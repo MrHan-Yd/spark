@@ -1,7 +1,8 @@
-# Windows 效率启动器 — 设计文档
+# Spark — 设计文档
 
-> 配套文档：[ARCHITECTURE.md](./ARCHITECTURE.md)  
-> 技术决策：Rust 宿主 + WinUI 3 UI + 开放插件（独立进程 / WASM）  
+> 产品：**Spark**  
+> 配套：[ARCHITECTURE.md](./ARCHITECTURE.md) · **[TECH_STACK.md](./TECH_STACK.md)（技术栈定稿）**  
+> 技术决策：**Rust Host + C# WinUI 3 UI** + 开放插件（独立进程；WASM = P2）  
 > 优先级：性能 > 稳定性 > 可扩展 > 开发速度
 
 ---
@@ -35,13 +36,16 @@
 
 | ID | 决策 | 结论 | 原因 |
 |----|------|------|------|
-| ADR-1 | 宿主语言 | **Rust** | 性能、内存安全、适合长期常驻 |
-| ADR-2 | UI | **WinUI 3** | 原生观感、DPI、动画；热路径不走 Web |
+| ADR-1 | 宿主语言 | **Rust** | 性能、内存安全、适合常驻 |
+| ADR-2 | UI 框架 | **WinUI 3** | 原生观感、DPI、动画；热路径不走 Web |
+| ADR-2b | UI 语言 | **C#**（定稿） | 体验迭代快；性能热路径在 Rust，无需 C++ UI |
 | ADR-3 | 插件默认形态 | **独立进程** | 崩溃隔离、语言无关 |
-| ADR-4 | 轻插件 | **WASM**（P2） | 快、可沙箱、无 exe 分发成本 |
+| ADR-4 | 轻插件 | **WASM**（P2） | 快、可沙箱 |
 | ADR-5 | IPC | **Named Pipe + JSON-RPC**（可迁 MessagePack） | Windows 原生、调试友好 |
-| ADR-6 | 索引 | **SQLite FTS5 + 内存热缓存** | 可靠、够快、易备份 |
-| ADR-7 | 全局钩子 | **默认不用** | 减少杀软误报与稳定性问题 |
+| ADR-6 | 索引 | **SQLite FTS5 + 内存热缓存** | 可靠、够快 |
+| ADR-7 | 全局钩子 | **默认不用** | 降低杀软误报 |
+| ADR-8 | 主界面技术 | **禁止 Electron/Tauri 主路径** | 内存与唤起不符合性能第一 |
+| ADR-9 | 产品名 / 品牌 | **Spark**；Logo A2+B1 | 四芒星 + 石墨黑白 |
 
 ---
 
@@ -509,7 +513,7 @@ repo/
     host/                 # 二进制入口
     sdk/
     ui-bridge/
-  ui/                     # WinUI 3 工程
+  ui/Spark.UI/            # C# WinUI 3 → spark-ui
   plugins/
     echo/
       plugin.json
@@ -619,12 +623,14 @@ repo/
 
 ## 13. 开放问题（待决）
 
-| 问题 | 选项 | 建议 |
-|------|------|------|
-| UI 同进程还是独立 | 同进程 MVP / 独立正式版 | MVP 同进程，接口按多进程设计 |
+| 问题 | 选项 | 状态 / 建议 |
+|------|------|-------------|
+| UI 用 C# 还是 C++ | C# / C++/WinRT | **已定：C#**（TECH_STACK） |
+| Host 与 UI 进程 | 双进程 / 同进程 | **已定方向：双进程**；Host 可 spawn UI |
 | 协议 JSON 还是 MessagePack | 先 JSON | 按 ADR-5 |
 | 是否支持全局无 prefix 插件查询 | 性能敏感 | 默认关闭，插件申请 `contribute_global` |
 | 商店形态 | 仅本地包 / 以后 HTTP 源 | P4 再做 |
+| 安装器 / 许可证 / 包 ID | 见 TECH_STACK §10 | 不挡骨架开发 |
 
 ---
 

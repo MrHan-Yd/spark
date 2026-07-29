@@ -1,7 +1,8 @@
-# Windows 效率启动器 — 功能设计
+# Spark — 功能设计
 
+> 产品名：**Spark**  
 > 本文描述**对用户可见的功能**与交互，不展开实现细节。  
-> 技术实现见 [ARCHITECTURE.md](./ARCHITECTURE.md)、[DESIGN.md](./DESIGN.md)。
+> 技术栈定稿见 [TECH_STACK.md](./TECH_STACK.md)；架构/设计见 [ARCHITECTURE.md](./ARCHITECTURE.md)、[DESIGN.md](./DESIGN.md)。
 
 ---
 
@@ -9,10 +10,11 @@
 
 | 项 | 说明 |
 |----|------|
-| 一句话 | Windows 上按快捷键即可搜索并执行一切的效率启动器 |
+| 一句话 | **Spark** — Windows 上按快捷键即可搜索并执行一切的效率启动器 |
 | 对标 | uTools / PowerToys Run / Raycast（仅 Windows） |
-| 差异 | 性能优先的原生宿主；开放插件；默认极简、可扩展 |
+| 差异 | Rust 性能核心 + 原生 WinUI 壳；开放插件；默认极简、可扩展 |
 | 目标用户 | 重度键鼠用户、开发者、办公效率用户 |
+| 技术（摘要） | Host=Rust，UI=C# WinUI 3，插件=独立进程（详见 TECH_STACK） |
 
 ---
 

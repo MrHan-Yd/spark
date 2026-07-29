@@ -1,0 +1,16 @@
+[package]
+name = "spark-plugin-echo"
+description = "Example Spark plugin (echo)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spark-plugin-echo"
+path = "src/main.rs"
+
+[dependencies]
+spark-sdk = { workspace = true }
+spark-core = { workspace = true }
+spark-ipc = { workspace = true }
+serde_json = { workspace = true }

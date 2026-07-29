@@ -1,0 +1,20 @@
+{
+  "id": "com.spark.echo",
+  "name": "Echo",
+  "version": "0.1.0",
+  "api_version": 1,
+  "main": "spark-plugin-echo.exe",
+  "runtime": "native",
+  "description": "示例插件：回显输入",
+  "keywords": ["echo", "demo"],
+  "commands": [
+    {
+      "name": "echo",
+      "title": "Echo",
+      "subtitle": "回显输入",
+      "mode": "list",
+      "prefix": "echo "
+    }
+  ],
+  "permissions": []
+}

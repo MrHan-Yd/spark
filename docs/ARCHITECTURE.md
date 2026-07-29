@@ -1,9 +1,9 @@
-# Windows 效率启动器 — 架构文档
+# Spark — 架构文档
 
-> 产品定位：Windows 专用、性能优先、类似 uTools 的全局唤起工具  
-> 宿主语言：Rust  
-> UI：WinUI 3（或等效原生壳）  
-> 插件：开放生态（官方 + 第三方）
+> 产品：**Spark** — Windows 专用、性能优先的全局效率启动器  
+> 宿主：**Rust**（`spark-host`）  
+> UI：**C# + WinUI 3**（`spark-ui`）— 定稿见 [TECH_STACK.md](./TECH_STACK.md)  
+> 插件：开放生态（独立进程；WASM 为 P2）
 
 ---
 
@@ -69,23 +69,24 @@
 
 ## 3. 进程模型
 
-| 进程 | 职责 | 生命周期 | 语言建议 |
-|------|------|----------|----------|
-| **host** | 热键、托盘、索引、路由、插件管理、IPC | 常驻 | Rust |
-| **ui** | 搜索框、结果列表、设置页、主题 | 可常驻隐藏或按需 | WinUI 3 (C#/C++/WinRT) 或 Rust+原生 |
+| 进程 | 职责 | 生命周期 | 语言 |
+|------|------|----------|------|
+| **host**（`spark-host`） | 热键、托盘、索引、路由、插件管理、IPC | 常驻 | **Rust** |
+| **ui**（`spark-ui`） | 搜索框、结果列表、设置页、主题、收藏 | 常驻隐藏或随 Host 拉起 | **C# + WinUI 3** |
 | **plugin-*** | 具体能力（翻译、OCR、截图等） | 按需启动，空闲回收 | 任意（Rust/C#/Go/Python…） |
 | **indexer-worker**（可选） | 重扫描、缩略图、深目录遍历 | 任务型 | Rust |
 
-### 3.1 为何 UI 可独立进程
+### 3.1 为何 UI 独立进程（C#）
 
-- UI 崩溃不丢索引与热键
-- 可用 WinUI 做高质感界面，核心仍保持 Rust 纯逻辑
-- 一期也可 **host 内嵌 UI 线程** 降低复杂度，二期再拆
+- UI 崩溃不丢索引与热键  
+- **性能热路径留在 Rust**；C# 只负责呈现与交互  
+- 语言边界清晰：Host↔UI 仅 IPC，避免 C++/C#/Rust 混链复杂度  
 
-**推荐落地节奏：**
+**落地节奏（定稿）：**
 
-- **MVP**：单 host 进程 + UI 同进程（不同线程）+ 插件独立进程  
-- **正式版**：host / ui / plugin 三分离
+- **MVP**：Host + UI **双进程**（Host 可自动 spawn UI）+ 插件独立进程；协议按双进程写死  
+- **不做**：以 Electron/Tauri WebView 替代 `spark-ui`  
+- **不做**：把索引/插件生命周期长期放在 C# 内
 
 ---
 
@@ -285,38 +286,44 @@ UI ──► Host ──► Plugin
 
 ## 10. 技术栈
 
+> **完整定稿与否决项以 [TECH_STACK.md](./TECH_STACK.md) 为准。** 下表为摘要。
+
 | 组件 | 选型 | 说明 |
 |------|------|------|
-| 宿主 | Rust edition 2021+ | `tokio`, `anyhow`/`thiserror` |
-| Win32 | `windows` crate | 热键、托盘、窗口、DPI |
+| 宿主 | Rust edition 2021+ | `tokio`, `thiserror`/`anyhow`, `windows` crate |
 | DB | `rusqlite` + FTS5 | 索引持久化 |
-| IPC | Named Pipe + serde | JSON 先，可迁 MessagePack |
-| WASM | `wasmtime` | 轻插件（可选一期） |
-| UI | WinUI 3 | 通过 UI Bridge 与 host 通信 |
-| 构建 | cargo workspace | host / sdk / plugin-template |
-| 安装 | MSIX 或 Inno Setup | 自启、协议关联 |
+| IPC | Named Pipe + JSON-RPC | `serde_json`；可迁 MessagePack |
+| WASM | `wasmtime` | **P2** 轻插件 |
+| UI | **C# + WinUI 3** | Windows App SDK；MVVM 可选 Toolkit |
+| UI↔Host | 双进程 IPC | UI 无权威索引状态 |
+| 构建 | Cargo workspace + .NET csproj | `crates/*` + `ui/Spark.UI` |
+| 安装 | MSIX 或 Inno Setup | 实现前二选一 |
 
 ---
 
 ## 11. 仓库与 crate 划分
 
 ```
-<repo>/
-  Cargo.toml                 # workspace
+spark/
+  Cargo.toml                 # Rust workspace
   crates/
-    host/                    # 主进程
-    core/                    # 领域模型、排序、清单解析（无 Win 依赖可测）
+    host/                    # spark-host
+    core/                    # 领域模型、排序、清单（可单测）
     ipc/                     # 协议类型与编解码
     index/                   # 索引引擎
     plugin-manager/          # 发现/启停/权限
-    sdk/                     # 给插件作者的 Rust SDK
-    ui-bridge/               # 与 UI 进程/线程的接口
+    sdk/                     # 插件 Rust SDK
+  ui/
+    Spark.UI/                # C# WinUI 3 → spark-ui.exe
   plugins/
-    demo-echo/               # 示例插件
-  ui/                        # WinUI 工程（可独立 csproj）
+    echo/                    # 示例插件
+  brand/
   docs/
+    TECH_STACK.md            # 技术栈定稿
     ARCHITECTURE.md
     DESIGN.md
+    FEATURES.md
+  ui-prototype/              # HTML 原型（非生产）
   scripts/
 ```
 
@@ -326,9 +333,9 @@ UI ──► Host ──► Plugin
 
 ```
 安装包
-  ├─ host.exe            # 自启、单实例
-  ├─ ui.exe / ui dll     # 视进程模型而定
-  ├─ resources/
+  ├─ spark-host.exe      # 自启、单实例、热键/托盘
+  ├─ spark-ui.exe        # C# WinUI 主窗（可由 host 拉起）
+  ├─ resources/          # 含 brand 图标
   ├─ plugins/ builtin/
   └─ uninstall
 ```
@@ -374,4 +381,7 @@ UI ──► Host ──► Plugin
 
 ## 16. 相关文档
 
-- [设计文档 DESIGN.md](./DESIGN.md) — 协议细节、数据模型、模块接口、目录与里程碑
+- [TECH_STACK.md](./TECH_STACK.md) — **技术栈定稿**（C# UI 决策、否决项）
+- [DESIGN.md](./DESIGN.md) — 协议、数据模型、模块接口、里程碑
+- [FEATURES.md](./FEATURES.md) — 功能与验收
+- [UI_PROTOTYPE.md](./UI_PROTOTYPE.md) — 原型与 WinUI 映射

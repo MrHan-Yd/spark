@@ -1,7 +1,8 @@
-# UI 原型说明 — macOS 玻璃风格
+# Spark UI 原型说明 — 玻璃风格
 
-> 可交互原型目录：`ui-prototype/`  
-> 产品功能见 [FEATURES.md](./FEATURES.md)
+> 产品：**Spark** · 可交互原型：`ui-prototype/`  
+> 生产 UI：**C# WinUI 3**（非本 HTML）· 技术栈见 [TECH_STACK.md](./TECH_STACK.md)  
+> 功能见 [FEATURES.md](./FEATURES.md)
 
 ---
 
@@ -72,18 +73,24 @@ Start-Process ui-prototype\index.html
 
 ---
 
-## 4. 落到 WinUI 3 的映射建议
+## 4. 落到 C# WinUI 3 的映射建议
 
-| 原型（CSS） | WinUI / 原生 |
+| 原型（CSS） | C# WinUI 3 |
 |-------------|--------------|
-| `backdrop-filter: blur` | `AcrylicBrush` / `DesktopAcrylic` / Win11 `MicaAlt` + 自定义半透明（玻璃感更强时用 Acrylic） |
-| 细边框高光 | `Border` + 1px `LinearGradientBrush` 或主题资源 |
-| 列表虚拟化 | `ListView` / `ItemsRepeater`（必须） |
-| 圆角阴影 | `CornerRadius` + 系统 `ThemeShadow` 或自定义 |
-| 深浅色 | `RequestedTheme` + 资源字典 |
-| 弹出动画 | `Composition` 缩放透明度 |
+| `backdrop-filter: blur` | `AcrylicBrush` / Desktop Acrylic；可辅 Mica |
+| 细边框高光 | `Border` + 主题色 / 细 `Stroke` |
+| 列表 / 平铺 | `ListView` 或 `ItemsRepeater`（**必须虚拟化**）；平铺用 `UniformGridLayout` 等 |
+| 主窗内设置页 | 同一 `Window` 内切换 `Frame`/自定义区域（非第二窗） |
+| 圆角阴影 | `CornerRadius` + `ThemeShadow` |
+| 深浅色 | `RequestedTheme` + ResourceDictionary |
+| 页面切换动画 | `Composition` / 内置导航过渡 |
+| IPC | Named Pipe 客户端，DTO 对齐 `docs/DESIGN` |
 
-**注意：** 完整 CSS 玻璃在 WinUI 上要靠 Acrylic + 图层，不要嵌 WebView 只为皮肤（性能优先）。原型仅作视觉与交互参考。
+**注意：**
+
+- 生产实现是 **C# WinUI**，本目录 HTML **仅原型**  
+- 不要用 WebView2 套原型当主界面（性能第一）  
+- 系统托盘由 **Host（Rust）** 负责，不在 UI 窗内画假托盘
 
 ---
 

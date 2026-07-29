@@ -1,8 +1,7 @@
 # ===== Rust / Cargo =====
 /target/
 **/*.rs.bk
-Cargo.lock
-# 若发布二进制库需要锁版本，可删除上一行并改跟踪 Cargo.lock
+# 应用仓库跟踪根目录 Cargo.lock（可复现构建）
 
 # ===== 构建 / 发布产物 =====
 /dist/

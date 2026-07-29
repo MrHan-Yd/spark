@@ -1,0 +1,12 @@
+[package]
+name = "spark-index"
+description = "Spark search index (in-memory MVP; SQLite FTS later)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spark-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
