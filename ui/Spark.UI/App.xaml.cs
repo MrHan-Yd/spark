@@ -4,16 +4,16 @@ namespace Spark.UI;
 
 public partial class App : Application
 {
+    private Window? _window;
+
     public App()
     {
         InitializeComponent();
     }
 
-    public static Window? MainWindow { get; private set; }
-
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        MainWindow = new MainWindow();
-        MainWindow.Activate();
+        _window = new MainWindow();
+        _window.Activate();
     }
 }

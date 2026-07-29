@@ -2,7 +2,6 @@ using System.Text.Json.Serialization;
 
 namespace Spark.UI.Models;
 
-/// <summary>对齐 crates/ipc + spark-core Candidate JSON。</summary>
 public sealed class CandidateDto
 {
     [JsonPropertyName("id")]
@@ -18,17 +17,14 @@ public sealed class CandidateDto
     public float Score { get; set; }
 
     [JsonPropertyName("source")]
-    public string Source { get; set; } = "";
+    public string Source { get; set; } = "应用";
 
-    [JsonPropertyName("plugin_id")]
-    public string? PluginId { get; set; }
+    [JsonPropertyName("icon")]
+    public string Icon { get; set; } = "?";
 }
 
 public sealed class QueryResultDto
 {
     [JsonPropertyName("items")]
     public List<CandidateDto> Items { get; set; } = new();
-
-    [JsonPropertyName("partial")]
-    public bool Partial { get; set; }
 }
