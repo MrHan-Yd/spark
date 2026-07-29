@@ -1,0 +1,119 @@
+# ===== Rust / Cargo =====
+/target/
+**/*.rs.bk
+Cargo.lock
+# 若发布二进制库需要锁版本，可删除上一行并改跟踪 Cargo.lock
+
+# ===== 构建 / 发布产物 =====
+/dist/
+/out/
+/build/
+/release/
+*.exe
+*.dll
+*.pdb
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+*.app
+*.msi
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# ===== OS =====
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ===== 日志 / 临时 / 缓存 =====
+*.log
+*.tmp
+*.temp
+*.cache
+.cache/
+tmp/
+temp/
+logs/
+
+# ===== 环境与密钥 =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# ===== 测试 / 覆盖率 =====
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# ===== Node（若原型或工具链用到） =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+.yarn/
+
+# ===== WinUI / .NET（若 UI 工程后续加入） =====
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# ===== 本地数据（运行时） =====
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ===== 杂项 =====
+*.bak
+*.orig
+*.rej
+.direnv/
+.venv/
+venv/
+__pycache__/

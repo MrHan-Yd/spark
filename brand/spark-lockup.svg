@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 120" fill="none" role="img" aria-label="Spark">
+  <rect x="12" y="18" width="84" height="84" rx="22" fill="#1C1C1E"/>
+  <rect x="12.5" y="18.5" width="83" height="83" rx="21.5" stroke="#FFFFFF" stroke-opacity="0.08" fill="none"/>
+  <path d="M54 32 L60.2 51.5 L80 58 L60.2 64.5 L54 84 L47.8 64.5 L28 58 L47.8 51.5 Z" fill="#F5F5F7"/>
+  <circle cx="76" cy="38" r="2.2" fill="#F5F5F7" opacity="0.45"/>
+  <text x="116" y="62" font-family="Segoe UI, -apple-system, PingFang SC, Microsoft YaHei, sans-serif" font-size="42" font-weight="650" letter-spacing="-0.045em" fill="#F5F5F7">Spark</text>
+  <text x="118" y="88" font-family="Segoe UI, -apple-system, PingFang SC, Microsoft YaHei, sans-serif" font-size="13" font-weight="500" letter-spacing="0.1em" fill="#8E8E93">FLASH LAUNCHER</text>
+</svg>

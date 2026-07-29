@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spark Logo — A2 + B1 定稿</title>
+  <style>
+    body {
+      margin: 0; min-height: 100vh; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #e8eef8; background: #0b0f14; padding: 40px 24px 64px;
+    }
+    h1 { font-size: 24px; font-weight: 650; letter-spacing: -0.03em; margin: 0 0 6px; }
+    .sub { color: rgba(255,255,255,0.45); font-size: 14px; margin: 0 0 28px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; max-width: 960px; }
+    .card {
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 14px; padding: 16px;
+    }
+    .card h2 { margin: 0 0 4px; font-size: 13px; color: rgba(255,255,255,0.7); }
+    .card p { margin: 0 0 14px; font-size: 12px; color: rgba(255,255,255,0.4); }
+    .stage {
+      display: grid; place-items: center; min-height: 140px; border-radius: 12px; background: #12151c;
+    }
+    .stage.light { background: #eceff4; }
+    .wide { grid-column: 1 / -1; }
+    .sizes { display: flex; gap: 20px; align-items: center; justify-content: center; }
+    .note {
+      max-width: 960px; margin-top: 24px; font-size: 13px; line-height: 1.65;
+      color: rgba(255,255,255,0.5); padding: 14px 16px; border-radius: 12px;
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+    }
+    code { font-family: Consolas, monospace; background: rgba(255,255,255,0.08); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Spark · 定稿</h1>
+  <p class="sub">A2 四芒星 / 火花 + B1 石墨黑 + 白</p>
+
+  <div class="grid">
+    <div class="card wide">
+      <h2>Lockup</h2>
+      <p>关于页 / 安装包</p>
+      <div class="stage"><img src="spark-lockup.svg" height="100" alt="lockup" /></div>
+    </div>
+    <div class="card">
+      <h2>App Icon</h2>
+      <p>#1C1C1E 底 · 白星</p>
+      <div class="stage"><img src="spark-icon.svg" width="88" height="88" alt="icon" /></div>
+    </div>
+    <div class="card">
+      <h2>多尺寸</h2>
+      <p>64 · 32 · 16</p>
+      <div class="stage">
+        <div class="sizes">
+          <img src="spark-icon.svg" width="64" height="64" alt="64" />
+          <img src="spark-icon.svg" width="32" height="32" alt="32" />
+          <img src="spark-mark.svg" width="16" height="16" alt="16" style="background:#1c1c1e;border-radius:4px;padding:2px;box-sizing:content-box" />
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Mark</h2>
+      <p>托盘纯符号</p>
+      <div class="stage"><img src="spark-mark.svg" width="56" height="56" alt="mark" /></div>
+    </div>
+    <div class="card">
+      <h2>浅底 Mono</h2>
+      <p>currentColor</p>
+      <div class="stage light"><img src="spark-icon-mono.svg" width="88" height="88" alt="mono" style="color:#1c1c1e" /></div>
+    </div>
+    <div class="card wide">
+      <h2>Wordmark</h2>
+      <p>文档 / 闪屏</p>
+      <div class="stage"><img src="spark-wordmark.svg" height="56" alt="word" /></div>
+    </div>
+  </div>
+
+  <div class="note">
+    规格：圆角约 25% · 底 <code>#1C1C1E</code> · 星 <code>#F5F5F7</code> · 文件在 <code>brand/spark-*.svg</code>
+  </div>
+</body>
+</html>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none" role="img" aria-label="Spark">
+  <!-- A2 四芒星 + B1 石墨黑白 -->
+  <rect x="0" y="0" width="128" height="128" rx="32" fill="#1C1C1E"/>
+  <!-- subtle top edge -->
+  <rect x="0.5" y="0.5" width="127" height="127" rx="31.5" stroke="#FFFFFF" stroke-opacity="0.08" fill="none"/>
+  <!-- four-point spark -->
+  <path d="M64 22 L72.8 55.2 L106 64 L72.8 72.8 L64 106 L55.2 72.8 L22 64 L55.2 55.2 Z" fill="#F5F5F7"/>
+  <!-- micro sparks -->
+  <circle cx="96" cy="34" r="3.5" fill="#F5F5F7" opacity="0.45"/>
+  <circle cx="32" cy="92" r="2.5" fill="#F5F5F7" opacity="0.3"/>
+</svg>
