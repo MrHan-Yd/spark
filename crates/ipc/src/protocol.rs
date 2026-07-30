@@ -4,6 +4,12 @@ use spark_core::Candidate;
 /// Wire protocol major version (bump on breaking changes).
 pub const API_VERSION: u32 = 1;
 
+/// Named pipe bare name (C# `NamedPipeClientStream(".", name, …)`).
+pub const PIPE_NAME: &str = "spark.host.ipc";
+
+/// Full Win32 path for CreateNamedPipe / CreateFile.
+pub const PIPE_PATH: &str = r"\\.\pipe\spark.host.ipc";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostMethod {
     Query,
@@ -56,6 +62,50 @@ pub enum UiMethod {
     Hide,
     SetQuery,
     Results,
+    Toggle,
+}
+
+impl UiMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Show => "ui.show",
+            Self::Hide => "ui.hide",
+            Self::SetQuery => "ui.set_query",
+            Self::Results => "ui.results",
+            Self::Toggle => "ui.toggle",
+        }
+    }
+}
+
+/// JSON-RPC notification (no `id`) for Host → UI push.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl JsonRpcNotification {
+    pub fn new(method: impl Into<String>, params: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            method: method.into(),
+            params,
+        }
+    }
+
+    pub fn ui_show() -> Self {
+        Self::new(UiMethod::Show.as_str(), serde_json::json!({}))
+    }
+
+    pub fn ui_hide() -> Self {
+        Self::new(UiMethod::Hide.as_str(), serde_json::json!({}))
+    }
+
+    pub fn ui_toggle() -> Self {
+        Self::new(UiMethod::Toggle.as_str(), serde_json::json!({}))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

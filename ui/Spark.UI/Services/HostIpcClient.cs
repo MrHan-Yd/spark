@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
@@ -5,30 +6,151 @@ using Spark.UI.Models;
 
 namespace Spark.UI.Services;
 
+/// <summary>
+/// 长连接 NDJSON：一条读循环分发 response / notification；请求用 TCS 等待。
+/// </summary>
 public sealed class HostIpcClient : IAsyncDisposable
 {
     public const string DefaultPipeName = "spark.host.ipc";
 
     private NamedPipeClientStream? _pipe;
-    private StreamReader? _reader;
     private StreamWriter? _writer;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> _pending = new();
+    private CancellationTokenSource? _loopCts;
+    private Task? _loopTask;
     private int _nextId = 1;
+    private int _connectGate;
 
     public bool IsConnected => _pipe?.IsConnected == true;
+
+    public event Action<string>? HostNotification;
 
     public async Task EnsureConnectedAsync(CancellationToken ct = default)
     {
         if (IsConnected) return;
+        if (Interlocked.CompareExchange(ref _connectGate, 1, 0) != 0)
+        {
+            // 另一路正在连
+            for (var i = 0; i < 30 && !IsConnected; i++)
+                await Task.Delay(100, ct);
+            return;
+        }
         try
         {
-            _pipe = new NamedPipeClientStream(".", DefaultPipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-            await _pipe.ConnectAsync(200, ct);
-            _reader = new StreamReader(_pipe, Encoding.UTF8, false, 4096, true);
-            _writer = new StreamWriter(_pipe, Encoding.UTF8, 4096, true) { AutoFlush = true };
+            if (IsConnected) return;
+            await TearDownAsync();
+
+            Exception? last = null;
+            for (var attempt = 0; attempt < 20; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var pipe = new NamedPipeClientStream(".", DefaultPipeName, PipeDirection.InOut,
+                    PipeOptions.Asynchronous);
+                try
+                {
+                    await pipe.ConnectAsync(500, ct);
+                    _pipe = pipe;
+                    _writer = new StreamWriter(pipe, new UTF8Encoding(false), 64 * 1024, leaveOpen: true)
+                    {
+                        AutoFlush = true,
+                        NewLine = "\n"
+                    };
+                    _loopCts = new CancellationTokenSource();
+                    _loopTask = Task.Run(() => ReadLoopAsync(_loopCts.Token));
+                    last = null;
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    try { await pipe.DisposeAsync(); } catch { /* ignore */ }
+                    await Task.Delay(150, ct);
+                }
+            }
+            if (last is not null)
+                App.Log("HostConnect", last);
         }
-        catch
+        finally
         {
-            await DisposePipeAsync();
+            Interlocked.Exchange(ref _connectGate, 0);
+        }
+    }
+
+    private async Task ReadLoopAsync(CancellationToken ct)
+    {
+        if (_pipe is null) return;
+        var reader = new StreamReader(_pipe, Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
+        try
+        {
+            while (!ct.IsCancellationRequested && _pipe.IsConnected)
+            {
+                string? line;
+                try
+                {
+                    line = await reader.ReadLineAsync(ct);
+                }
+                catch
+                {
+                    break;
+                }
+                if (line is null) break;
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+
+                    if (root.TryGetProperty("method", out var methodEl)
+                        && !root.TryGetProperty("result", out _)
+                        && !root.TryGetProperty("error", out _))
+                    {
+                        var hasId = root.TryGetProperty("id", out var idEl)
+                                    && idEl.ValueKind is not JsonValueKind.Null
+                                    && idEl.ValueKind is not JsonValueKind.Undefined;
+                        if (!hasId)
+                        {
+                            HostNotification?.Invoke(methodEl.GetString() ?? "");
+                            continue;
+                        }
+                    }
+
+                    if (root.TryGetProperty("id", out var rid))
+                    {
+                        var id = rid.ValueKind == JsonValueKind.Number
+                            ? rid.GetInt32()
+                            : int.TryParse(rid.ToString(), out var n) ? n : -1;
+                        if (id >= 0 && _pending.TryRemove(id, out var tcs))
+                        {
+                            if (root.TryGetProperty("error", out var err))
+                            {
+                                var msg = err.TryGetProperty("message", out var m)
+                                    ? m.GetString() ?? "ipc error"
+                                    : "ipc error";
+                                tcs.TrySetException(new InvalidOperationException(msg));
+                            }
+                            else if (root.TryGetProperty("result", out var result))
+                            {
+                                tcs.TrySetResult(result.Clone());
+                            }
+                            else
+                            {
+                                tcs.TrySetResult(default);
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // 单行解析失败忽略
+                }
+            }
+        }
+        finally
+        {
+            foreach (var kv in _pending)
+                kv.Value.TrySetCanceled();
+            _pending.Clear();
         }
     }
 
@@ -38,62 +160,115 @@ public sealed class HostIpcClient : IAsyncDisposable
         if (!IsConnected)
             return DemoData.Query(text);
 
-        var id = _nextId++;
-        var req = new { jsonrpc = "2.0", id, method = "host.query", @params = new { text, limit } };
-        await _writer!.WriteLineAsync(JsonSerializer.Serialize(req).AsMemory(), ct);
-        var line = await _reader!.ReadLineAsync(ct) ?? throw new InvalidOperationException("host closed pipe");
-        using var doc = JsonDocument.Parse(line);
-        if (doc.RootElement.TryGetProperty("error", out var err))
-            throw new InvalidOperationException(err.GetProperty("message").GetString() ?? "ipc error");
-        return JsonSerializer.Deserialize<QueryResultDto>(doc.RootElement.GetProperty("result").GetRawText())
-               ?? new QueryResultDto();
+        try
+        {
+            var result = await CallAsync("host.query", new { text, limit }, ct);
+            if (result.ValueKind == JsonValueKind.Undefined)
+                return DemoData.Query(text);
+            return JsonSerializer.Deserialize<QueryResultDto>(result.GetRawText())
+                   ?? new QueryResultDto();
+        }
+        catch
+        {
+            return DemoData.Query(text);
+        }
     }
 
-    public async Task InvokeAsync(string itemId, string actionId, string text, CancellationToken ct = default)
+    public async Task<JsonElement?> InvokeAsync(string itemId, string actionId, string text,
+        CancellationToken ct = default)
     {
         await EnsureConnectedAsync(ct);
-        if (!IsConnected) return;
-        var id = _nextId++;
-        var req = new
+        if (!IsConnected) return null;
+        try
         {
-            jsonrpc = "2.0",
-            id,
-            method = "host.invoke",
-            @params = new { item_id = itemId, action_id = actionId, text }
-        };
-        await _writer!.WriteLineAsync(JsonSerializer.Serialize(req).AsMemory(), ct);
-        _ = await _reader!.ReadLineAsync(ct);
+            var el = await CallAsync("host.invoke",
+                new { item_id = itemId, action_id = actionId, text }, ct);
+            return el.ValueKind == JsonValueKind.Undefined ? null : el;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
-    private async Task DisposePipeAsync()
+    private async Task<JsonElement> CallAsync(string method, object paramsObj, CancellationToken ct)
     {
-        if (_writer is not null) await _writer.DisposeAsync();
-        if (_reader is not null) _reader.Dispose();
-        if (_pipe is not null) await _pipe.DisposeAsync();
-        _writer = null;
-        _reader = null;
-        _pipe = null;
+        if (!IsConnected || _writer is null)
+            return default;
+
+        var id = Interlocked.Increment(ref _nextId);
+        var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pending[id] = tcs;
+
+        var req = new Dictionary<string, object?>
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = id,
+            ["method"] = method,
+            ["params"] = paramsObj
+        };
+        var json = JsonSerializer.Serialize(req);
+
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            await _writer.WriteLineAsync(json.AsMemory(), ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(8));
+        await using var reg = timeout.Token.Register(() =>
+        {
+            if (_pending.TryRemove(id, out var p))
+                p.TrySetException(new TimeoutException("host ipc timeout"));
+        });
+
+        return await tcs.Task;
     }
 
-    public async ValueTask DisposeAsync() => await DisposePipeAsync();
+    private async Task TearDownAsync()
+    {
+        try { _loopCts?.Cancel(); } catch { /* ignore */ }
+        try
+        {
+            if (_loopTask is not null)
+                await Task.WhenAny(_loopTask, Task.Delay(200));
+        }
+        catch { /* ignore */ }
+        _loopTask = null;
+        _loopCts?.Dispose();
+        _loopCts = null;
+        if (_writer is not null)
+        {
+            try { await _writer.DisposeAsync(); } catch { /* ignore */ }
+        }
+        _writer = null;
+        if (_pipe is not null)
+        {
+            try { await _pipe.DisposeAsync(); } catch { /* ignore */ }
+        }
+        _pipe = null;
+        foreach (var kv in _pending)
+            kv.Value.TrySetCanceled();
+        _pending.Clear();
+    }
+
+    public async ValueTask DisposeAsync() => await TearDownAsync();
 }
 
 public static class DemoData
 {
     public static readonly CandidateDto[] Seed =
     {
-        new() { Id = "app.wt", Title = "Windows Terminal", Subtitle = "应用程序", Score = 1, Source = "应用", Icon = "Wt" },
-        new() { Id = "app.code", Title = "Visual Studio Code", Subtitle = "最近 · 3 分钟前", Score = 0.98f, Source = "历史", Icon = "Vs" },
-        new() { Id = "app.chrome", Title = "Google Chrome", Subtitle = "应用程序", Score = 0.95f, Source = "应用", Icon = "Ch" },
-        new() { Id = "tool.calc", Title = "计算 128 * 32", Subtitle = "= 4096 · Enter 复制", Score = 0.9f, Source = "工具", Icon = "=" },
-        new() { Id = "plugin.echo", Title = "Echo hello", Subtitle = "插件命令", Score = 0.88f, Source = "Echo", Icon = "Ec" },
-        new() { Id = "file.readme", Title = "项目 README.md", Subtitle = @"D:\demo\test01\docs", Score = 0.85f, Source = "文件", Icon = "Md" },
-        new() { Id = "sys.settings", Title = "设置", Subtitle = "打开启动器设置", Score = 0.84f, Source = "系统", Icon = "Se" },
-        new() { Id = "app.explorer", Title = "文件资源管理器", Subtitle = "应用程序", Score = 0.8f, Source = "应用", Icon = "Ex" },
-        new() { Id = "plugin.json", Title = "JSON 格式化", Subtitle = "剪贴板 · 需权限", Score = 0.76f, Source = "插件", Icon = "{}" },
-        new() { Id = "sys.lock", Title = "锁定工作站", Subtitle = "系统操作 · 需确认", Score = 0.7f, Source = "系统", Icon = "Lk" },
-        new() { Id = "file.arch", Title = "ARCHITECTURE.md", Subtitle = "docs · 今天", Score = 0.68f, Source = "文件", Icon = "Ar" },
-        new() { Id = "web.g", Title = "g rust async", Subtitle = "Google 搜索", Score = 0.65f, Source = "快搜", Icon = "G" },
+        new() { Id = "app.wt", Title = "Windows Terminal", Subtitle = "应用程序", Score = 1, Source = "app", Target = "wt.exe" },
+        new() { Id = "app.code", Title = "Visual Studio Code", Subtitle = "最近", Score = 0.98f, Source = "history" },
+        new() { Id = "app.chrome", Title = "Google Chrome", Subtitle = "应用程序", Score = 0.95f, Source = "app" },
+        new() { Id = "app.explorer", Title = "文件资源管理器", Subtitle = "系统", Score = 0.8f, Source = "app", Target = @"C:\Windows\explorer.exe" },
+        new() { Id = "sys.settings", Title = "设置", Subtitle = "打开启动器设置", Score = 0.84f, Source = "builtin" },
     };
 
     private static readonly Dictionary<string, string[]> Keys = new(StringComparer.OrdinalIgnoreCase)
@@ -101,15 +276,8 @@ public static class DemoData
         ["app.wt"] = ["wt", "terminal", "终端"],
         ["app.code"] = ["code", "vscode"],
         ["app.chrome"] = ["chrome", "浏览器"],
-        ["tool.calc"] = ["128", "算", "calc"],
-        ["plugin.echo"] = ["echo", "hello"],
-        ["file.readme"] = ["readme", "docs"],
         ["sys.settings"] = ["settings", "设置", "prefs"],
         ["app.explorer"] = ["explorer", "资源"],
-        ["plugin.json"] = ["json", "格式"],
-        ["sys.lock"] = ["lock", "锁屏"],
-        ["file.arch"] = ["arch", "架构"],
-        ["web.g"] = ["g ", "google", "rust"],
     };
 
     public static CandidateDto? Find(string id) =>
@@ -120,11 +288,8 @@ public static class DemoData
         var q = text.Trim();
         IEnumerable<CandidateDto> items;
         if (string.IsNullOrEmpty(q))
-        {
             items = Seed.Take(8);
-        }
         else
-        {
             items = Seed.Where(x =>
                 x.Title.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                 (x.Subtitle?.Contains(q, StringComparison.OrdinalIgnoreCase) ?? false) ||
@@ -132,7 +297,19 @@ public static class DemoData
                 (Keys.TryGetValue(x.Id, out var ks) &&
                  ks.Any(k => k.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                              q.Contains(k, StringComparison.OrdinalIgnoreCase))));
-        }
-        return new QueryResultDto { Items = items.ToList() };
+
+        var list = items.Select((x, i) => new CandidateDto
+        {
+            Id = x.Id,
+            Title = x.Title,
+            Subtitle = x.Subtitle,
+            Score = x.Score,
+            Source = x.Source,
+            Target = x.Target,
+            IconPath = x.IconPath,
+            Shortcut = i < 9 ? $"{i + 1}" : ""
+        }).ToList();
+
+        return new QueryResultDto { Items = list };
     }
 }

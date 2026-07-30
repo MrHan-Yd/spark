@@ -34,6 +34,14 @@ impl Action {
             is_default: true,
         }
     }
+
+    pub fn reveal() -> Self {
+        Self {
+            id: "reveal".into(),
+            title: "打开文件位置".into(),
+            is_default: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +49,31 @@ pub struct Candidate {
     pub id: String,
     pub title: String,
     pub subtitle: Option<String>,
+    /// Launch target: .lnk / .exe / protocol path
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Optional icon path (shortcut target or .ico)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub score: f32,
     pub source: Source,
     pub actions: Vec<Action>,
     pub plugin_id: Option<String>,
+}
+
+impl Candidate {
+    pub fn app(id: impl Into<String>, title: impl Into<String>, target: impl Into<String>) -> Self {
+        let target = target.into();
+        Self {
+            id: id.into(),
+            title: title.into(),
+            subtitle: Some("应用程序".into()),
+            icon: Some(target.clone()),
+            target: Some(target),
+            score: 1.0,
+            source: Source::App,
+            actions: vec![Action::open_default(), Action::reveal()],
+            plugin_id: None,
+        }
+    }
 }

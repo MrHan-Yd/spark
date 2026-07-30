@@ -18,7 +18,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <AssemblyName>spark-ui</AssemblyName>
-    <!-- 使用生成的 XAML Main；若需自定义入口再打开 DISABLE -->
+    <!-- 任务栏 / 资源管理器 应用图标（brand 四芒星） -->
+    <ApplicationIcon>Assets\spark.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
@@ -26,11 +27,17 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
+  <!-- 输出根目录也放一份 ico，方便 SetIcon / 托盘加载 -->
+  <Target Name="CopySparkIcoRoot" AfterTargets="Build">
+    <Copy SourceFiles="Assets\spark.ico"
+          DestinationFiles="$(OutputPath)spark.ico"
+          SkipUnchangedFiles="true"
+          Condition="Exists('Assets\spark.ico')" />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
-    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
   </ItemGroup>
 
   <ItemGroup>

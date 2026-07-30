@@ -7,8 +7,8 @@ mod protocol;
 pub use error::IpcError;
 pub use message::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use protocol::{
-    HostMethod, InvokeParams, InvokeResult, PluginMethod, QueryParams, QueryResult, UiMethod,
-    API_VERSION,
+    HostMethod, InvokeParams, InvokeResult, JsonRpcNotification, PluginMethod, QueryParams,
+    QueryResult, UiMethod, API_VERSION, PIPE_NAME, PIPE_PATH,
 };
 
 /// Encode one NDJSON line (without trailing newline applied by caller if needed).

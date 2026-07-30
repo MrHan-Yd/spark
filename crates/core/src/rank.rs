@@ -21,6 +21,8 @@ mod tests {
             id: title.into(),
             title: title.into(),
             subtitle: None,
+            target: None,
+            icon: None,
             score,
             source: Source::App,
             actions: vec![Action::open_default()],

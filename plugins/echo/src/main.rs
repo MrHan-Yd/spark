@@ -15,6 +15,8 @@ impl Plugin for Echo {
             id: format!("echo:{text}"),
             title: text.clone(),
             subtitle: Some("Echo · Enter 复制".into()),
+            target: None,
+            icon: None,
             score: 1.0,
             source: Source::Plugin,
             actions: vec![Action {
@@ -27,9 +29,7 @@ impl Plugin for Echo {
     }
 
     fn invoke(&mut self, params: InvokeParams) -> InvokeResult {
-        InvokeResult::CopyText {
-            text: params.text,
-        }
+        InvokeResult::CopyText { text: params.text }
     }
 }
 
