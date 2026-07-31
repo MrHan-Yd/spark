@@ -16,8 +16,8 @@ use windows::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
@@ -30,6 +30,7 @@ pub struct UiHub {
     inner: Arc<Mutex<Vec<ClientWriter>>>,
 }
 
+#[derive(Clone, Copy)]
 struct ClientWriter {
     id: u64,
     handle: SendHandle,
@@ -69,19 +70,32 @@ impl UiHub {
     }
 
     pub fn broadcast_line(&self, line: &str) {
+        // 在锁外快照句柄，避免持锁期间做阻塞写（WriteFile 可能卡在对端不读的
+        // 僵尸连接上）；写不成功就把该客户端标记为失效，下次广播前清理。
         let payload = format!("{line}\n");
         let bytes = payload.as_bytes();
+        let snapshot: Vec<ClientWriter> = self.inner.lock().map(|g| g.clone()).unwrap_or_default();
         let mut dead = Vec::new();
-        if let Ok(mut g) = self.inner.lock() {
-            for c in g.iter() {
-                if write_all_handle(c.handle.raw(), bytes).is_err() {
-                    dead.push(c.id);
-                }
+        for c in snapshot.iter() {
+            if write_all_handle(c.handle.raw(), bytes).is_err() {
+                dead.push(c.id);
             }
-            if !dead.is_empty() {
+        }
+        if !dead.is_empty() {
+            if let Ok(mut g) = self.inner.lock() {
                 g.retain(|c| !dead.contains(&c.id));
             }
         }
+    }
+
+    /// 后台线程广播，保证调用方（消息循环线程）永远不被 pipe I/O 卡住。
+    pub fn notify_toggle_async(&self) {
+        let hub = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("spark-broadcast".into())
+            .spawn(move || {
+                hub.notify_toggle();
+            });
     }
 
     pub fn notify_show(&self) {
@@ -114,9 +128,9 @@ fn write_all_handle(handle: HANDLE, bytes: &[u8]) -> Result<()> {
         }
         offset += written as usize;
     }
-    unsafe {
-        let _ = FlushFileBuffers(handle);
-    }
+    // 注意：不要对 pipe 调 FlushFileBuffers —— 字节模式命名管道上它会阻塞
+    // 直到对端读走全部数据；对端（UI）一旦没在消费，Host 消息循环就会永久卡死，
+    // 表现为 Alt+Space 用过几次后彻底失灵。WriteFile 对管道本身就是同步语义。
     Ok(())
 }
 
@@ -247,7 +261,7 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost, hub: &UiHub) -> Re
             reply(pipe, &resp)?;
         }
         crate::toggle_signal::signal_toggle();
-        hub.notify_toggle();
+        hub.notify_toggle_async();
         return Ok(());
     }
 

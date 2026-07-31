@@ -42,14 +42,16 @@ public sealed class HostIpcClient : IAsyncDisposable
             await TearDownAsync();
 
             Exception? last = null;
-            for (var attempt = 0; attempt < 20; attempt++)
+            // 本地管道正常应毫秒级连上；超时给足 1.5s，避免客户端先放弃、服务端
+            // 后 accept 造成僵尸连接。重试 6 次 ≈ 最坏 10s，足够等 Host 起来。
+            for (var attempt = 0; attempt < 6; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
                 var pipe = new NamedPipeClientStream(".", DefaultPipeName, PipeDirection.InOut,
                     PipeOptions.Asynchronous);
                 try
                 {
-                    await pipe.ConnectAsync(500, ct);
+                    await pipe.ConnectAsync(1500, ct);
                     _pipe = pipe;
                     _writer = new StreamWriter(pipe, new UTF8Encoding(false), 64 * 1024, leaveOpen: true)
                     {
@@ -88,7 +90,18 @@ public sealed class HostIpcClient : IAsyncDisposable
                 string? line;
                 try
                 {
-                    line = await reader.ReadLineAsync(ct);
+                    // 读超时自愈：pipe 可能半死（Host 端 WriteFile 卡住、连接静默失效）。
+                    // 超时后主动断开，让 MaintainHostConnectionAsync 重连拿一条新连接。
+                    var readTask = reader.ReadLineAsync(ct).AsTask();
+                    _ = readTask.ContinueWith(t => _ = t.Exception,
+                        TaskContinuationOptions.OnlyOnFaulted);
+                    line = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                catch (TimeoutException)
+                {
+                    // 读超时：pipe 可能半死，主动断开等重连自愈
+                    await TearDownAsync();
+                    break;
                 }
                 catch
                 {

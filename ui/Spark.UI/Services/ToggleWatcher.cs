@@ -59,6 +59,25 @@ public sealed class ToggleWatcher : IDisposable
         }
     }
 
+    /// <summary>
+    /// 向正在运行的实例发一次 toggle 信号（唤醒窗口）。
+    /// 供第二实例启动时使用：避免多个 UI 抢同一个 auto-reset 事件。
+    /// </summary>
+    public static void Signal()
+    {
+        var ev = CreateEventW(IntPtr.Zero, false, false, EventName);
+        if (ev == IntPtr.Zero)
+            return;
+        try
+        {
+            SetEvent(ev);
+        }
+        finally
+        {
+            CloseHandle(ev);
+        }
+    }
+
     public void Dispose()
     {
         _cts.Cancel();
@@ -69,6 +88,9 @@ public sealed class ToggleWatcher : IDisposable
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateEventW(IntPtr lpEventAttributes, bool bManualReset,
         bool bInitialState, string lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetEvent(IntPtr hEvent);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);

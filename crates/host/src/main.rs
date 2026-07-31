@@ -147,13 +147,17 @@ fn try_spawn_ui_on_boot() {
     info!("spark-ui.exe not found — start UI manually for IPC");
 }
 
-fn is_ui_running() -> bool {
+pub(crate) fn is_ui_running() -> bool {
     // Lightweight: try open pipe is not enough (host is the server).
     // Check process name.
     std::process::Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq spark-ui.exe", "/NH"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("spark-ui"))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_lowercase()
+                .contains("spark-ui")
+        })
         .unwrap_or(false)
 }
 
