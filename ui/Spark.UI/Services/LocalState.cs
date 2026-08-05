@@ -65,7 +65,7 @@ public sealed class AppUiState
     public string Hotkey { get; set; } = "Alt+Space";
     public string Theme { get; set; } = "dark";
     public string DefaultView { get; set; } = "list";
-    public int WindowWidth { get; set; } = 680;
+    public int WindowWidth { get; set; } = 800;
     public bool ReduceMotion { get; set; }
 }
 

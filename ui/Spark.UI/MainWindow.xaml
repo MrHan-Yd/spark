@@ -5,11 +5,133 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Spark">
 
-  <!-- 对齐 ui-prototype 主弹窗：深色玻璃感（稳定 Fallback 色，避免 Acrylic 闪退） -->
+  <!-- 对齐 ui-prototype 主弹窗：颜色收成 Root.Resources 画刷，主题切换由代码改 Color（深/浅/跟随系统） -->
   <Grid x:Name="Root" Background="#E61C1C1E">
-    <Border BorderBrush="#28FFFFFF" BorderThickness="1" IsHitTestVisible="False"/>
+    <Grid.Resources>
+      <!-- 主题画刷（值取自 ui-prototype/styles.css 变量，alpha 已转 ARGB） -->
+      <SolidColorBrush x:Key="GlassBgBrush" Color="#E61C1C1E"/>
+      <SolidColorBrush x:Key="GlassBorderBrush" Color="#24FFFFFF"/>
+      <SolidColorBrush x:Key="TextPrimaryBrush" Color="#EBEBEB"/>
+      <SolidColorBrush x:Key="TextSecondaryBrush" Color="#8CFFFFFF"/>
+      <SolidColorBrush x:Key="TextTertiaryBrush" Color="#61FFFFFF"/>
+      <SolidColorBrush x:Key="AccentBrush" Color="#FF0A84FF"/>
+      <SolidColorBrush x:Key="AccentSoftBrush" Color="#380A84FF"/>
+      <SolidColorBrush x:Key="RowHoverBrush" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="RowActiveBrush" Color="#470A84FF"/>
+      <SolidColorBrush x:Key="RowActiveStrongBrush" Color="#5C0A84FF"/>
+      <SolidColorBrush x:Key="DividerBrush" Color="#1AFFFFFF"/>
+      <SolidColorBrush x:Key="ChipBgBrush" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="FavBgBrush" Color="#24000000"/>
+      <SolidColorBrush x:Key="FooterBgBrush" Color="#1F000000"/>
+      <SolidColorBrush x:Key="GridTileBgBrush" Color="#08FFFFFF"/>
+      <SolidColorBrush x:Key="SwitchTrackOffBrush" Color="#52303038"/>
+      <SolidColorBrush x:Key="StarBrush" Color="#FFD60A"/>
+      <!-- 顶部高光（对应 .launcher-glass::before） -->
+      <LinearGradientBrush x:Key="GlassHighlightBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Offset="0" Color="#14FFFFFF"/>
+        <GradientStop Offset="0.28" Color="#00FFFFFF"/>
+      </LinearGradientBrush>
 
-    <Grid>
+      <!-- 列表/平铺选中态：对齐 .result-item.active（accent-soft 圆角蓝） -->
+      <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="ListViewItemBackgroundPressed" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#470A84FF"/>
+      <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="#5C0A84FF"/>
+      <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPressed" Color="#5C0A84FF"/>
+      <SolidColorBrush x:Key="ListViewItemBorderBrushPointerOver" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="ListViewItemBorderBrushPressed" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="ListViewItemBorderBrushSelected" Color="#470A84FF"/>
+      <SolidColorBrush x:Key="GridViewItemBackgroundPointerOver" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="GridViewItemBackgroundPressed" Color="#14FFFFFF"/>
+      <SolidColorBrush x:Key="GridViewItemBackgroundSelected" Color="#470A84FF"/>
+      <SolidColorBrush x:Key="GridViewItemBackgroundSelectedPointerOver" Color="#5C0A84FF"/>
+      <SolidColorBrush x:Key="GridViewItemBackgroundSelectedPressed" Color="#5C0A84FF"/>
+      <SolidColorBrush x:Key="GridViewItemBorderBrushPointerOver" Color="#1AFFFFFF"/>
+      <SolidColorBrush x:Key="GridViewItemBorderBrushSelected" Color="#590A84FF"/>
+      <SolidColorBrush x:Key="GridViewItemBorderBrushSelectedPointerOver" Color="#590A84FF"/>
+
+      <!-- 设置页通用样式 -->
+      <Style x:Key="NavItemStyle" TargetType="Button">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Padding" Value="10,8"/>
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
+        <Setter Property="FontSize" Value="13"/>
+      </Style>
+
+      <Style x:Key="PresetStyle" TargetType="Button">
+        <Setter Property="Background" Value="{StaticResource ChipBgBrush}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource GlassBorderBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="Padding" Value="10,6"/>
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
+        <Setter Property="FontSize" Value="12"/>
+      </Style>
+
+      <Style x:Key="PaneRowBorder" TargetType="Border">
+        <Setter Property="BorderBrush" Value="{StaticResource DividerBrush}"/>
+        <Setter Property="BorderThickness" Value="0,0,0,1"/>
+        <Setter Property="Padding" Value="0,10"/>
+      </Style>
+
+      <!-- 原型 .switch（42x26 胶囊 + 滑块） -->
+      <Style x:Key="SwitchStyle" TargetType="ToggleSwitch">
+        <Setter Property="MinWidth" Value="0"/>
+        <Setter Property="MinHeight" Value="0"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ToggleSwitch">
+              <Grid Width="42" Height="26" Background="Transparent">
+                <VisualStateManager.VisualStateGroups>
+                  <VisualStateGroup x:Name="CommonStates">
+                    <VisualState x:Name="Normal"/>
+                    <VisualState x:Name="PointerOver"/>
+                    <VisualState x:Name="Pressed"/>
+                    <VisualState x:Name="Disabled">
+                      <VisualState.Setters>
+                        <Setter Target="Track.Opacity" Value="0.5"/>
+                        <Setter Target="Thumb.Opacity" Value="0.5"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                  </VisualStateGroup>
+                  <VisualStateGroup x:Name="ToggleStates">
+                    <VisualState x:Name="On">
+                      <VisualState.Setters>
+                        <Setter Target="Track.Fill" Value="#FF30D158"/>
+                        <Setter Target="ThumbTransform.X" Value="16"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Off">
+                      <VisualState.Setters>
+                        <Setter Target="Track.Fill" Value="{StaticResource SwitchTrackOffBrush}"/>
+                        <Setter Target="ThumbTransform.X" Value="0"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Indeterminate"/>
+                  </VisualStateGroup>
+                </VisualStateManager.VisualStateGroups>
+                <Border x:Name="Track" CornerRadius="13" Background="{StaticResource SwitchTrackOffBrush}"/>
+                <Border x:Name="Thumb" Width="22" Height="22" CornerRadius="11" Background="White"
+                        HorizontalAlignment="Left" VerticalAlignment="Top" Margin="2">
+                  <Border.RenderTransform>
+                    <TranslateTransform x:Name="ThumbTransform"/>
+                  </Border.RenderTransform>
+                </Border>
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+    </Grid.Resources>
+
+    <!-- 窗体外框（1px 玻璃描边） -->
+    <Border BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1" IsHitTestVisible="False"/>
+
+    <!-- ========== 搜索模式 ========== -->
+    <Grid x:Name="MainPanel">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
@@ -18,8 +140,8 @@
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
 
-      <!-- 搜索行 -->
-      <Grid Padding="18,16,14,14" ColumnSpacing="10">
+      <!-- 搜索行（对齐原型 .search-row：padding 16/18/14，gap 12） -->
+      <Grid Padding="18,16,18,14" ColumnSpacing="12">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="*"/>
@@ -28,45 +150,57 @@
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
 
-        <FontIcon Glyph="&#xE721;" FontSize="18" Foreground="#8CFFFFFF" VerticalAlignment="Center"/>
+        <!-- 放大镜（原型 SVG 描边风格） -->
+        <Path Data="M 11 4 A 7 7 0 1 0 11 18 A 7 7 0 1 0 11 4 M 16.5 16.5 L 21 21"
+              Stroke="{StaticResource TextSecondaryBrush}" StrokeThickness="1.8"
+              StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Width="20" Height="20"
+              VerticalAlignment="Center"/>
 
         <TextBox x:Name="QueryBox" Grid.Column="1"
                  PlaceholderText="搜索应用、文件、命令…"
                  FontSize="20"
                  Background="Transparent"
                  BorderThickness="0"
-                 Foreground="#EBEBEB"
-                 PlaceholderForeground="#61FFFFFF"
+                 Foreground="{StaticResource TextPrimaryBrush}"
+                 PlaceholderForeground="{StaticResource TextTertiaryBrush}"
                  TextChanged="OnQueryChanged"
                  KeyDown="OnQueryKeyDown"/>
 
         <TextBlock x:Name="SearchMeta" Grid.Column="2" Text="" FontSize="12"
-                   Foreground="#61FFFFFF" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                   Foreground="{StaticResource TextTertiaryBrush}" VerticalAlignment="Center" Margin="0,0,6,0"/>
 
-        <Border Grid.Column="3" Background="#14FFFFFF" CornerRadius="8"
-                BorderBrush="#1AFFFFFF" BorderThickness="1" Padding="2" VerticalAlignment="Center">
+        <!-- 视图切换（原型 .view-toggle：chip 底 + 边框） -->
+        <Border Grid.Column="3" Background="{StaticResource ChipBgBrush}" CornerRadius="8"
+                BorderBrush="{StaticResource DividerBrush}" BorderThickness="1" Padding="2" VerticalAlignment="Center">
           <StackPanel Orientation="Horizontal" Spacing="2">
             <Button x:Name="BtnViewList" Width="28" Height="26" Padding="0"
-                    Background="#380A84FF" BorderThickness="0" CornerRadius="6"
-                    Click="OnViewList" ToolTipService.ToolTip="列表">
-              <FontIcon Glyph="&#xE8FD;" FontSize="12" Foreground="#EBEBEB"/>
+                    Background="{StaticResource AccentSoftBrush}" BorderThickness="0" CornerRadius="6"
+                    Click="OnViewList" ToolTipService.ToolTip="列表视图">
+              <Path Data="M 2 3.9 H 14 M 2 8 H 14 M 2 12.1 H 14"
+                    Stroke="{StaticResource TextPrimaryBrush}" StrokeThickness="1.8" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                    Width="16" Height="16"/>
             </Button>
             <Button x:Name="BtnViewGrid" Width="28" Height="26" Padding="0"
                     Background="Transparent" BorderThickness="0" CornerRadius="6"
-                    Click="OnViewGrid" ToolTipService.ToolTip="平铺">
-              <FontIcon Glyph="&#xE8A9;" FontSize="12" Foreground="#61FFFFFF"/>
+                    Click="OnViewGrid" ToolTipService.ToolTip="平铺视图">
+              <Path Data="M 2 2 H 7 V 7 H 2 Z M 9 2 H 14 V 7 H 9 Z M 2 9 H 7 V 14 H 2 Z M 9 9 H 14 V 14 H 9 Z"
+                    Fill="{StaticResource TextTertiaryBrush}" Width="16" Height="16"/>
             </Button>
           </StackPanel>
         </Border>
 
-        <Button Grid.Column="4" Width="32" Height="32" Padding="0"
+        <!-- 设置按钮（原型 .icon-tool 32x32） -->
+        <Button Grid.Column="4" x:Name="BtnSettings" Width="32" Height="32" Padding="0"
                 Background="Transparent" BorderThickness="0" CornerRadius="8"
-                Click="OnOpenSettings" ToolTipService.ToolTip="设置">
-          <FontIcon Glyph="&#xE713;" FontSize="14" Foreground="#61FFFFFF"/>
+                Click="OnOpenSettings" ToolTipService.ToolTip="设置 (Ctrl+,)">
+          <Path Data="M 12 2 V 4 M 12 20 V 22 M 4.93 4.93 L 6.34 6.34 M 17.66 17.66 L 19.07 19.07 M 2 12 H 4 M 20 12 H 22 M 4.93 19.07 L 6.34 17.66 M 17.66 6.34 L 19.07 4.93 M 9 12 A 3 3 0 1 0 15 12 A 3 3 0 1 0 9 12"
+                Stroke="{StaticResource TextTertiaryBrush}" StrokeThickness="1.7"
+                StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Width="18" Height="18"/>
         </Button>
       </Grid>
 
-      <Border Grid.Row="1" Height="1" Margin="12,0" Background="#1AFFFFFF"/>
+      <!-- 分隔线（原型 .divider） -->
+      <Border Grid.Row="1" Height="1" Margin="12,0" Background="{StaticResource DividerBrush}"/>
 
       <!-- 列表 -->
       <ListView x:Name="ResultList" Grid.Row="2" Margin="8,6,8,4" MaxHeight="360"
@@ -97,24 +231,24 @@
                 </Border>
                 <Border CornerRadius="9" Background="{Binding IconBrush}"
                         Visibility="{Binding IconTextVisibility}">
-                  <TextBlock Text="{Binding IconGlyph}" FontSize="13" FontWeight="SemiBold"
+                  <TextBlock Text="{Binding IconGlyph}" FontSize="13" FontWeight="Medium"
                              Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
               </Grid>
               <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
-                <TextBlock Text="{Binding Title}" FontSize="14" FontWeight="SemiBold"
-                           Foreground="#EBEBEB" TextTrimming="CharacterEllipsis"/>
+                <TextBlock Text="{Binding Title}" FontSize="14" FontWeight="Medium"
+                           Foreground="{StaticResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis"/>
                 <TextBlock Text="{Binding Subtitle}" FontSize="12"
-                           Foreground="#8CFFFFFF" TextTrimming="CharacterEllipsis"/>
+                           Foreground="{StaticResource TextSecondaryBrush}" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
               <TextBlock Grid.Column="2" Text="{Binding SourceLabel}" FontSize="11"
-                         Foreground="#61FFFFFF" VerticalAlignment="Center"/>
+                         Foreground="{StaticResource TextTertiaryBrush}" VerticalAlignment="Center"/>
             </Grid>
           </DataTemplate>
         </ListView.ItemTemplate>
       </ListView>
 
-      <!-- 平铺（简单 Uniform 网格，避免 ItemsWrapGrid 问题） -->
+      <!-- 平铺（对齐原型 .results-grid：48 icon/圆角12/选中描边） -->
       <GridView x:Name="ResultGrid" Grid.Row="2" Margin="8,6,8,4" MaxHeight="360"
                 SelectionMode="Single" IsItemClickEnabled="True" ItemClick="OnItemClick"
                 Background="Transparent" BorderThickness="0" Visibility="Collapsed">
@@ -125,7 +259,9 @@
             <Setter Property="Margin" Value="4"/>
             <Setter Property="Padding" Value="8,10"/>
             <Setter Property="CornerRadius" Value="14"/>
+            <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="Background" Value="{StaticResource GridTileBgBrush}"/>
           </Style>
         </GridView.ItemContainerStyle>
         <GridView.ItemTemplate>
@@ -139,76 +275,289 @@
                 </Border>
                 <Border CornerRadius="12" Background="{Binding IconBrush}"
                         Visibility="{Binding IconTextVisibility}">
-                  <TextBlock Text="{Binding IconGlyph}" FontSize="16" FontWeight="SemiBold"
+                  <TextBlock Text="{Binding IconGlyph}" FontSize="16" FontWeight="Medium"
                              Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
               </Grid>
-              <TextBlock Text="{Binding Title}" FontSize="12" FontWeight="SemiBold"
-                         Foreground="#EBEBEB" TextAlignment="Center"
+              <TextBlock Text="{Binding Title}" FontSize="12" FontWeight="Medium"
+                         Foreground="{StaticResource TextPrimaryBrush}" TextAlignment="Center"
                          TextTrimming="CharacterEllipsis" MaxLines="2" TextWrapping="Wrap"/>
               <TextBlock Text="{Binding SourceLabel}" FontSize="10"
-                         Foreground="#61FFFFFF" HorizontalAlignment="Center"/>
+                         Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
             </StackPanel>
           </DataTemplate>
         </GridView.ItemTemplate>
       </GridView>
 
-      <!-- 收藏 -->
-      <Border Grid.Row="3" Background="#24000000" BorderBrush="#1AFFFFFF" BorderThickness="0,1,0,0"
-              Padding="12,8,12,10">
-        <StackPanel Spacing="8">
-          <StackPanel Orientation="Horizontal" Spacing="6">
-            <FontIcon Glyph="&#xE735;" FontSize="11" Foreground="#FFD60A"/>
-            <TextBlock Text="收藏" FontSize="11" FontWeight="SemiBold" Foreground="#61FFFFFF"/>
-            <TextBlock x:Name="FavCount" Text="" FontSize="11" Foreground="#61FFFFFF"/>
-          </StackPanel>
-          <ScrollViewer HorizontalScrollMode="Enabled" HorizontalScrollBarVisibility="Hidden"
-                        VerticalScrollMode="Disabled">
-            <StackPanel x:Name="FavIcons" Orientation="Horizontal" Spacing="6" MinHeight="56"/>
+      <!-- 收藏坞（对齐原型 .favorites：折叠 + 分组 tab + 72px 卡片） -->
+      <Border Grid.Row="3" Background="{StaticResource FavBgBrush}"
+              BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,1,0,0"
+              Padding="12,6,12,8">
+        <StackPanel x:Name="FavRoot" Spacing="8">
+          <Grid ColumnSpacing="8">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <Button x:Name="FavToggle" Background="Transparent" BorderThickness="0"
+                    Padding="2,4,6,4" CornerRadius="8" Click="OnFavToggle" ToolTipService.ToolTip="收起收藏">
+              <StackPanel Orientation="Horizontal" Spacing="5">
+                <Path x:Name="FavChevronPath" Data="M 4.5 6.2 L 8 9.7 L 11.5 6.2"
+                      Stroke="{StaticResource TextTertiaryBrush}" StrokeThickness="1.6"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Width="12" Height="12"
+                      VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5">
+                  <Path.RenderTransform>
+                    <RotateTransform/>
+                  </Path.RenderTransform>
+                </Path>
+                <Path Data="M 8 1.5 L 9.76 5.07 L 13.7 5.64 L 10.85 8.42 L 11.52 12.34 L 8 10.5 L 4.48 12.34 L 5.15 8.42 L 2.3 5.64 L 6.24 5.07 Z"
+                      Fill="{StaticResource StarBrush}" Width="12" Height="12" VerticalAlignment="Center"/>
+                <TextBlock Text="收藏" FontSize="11" FontWeight="SemiBold"
+                           Foreground="{StaticResource TextTertiaryBrush}" VerticalAlignment="Center"/>
+                <TextBlock x:Name="FavCount" Text="" FontSize="11"
+                           Foreground="{StaticResource TextTertiaryBrush}" VerticalAlignment="Center"/>
+              </StackPanel>
+            </Button>
+
+            <ScrollViewer Grid.Column="1" HorizontalScrollMode="Enabled"
+                          HorizontalScrollBarVisibility="Hidden" VerticalScrollMode="Disabled">
+              <StackPanel x:Name="FavGroups" Orientation="Horizontal" Spacing="4" Padding="0,2"/>
+            </ScrollViewer>
+
+            <Button x:Name="FavAddGroup" Grid.Column="2" Content="+" FontSize="14"
+                    Width="22" Height="22" Padding="0" Background="Transparent"
+                    BorderBrush="{StaticResource DividerBrush}" BorderThickness="1" CornerRadius="6"
+                    Click="OnFavAddGroup" ToolTipService.ToolTip="新建分组" VerticalAlignment="Center"/>
+          </Grid>
+
+          <ScrollViewer x:Name="FavBody" HorizontalScrollMode="Enabled"
+                        HorizontalScrollBarVisibility="Hidden" VerticalScrollMode="Disabled">
+            <StackPanel x:Name="FavItems" Orientation="Horizontal" Spacing="6"
+                        MinHeight="64" Padding="0,0,0,2"/>
           </ScrollViewer>
         </StackPanel>
       </Border>
 
-      <!-- 底栏 -->
-      <Grid Grid.Row="4" Padding="14,8,14,10" Background="#1F000000"
-            BorderBrush="#1AFFFFFF" BorderThickness="0,1,0,0">
+      <!-- 底栏（对齐原型 .footer：chips） -->
+      <Grid Grid.Row="4" Padding="14,8,14,10" Background="{StaticResource FooterBgBrush}"
+            BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,1,0,0">
         <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
-          <Border Background="#14FFFFFF" CornerRadius="6" Padding="8,3">
-            <TextBlock Text="Enter 打开" FontSize="11" Foreground="#8CFFFFFF"/>
+          <Border Background="{StaticResource ChipBgBrush}" CornerRadius="6" Padding="8,3">
+            <TextBlock Text="Enter 打开" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
           </Border>
-          <Border Background="#14FFFFFF" CornerRadius="6" Padding="8,3">
-            <TextBlock Text="↑↓ 选择" FontSize="11" Foreground="#8CFFFFFF"/>
+          <Border Background="{StaticResource ChipBgBrush}" CornerRadius="6" Padding="8,3">
+            <TextBlock Text="Tab 动作" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
           </Border>
-          <Border Background="#14FFFFFF" CornerRadius="6" Padding="8,3">
-            <TextBlock Text="Esc 关闭" FontSize="11" Foreground="#8CFFFFFF"/>
+          <Border Background="{StaticResource ChipBgBrush}" CornerRadius="6" Padding="8,3">
+            <TextBlock Text="Ctrl+, 设置" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
           </Border>
         </StackPanel>
-        <TextBlock x:Name="Footer" Text="本地 · 极速" FontSize="11" Foreground="#61FFFFFF"
+        <TextBlock x:Name="Footer" Text="本地 · 极速" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"
                    HorizontalAlignment="Right" VerticalAlignment="Center"/>
       </Grid>
     </Grid>
 
-    <!-- 设置 -->
-    <Grid x:Name="SettingsPanel" Visibility="Collapsed" Background="#F21C1C1E">
+    <!-- ========== 设置模式（同一主窗内切换，对齐原型 .mode-settings） ========== -->
+    <Grid x:Name="SettingsPanel" Visibility="Collapsed" Background="{StaticResource GlassBgBrush}"
+          KeyDown="OnSettingsKeyDown">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
       </Grid.RowDefinitions>
-      <Grid Padding="14,12" BorderBrush="#1AFFFFFF" BorderThickness="0,0,0,1">
-        <Button Content="← 返回" Click="OnCloseSettings" Background="#14FFFFFF"
-                BorderThickness="0" CornerRadius="8" Padding="10,6" FontSize="13"
-                Foreground="#8CFFFFFF" HorizontalAlignment="Left"/>
-        <TextBlock Text="设置" FontSize="14" FontWeight="SemiBold" Foreground="#EBEBEB"
+
+      <!-- 顶栏：返回 + 居中标题 -->
+      <Grid Padding="14,12" BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,0,0,1">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="48"/>
+        </Grid.ColumnDefinitions>
+        <Button Click="OnCloseSettings" Background="{StaticResource ChipBgBrush}"
+                BorderThickness="0" CornerRadius="8" Padding="10,6">
+          <StackPanel Orientation="Horizontal" Spacing="4">
+            <Path Data="M 10 3 L 5 8 L 10 13" Stroke="{StaticResource TextSecondaryBrush}"
+                  StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                  Width="16" Height="16"/>
+            <TextBlock Text="返回" FontSize="13" Foreground="{StaticResource TextSecondaryBrush}"/>
+          </StackPanel>
+        </Button>
+        <TextBlock Grid.Column="1" Text="设置" FontSize="14" FontWeight="SemiBold"
+                   Foreground="{StaticResource TextPrimaryBrush}"
                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
       </Grid>
-      <ScrollViewer Grid.Row="1" Padding="20,16">
-        <StackPanel Spacing="8" MaxWidth="480">
-          <TextBlock Text="热键由 Host 注册（默认 Alt+Space）。" FontSize="13"
-                     Foreground="#8CFFFFFF" TextWrapping="Wrap"/>
-          <TextBlock x:Name="AboutText" Text="Spark UI" FontSize="13"
-                     Foreground="#8CFFFFFF" TextWrapping="Wrap"/>
-        </StackPanel>
-      </ScrollViewer>
+
+      <!-- 左侧导航 + 右侧 pane -->
+      <Grid Grid.Row="1">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="120"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <Border BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,0,1,0" Padding="10,8">
+          <StackPanel Spacing="2">
+            <Button x:Name="NavGeneral" Content="通用" Tag="general" Style="{StaticResource NavItemStyle}" Click="OnSettingsNav"/>
+            <Button x:Name="NavHotkey" Content="热键" Tag="hotkey" Style="{StaticResource NavItemStyle}" Click="OnSettingsNav"/>
+            <Button x:Name="NavAppearance" Content="外观" Tag="appearance" Style="{StaticResource NavItemStyle}" Click="OnSettingsNav"/>
+            <Button x:Name="NavPlugins" Content="插件" Tag="plugins" Style="{StaticResource NavItemStyle}" Click="OnSettingsNav"/>
+          </StackPanel>
+        </Border>
+
+        <ScrollViewer Grid.Column="1" Padding="20,12,16,16">
+          <StackPanel>
+
+            <!-- 通用 -->
+            <StackPanel x:Name="PaneGeneral">
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="开机启动" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <ToggleSwitch x:Name="StartupSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Toggled="OnToggleStartup"/>
+                </Grid>
+              </Border>
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="失焦时隐藏" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <ToggleSwitch x:Name="HideFocusSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Toggled="OnToggleHideFocus"/>
+                </Grid>
+              </Border>
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="执行后隐藏" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <ToggleSwitch x:Name="HideInvokeSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Toggled="OnToggleHideInvoke"/>
+                </Grid>
+              </Border>
+              <TextBlock Text="系统托盘图标在任务栏通知区域（正式版），不在本窗口内。" FontSize="12"
+                         Foreground="{StaticResource TextSecondaryBrush}" Margin="0,12,0,0" TextWrapping="Wrap"/>
+              <TextBlock x:Name="AboutText" Text="Spark UI" FontSize="12"
+                         Foreground="{StaticResource TextTertiaryBrush}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+
+            <!-- 热键 -->
+            <StackPanel x:Name="PaneHotkey" Visibility="Collapsed">
+              <TextBlock Text="唤起热键" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
+              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,10,0,0">
+                <Button x:Name="BtnHotkeyAlt" Content="Alt + Space" Tag="Alt+Space"
+                        Click="OnHotkeyPreset" Style="{StaticResource PresetStyle}"/>
+                <Button x:Name="BtnHotkeyCtrl" Content="Ctrl + Space" Tag="Ctrl+Space"
+                        Click="OnHotkeyPreset" Style="{StaticResource PresetStyle}"/>
+              </StackPanel>
+              <TextBlock Text="默认 Alt+Space；冲突时可改 Ctrl+Space。" FontSize="12"
+                         Foreground="{StaticResource TextSecondaryBrush}" Margin="0,12,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+
+            <!-- 外观 -->
+            <StackPanel x:Name="PaneAppearance" Visibility="Collapsed">
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="主题" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <ComboBox x:Name="ThemeCombo" Grid.Column="1" MinWidth="150" FontSize="12" SelectionChanged="OnThemeChanged">
+                    <ComboBoxItem Content="跟随系统"/>
+                    <ComboBoxItem Content="深色玻璃"/>
+                    <ComboBoxItem Content="浅色玻璃"/>
+                  </ComboBox>
+                </Grid>
+              </Border>
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="默认视图" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <ComboBox x:Name="ViewCombo" Grid.Column="1" MinWidth="150" FontSize="12" SelectionChanged="OnViewChanged">
+                    <ComboBoxItem Content="列表"/>
+                    <ComboBoxItem Content="平铺"/>
+                  </ComboBox>
+                </Grid>
+              </Border>
+              <StackPanel Padding="0,10" BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,0,0,1">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="窗口宽度" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <TextBlock x:Name="WidthValue" Grid.Column="1" Text="800px" FontSize="12"
+                             Foreground="{StaticResource TextTertiaryBrush}" VerticalAlignment="Center"/>
+                </Grid>
+                <Slider x:Name="WidthSlider" Minimum="560" Maximum="840" StepFrequency="10"
+                        ValueChanged="OnWidthChanged" Margin="0,6,0,0"/>
+              </StackPanel>
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="减少动画" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                  <ToggleSwitch x:Name="ReduceMotionSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Toggled="OnToggleReduceMotion"/>
+                </Grid>
+              </Border>
+            </StackPanel>
+
+            <!-- 插件 -->
+            <StackPanel x:Name="PanePlugins" Visibility="Collapsed">
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <StackPanel>
+                    <TextBlock Text="Echo" FontSize="13" FontWeight="Medium" Foreground="{StaticResource TextPrimaryBrush}"/>
+                    <TextBlock Text="com.example.echo" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,2,0,0"/>
+                  </StackPanel>
+                  <ToggleSwitch x:Name="EchoSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" IsOn="True"/>
+                </Grid>
+              </Border>
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <StackPanel>
+                    <TextBlock Text="JSON 格式化" FontSize="13" FontWeight="Medium" Foreground="{StaticResource TextPrimaryBrush}"/>
+                    <TextBlock Text="需剪贴板权限" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,2,0,0"/>
+                  </StackPanel>
+                  <ToggleSwitch x:Name="JsonSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" IsOn="True"/>
+                </Grid>
+              </Border>
+              <Button Content="安装本地插件…" Click="OnInstallPlugin" Margin="0,14,0,0"
+                      Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                      BorderThickness="1" CornerRadius="8" FontSize="13"
+                      Foreground="{StaticResource TextPrimaryBrush}"/>
+              <TextBlock x:Name="PluginStatus" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                         Margin="0,10,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+
+          </StackPanel>
+        </ScrollViewer>
+      </Grid>
     </Grid>
+
+    <!-- 顶部高光（对应 .launcher-glass::before，置于最上避免被设置层盖住） -->
+    <Border IsHitTestVisible="False">
+      <Border.Background>
+        <StaticResource ResourceKey="GlassHighlightBrush"/>
+      </Border.Background>
+    </Border>
   </Grid>
 </Window>

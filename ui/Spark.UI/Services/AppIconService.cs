@@ -155,31 +155,12 @@ public static class AppIconService
                 var name = Path.GetFileNameWithoutExtension(lnk);
                 if (!keywords.Any(k => name.Contains(k, StringComparison.OrdinalIgnoreCase)))
                     continue;
-                var target = ResolveLnkTarget(lnk);
-                if (!string.IsNullOrEmpty(target) && File.Exists(target))
-                    return target;
+                // 直接返回 lnk 路径：ExtractFromFile 用 SHGetFileInfo 取关联图标，
+                // 避免 WScript.Shell COM 解析 target（MTA 线程上可能挂起）
+                return lnk;
             }
         }
         return null;
-    }
-
-    private static string? ResolveLnkTarget(string lnkPath)
-    {
-        try
-        {
-            var shellType = Type.GetTypeFromProgID("WScript.Shell");
-            if (shellType is null) return null;
-            dynamic shell = Activator.CreateInstance(shellType)!;
-            dynamic sc = shell.CreateShortcut(lnkPath);
-            string? target = sc.TargetPath as string;
-            Marshal.FinalReleaseComObject(sc);
-            Marshal.FinalReleaseComObject(shell);
-            return target;
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     private static ImageSource? ExtractFromFile(string path, int index)
