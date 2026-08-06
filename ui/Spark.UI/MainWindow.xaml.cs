@@ -62,6 +62,19 @@ public sealed partial class MainWindow : Window
     private bool _acrylicOk;
     /// <summary>同步设置控件时避免触发保存/换主题副作用。</summary>
     private bool _syncing;
+    /// <summary>列表/平铺切换动画；_viewAnimGen 让旧动画的 Completed 回调失配（快速连续切换不误折叠面板）。</summary>
+    private Storyboard? _viewAnim;
+    private int _viewAnimGen;
+    /// <summary>收藏坞抽屉动画：布局高度在每渲染帧（CompositionTarget.Rendering）手动驱动——
+    /// WinUI 3 的 Storyboard DoubleAnimation 对 Height 这类布局属性不渲染中间帧（实测零中间态），
+    /// 普通属性赋值才能保证每帧触发布局重排；用渲染帧同步驱动（而非 DispatcherTimer）让动画值
+    /// 与渲染帧对齐、每帧只布局一次，避免帧错位造成的卡顿。_favAnimGen 让被中断的旧动画落定失配。</summary>
+    private bool _favTweening;
+    private int _favAnimGen;
+    private bool _favCollapsing;
+    private double _favH0, _favH1, _favO0, _favG0, _favA0;
+    private long _favTweenStart;
+    private int _favTweenMs;
 
     public MainWindow()
     {
@@ -95,6 +108,7 @@ public sealed partial class MainWindow : Window
         _hideOnDeactivate = LocalState.Ui.HideOnFocusLost;
         ApplyTheme();
         SetView(LocalState.Ui.DefaultView == "grid");
+        CompositionTarget.Rendering += OnFavRendering;
         BuildAnimations();
 
         try { SetupChrome(); } catch (Exception ex) { App.Log("SetupChrome", ex); }
@@ -147,6 +161,7 @@ public sealed partial class MainWindow : Window
             HideLauncher();
             await RefreshResultsAsync("");
             RenderFavorites();
+            ApplyFavCollapse(!LocalState.Fav.Expanded, animate: false);
             _ = MaintainHostConnectionAsync();
         };
     }
@@ -897,12 +912,107 @@ public sealed partial class MainWindow : Window
             FavItems.Children.Add(btn);
         }
 
-        // 折叠状态
-        var collapsed = !fav.Expanded;
+        // 折叠状态由 ApplyFavCollapse 管（带动画），这里只同步提示文字
+        ToolTipService.SetToolTip(FavToggle, fav.Expanded ? "收起收藏" : "展开收藏");
+    }
+
+    /// <summary>
+    /// 收藏坞折叠态：像抽屉一样推回/拉出——主体高度逐帧伸缩 + 淡入淡出 + 箭头旋转 + 分组行淡出
+    /// （对齐原型 .favorites.is-collapsed 过渡）。animate=false 时直接落定（启动、新建分组、减少动画）。
+    /// </summary>
+    private void ApplyFavCollapse(bool collapsed, bool animate)
+    {
+        _favTweening = false;
+        _favAnimGen++;
+        var gen = _favAnimGen;
+
+        if (!animate || LocalState.Ui.ReduceMotion)
+        {
+            FavSettle(collapsed, gen);
+            return;
+        }
+
+        double h;
+        if (collapsed)
+        {
+            // 折叠：从当前实际高度开始收（此刻即自然高度，首帧无跳变）
+            h = FavBody.ActualHeight > 0 ? FavBody.ActualHeight : 76;
+        }
+        else
+        {
+            // 展开：先恢复列宽/可点（内容透明瞬间看不出跳变），量出内容自然高度
+            FavGroupsCol.Width = new GridLength(1, GridUnitType.Star);
+            FavAddGroup.Width = 22;
+            FavGroups.IsHitTestVisible = FavAddGroup.IsHitTestVisible = true;
+            FavBody.Visibility = Visibility.Visible;
+            FavBody.Height = double.NaN;
+            FavBody.UpdateLayout();
+            h = FavBody.ActualHeight > 0 ? FavBody.ActualHeight : 76;
+            // 量完立即压回 0 并应用布局：否则 Timer 首帧前会按自然高度闪出一帧完整抽屉
+            // （展开时"弹一下"的来源：完整展开一帧 → 瞬间缩回 0 → 再平滑拉出）
+            FavBody.Height = 0;
+            FavBody.UpdateLayout();
+        }
+
+        // 起点取当前实际值，连续快速切换可从中途续动
+        _favCollapsing = collapsed;
+        _favH0 = collapsed ? h : 0;
+        _favH1 = collapsed ? 0 : h;
+        _favO0 = FavBody.Opacity;
+        _favG0 = FavGroups.Opacity;
+        _favA0 = FavChevronPath.RenderTransform is RotateTransform rt ? rt.Angle : 0;
+        _favTweenStart = Environment.TickCount64;
+        // 展开比收起更轻快（240ms），收起 320ms 保持利落
+        _favTweenMs = collapsed ? 320 : 240;
+        FavBody.Visibility = Visibility.Visible;
+        _favTweening = true;
+    }
+
+    /// <summary>每渲染帧：按缓动曲线插值高度/透明度/箭头/分组行，结束后落定。</summary>
+    private void OnFavRendering(object? sender, object e)
+    {
+        if (!_favTweening) return;
+        var t = (Environment.TickCount64 - _favTweenStart) / (double)_favTweenMs;
+        var done = t >= 1;
+        if (done) t = 1;
+        // 缓动：收起走 cubic ease-out（先快后慢，退场利落）；
+        // 展开走 quadratic ease-out（起步比 smoothstep 快，消除"沉重感"，又比 cubic 温和不会冲）
+        var k = _favCollapsing
+            ? 1 - Math.Pow(1 - t, 3)
+            : 1 - Math.Pow(1 - t, 2);
+
+        FavBody.Height = _favH0 + (_favH1 - _favH0) * k;
+        FavBody.Opacity = _favO0 + ((_favCollapsing ? 0 : 1) - _favO0) * k;
+        if (FavChevronPath.RenderTransform is RotateTransform rt)
+            rt.Angle = _favA0 + ((_favCollapsing ? -90 : 0) - _favA0) * k;
+        FavGroups.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
+        FavAddGroup.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
+        // 抽屉收起时按钮行与收藏条的间距同步收紧，展开恢复（k：折叠 1→0 / 展开 0→1）。
+        // 结果列表高度不在这里驱动——ListView 在 * 行里自动跟随收藏坞腾出的空间
+        FavRoot.Spacing = 8 * k;
+
+        if (done)
+        {
+            _favTweening = false;
+            FavSettle(_favCollapsing, _favAnimGen);
+        }
+    }
+
+    /// <summary>落定收藏坞折叠态（动画结束 / 减少动画 / 启动）。</summary>
+    private void FavSettle(bool collapsed, int gen)
+    {
+        if (gen != _favAnimGen) return;
         FavBody.Visibility = collapsed ? Visibility.Collapsed : Visibility.Visible;
+        FavBody.Height = double.NaN;
+        FavBody.Opacity = 1;
+        FavRoot.Spacing = collapsed ? 0 : 8;
+        FavGroupsCol.Width = collapsed ? new GridLength(0) : new GridLength(1, GridUnitType.Star);
+        FavAddGroup.Width = collapsed ? 0 : 22;
+        FavGroups.Opacity = collapsed ? 0 : 1;
+        FavAddGroup.Opacity = collapsed ? 0 : 1;
+        FavGroups.IsHitTestVisible = FavAddGroup.IsHitTestVisible = !collapsed;
         if (FavChevronPath.RenderTransform is RotateTransform rt)
             rt.Angle = collapsed ? -90 : 0;
-        ToolTipService.SetToolTip(FavToggle, collapsed ? "展开收藏" : "收起收藏");
     }
 
     private void OnFavToggle(object sender, RoutedEventArgs e)
@@ -911,6 +1021,7 @@ public sealed partial class MainWindow : Window
         fav.Expanded = !fav.Expanded;
         LocalState.SaveFav();
         RenderFavorites();
+        ApplyFavCollapse(!fav.Expanded, animate: true);
     }
 
     private async void OnFavAddGroup(object sender, RoutedEventArgs e)
@@ -935,6 +1046,7 @@ public sealed partial class MainWindow : Window
             LocalState.Fav.Expanded = true;
             LocalState.SaveFav();
             RenderFavorites();
+            ApplyFavCollapse(false, animate: false);
         }
     }
 
@@ -942,9 +1054,8 @@ public sealed partial class MainWindow : Window
 
     private void SetView(bool grid)
     {
+        if (_gridView == grid) return;
         _gridView = grid;
-        ResultList.Visibility = grid ? Visibility.Collapsed : Visibility.Visible;
-        ResultGrid.Visibility = grid ? Visibility.Visible : Visibility.Collapsed;
         var res = Root.Resources;
         var activeBg = (Brush)res["AccentSoftBrush"];
         var idleBg = new SolidColorBrush(Colors.Transparent);
@@ -954,6 +1065,70 @@ public sealed partial class MainWindow : Window
             pl.Stroke = grid ? (Brush)res["TextTertiaryBrush"] : (Brush)res["TextPrimaryBrush"];
         if (BtnViewGrid.Content is XamlPath pg)
             pg.Fill = grid ? (Brush)res["TextPrimaryBrush"] : (Brush)res["TextTertiaryBrush"];
+
+        // 列表 ↔ 平铺：出场淡出+轻微缩小下沉，入场放大浮现（对齐原型 .is-leaving / view-enter-*）
+        var outgoing = grid ? (UIElement)ResultList : (UIElement)ResultGrid;
+        var incoming = grid ? (UIElement)ResultGrid : (UIElement)ResultList;
+
+        _viewAnim?.Stop();
+        _viewAnimGen++;
+        var gen = _viewAnimGen;
+
+        if (LocalState.Ui.ReduceMotion)
+        {
+            ResultList.Opacity = 1;
+            ResultGrid.Opacity = 1;
+            outgoing.Visibility = Visibility.Collapsed;
+            incoming.Visibility = Visibility.Visible;
+            return;
+        }
+
+        // 上次动画可能中断在半途：两个面板同格叠放，先复位到可见不透明再播动画（Begin 立即套用 From 值，无闪烁）
+        ResultList.Visibility = Visibility.Visible;
+        ResultGrid.Visibility = Visibility.Visible;
+        ResultList.Opacity = 1;
+        ResultGrid.Opacity = 1;
+
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        var inDur = new Duration(TimeSpan.FromMilliseconds(280));
+        var outDur = new Duration(TimeSpan.FromMilliseconds(220));
+        var sb = new Storyboard();
+        void Add(DependencyObject target, string prop, double from, double to, Duration d)
+        {
+            var a = new DoubleAnimation { From = from, To = to, Duration = d, EasingFunction = ease };
+            Storyboard.SetTarget(a, target);
+            Storyboard.SetTargetProperty(a, prop);
+            sb.Children.Add(a);
+        }
+
+        // 出场：淡出 + 缩到 0.97 + 下沉 6px（对齐原型 .results.is-leaving）
+        var outT = new CompositeTransform();
+        outgoing.RenderTransform = outT;
+        Add(outgoing, "Opacity", 1, 0, outDur);
+        Add(outT, "ScaleX", 1, 0.97, outDur);
+        Add(outT, "ScaleY", 1, 0.97, outDur);
+        Add(outT, "TranslateY", 0, 6, outDur);
+
+        // 入场：平铺从下方 10px 放大浮现（scale 0.94），列表从左侧 -12px 滑入（scale 0.98）
+        var inT = grid
+            ? new CompositeTransform { ScaleX = 0.94, ScaleY = 0.94, TranslateY = 10 }
+            : new CompositeTransform { ScaleX = 0.98, ScaleY = 0.98, TranslateX = -12 };
+        incoming.RenderTransform = inT;
+        Add(incoming, "Opacity", 0, 1, inDur);
+        Add(inT, "ScaleX", inT.ScaleX, 1, inDur);
+        Add(inT, "ScaleY", inT.ScaleY, 1, inDur);
+        if (grid)
+            Add(inT, "TranslateY", 10, 0, inDur);
+        else
+            Add(inT, "TranslateX", -12, 0, inDur);
+
+        sb.Completed += (_, _) =>
+        {
+            if (gen != _viewAnimGen) return;
+            outgoing.Visibility = Visibility.Collapsed;
+        };
+        _viewAnim = sb;
+        sb.Begin();
     }
 
     private void OnViewList(object sender, RoutedEventArgs e)
@@ -1075,6 +1250,15 @@ public sealed partial class MainWindow : Window
         _animIn.Stop();
         _animOut.Stop();
         ResetPop();
+        // 停掉列表/平铺切换动画，按当前视图直接落定（防止中断在半透明/半缩放状态）
+        _viewAnim?.Stop();
+        _viewAnimGen++;
+        ResultList.Visibility = _gridView ? Visibility.Collapsed : Visibility.Visible;
+        ResultGrid.Visibility = _gridView ? Visibility.Visible : Visibility.Collapsed;
+        ResultList.Opacity = 1;
+        ResultGrid.Opacity = 1;
+        // 收藏坞同理直接落定
+        ApplyFavCollapse(!LocalState.Fav.Expanded, animate: false);
     }
 
     private void OnThemeChanged(object sender, SelectionChangedEventArgs e)

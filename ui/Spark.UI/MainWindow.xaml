@@ -209,7 +209,7 @@
       <Border Grid.Row="1" Height="1" Margin="12,0" Background="{StaticResource DividerBrush}"/>
 
       <!-- 列表 -->
-      <ListView x:Name="ResultList" Grid.Row="2" Margin="8,6,8,4" MaxHeight="360"
+      <ListView x:Name="ResultList" Grid.Row="2" Margin="8,6,8,4"
                 SelectionMode="Single" IsItemClickEnabled="True" ItemClick="OnItemClick"
                 Background="Transparent" BorderThickness="0">
         <ListView.ItemContainerStyle>
@@ -258,7 +258,7 @@
            默认模板的 ListViewItemPresenter 圆角只认主题资源 GridViewItemCornerRadius（=4），
            样式里的 CornerRadius 不生效；这里自定义模板用 Border 画圆角卡（12）。
            平时卡片透明不可见，只有选中（光标处）才显示 accent 圆角框，当作选中指示器 -->
-      <GridView x:Name="ResultGrid" Grid.Row="2" Margin="8,6,8,4" MaxHeight="360"
+      <GridView x:Name="ResultGrid" Grid.Row="2" Margin="8,6,8,4"
                 SelectionMode="Single" IsItemClickEnabled="True" ItemClick="OnItemClick"
                 Background="Transparent" BorderThickness="0" Visibility="Collapsed">
         <GridView.ItemContainerStyle>
@@ -359,7 +359,7 @@
           <Grid ColumnSpacing="8">
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="*"/>
+              <ColumnDefinition x:Name="FavGroupsCol" Width="*"/>
               <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
