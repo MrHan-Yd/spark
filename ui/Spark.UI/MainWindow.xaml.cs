@@ -73,6 +73,8 @@ public sealed partial class MainWindow : Window
     private int _favAnimGen;
     private bool _favCollapsing;
     private double _favH0, _favH1, _favO0, _favG0, _favA0;
+    /// <summary>分组列起始宽度（随动画同步收放，避免落定时列宽瞬间跳变造成尾部卡顿）。</summary>
+    private double _favGroupsW0;
     private long _favTweenStart;
     private int _favTweenMs;
 
@@ -937,6 +939,7 @@ public sealed partial class MainWindow : Window
         {
             // 折叠：从当前实际高度开始收（此刻即自然高度，首帧无跳变）
             h = FavBody.ActualHeight > 0 ? FavBody.ActualHeight : 76;
+            _favGroupsW0 = FavGroupsCol.ActualWidth > 0 ? FavGroupsCol.ActualWidth : 300;
         }
         else
         {
@@ -948,6 +951,7 @@ public sealed partial class MainWindow : Window
             FavBody.Height = double.NaN;
             FavBody.UpdateLayout();
             h = FavBody.ActualHeight > 0 ? FavBody.ActualHeight : 76;
+            _favGroupsW0 = FavGroupsCol.ActualWidth > 0 ? FavGroupsCol.ActualWidth : 300;
             // 量完立即压回 0 并应用布局：否则 Timer 首帧前会按自然高度闪出一帧完整抽屉
             // （展开时"弹一下"的来源：完整展开一帧 → 瞬间缩回 0 → 再平滑拉出）
             FavBody.Height = 0;
@@ -962,8 +966,8 @@ public sealed partial class MainWindow : Window
         _favG0 = FavGroups.Opacity;
         _favA0 = FavChevronPath.RenderTransform is RotateTransform rt ? rt.Angle : 0;
         _favTweenStart = Environment.TickCount64;
-        // 展开比收起更轻快（240ms），收起 320ms 保持利落
-        _favTweenMs = collapsed ? 320 : 240;
+        // 展开 240ms 轻快，收起 280ms（1.5 次方曲线下前后更均匀）
+        _favTweenMs = collapsed ? 280 : 240;
         FavBody.Visibility = Visibility.Visible;
         _favTweening = true;
     }
@@ -975,10 +979,10 @@ public sealed partial class MainWindow : Window
         var t = (Environment.TickCount64 - _favTweenStart) / (double)_favTweenMs;
         var done = t >= 1;
         if (done) t = 1;
-        // 缓动：收起走 cubic ease-out（先快后慢，退场利落）；
-        // 展开走 quadratic ease-out（起步比 smoothstep 快，消除"沉重感"，又比 cubic 温和不会冲）
+        // 缓动：收起走 1-(1-t)^1.5——速度从 1.5 线性降到 0，比 quadratic（2→0）前后段更均匀、
+        // 不拖尾（quadratic 后段明显偏慢，感知"前后不和谐"）；展开保持 quadratic（轻快）
         var k = _favCollapsing
-            ? 1 - Math.Pow(1 - t, 3)
+            ? 1 - Math.Pow(1 - t, 1.5)
             : 1 - Math.Pow(1 - t, 2);
 
         FavBody.Height = _favH0 + (_favH1 - _favH0) * k;
@@ -987,9 +991,12 @@ public sealed partial class MainWindow : Window
             rt.Angle = _favA0 + ((_favCollapsing ? -90 : 0) - _favA0) * k;
         FavGroups.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
         FavAddGroup.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
-        // 抽屉收起时按钮行与收藏条的间距同步收紧，展开恢复（k：折叠 1→0 / 展开 0→1）。
-        // 结果列表高度不在这里驱动——ListView 在 * 行里自动跟随收藏坞腾出的空间
-        FavRoot.Spacing = 8 * k;
+        // 布局型属性（间距/分组列宽/按钮宽）只在前半程收放，后半程保持终值——
+        // 避免尾部多布局属性叠加（ScrollViewer 裁剪 + 列宽重排）导致单帧超时、动画"直接跳到底"
+        var p = _favCollapsing ? 1 - Math.Min(1, (1 - k) * 2) : Math.Min(1, k * 2);
+        FavRoot.Spacing = 8 * p;
+        FavGroupsCol.Width = new GridLength(_favGroupsW0 * p);
+        FavAddGroup.Width = 22 * p;
 
         if (done)
         {
@@ -1356,13 +1363,19 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>根上 handledEventsToo 收箭头键：输入框有文本时 TextBox 已先消费箭头（光标移动），
-    /// 这里统一只移动下面选中项，并把输入框光标拉回末尾（搜索框只能输入/退格，不能移光标）。</summary>
+    /// <summary>根上 handledEventsToo 收箭头键（冒泡终点）：输入框有文本时 TextBox 已先消费箭头（光标移动），
+    /// 这里仍能收到，统一只移动下面选中项，并把输入框光标拉回末尾（搜索框只能输入/退格，不能移光标）。
+    /// 列表/平铺都走这里：列表视图左右等价上一条/下一条，平铺按网格行列移动。
+    /// 焦点在收藏坞交互件上时不接管（方向键留给按钮导航）；其余位置（搜索框/列表/平铺/视图切换…）箭头键都移动结果选中项——
+    /// 列表视图点击条目后焦点落在 ListViewItem 上，原生 ListView 只处理上下、左右是死键（平铺原生是 2D 没这问题），
+    /// 必须在这里统一接管，两视图行为才一致。
+    /// 注意：焦点在条目上时原生 ListView/GridView 会先于本处理器移动选中（键盘光标跟随），
+    /// 因此这里从 _active（按下前的值）计算目标并绝对赋值；若读 SelectedIndex 重算会叠加上原生那一步，造成双重移动。</summary>
     private void OnRootKeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (_composing) return;                       // IME 组词中不拦截
         if (MainPanel.Visibility != Visibility.Visible) return; // 设置页里不动
-        if (QueryBox.FocusState == FocusState.Unfocused) return; // 焦点在网格/收藏等：交给原生处理
+        if (IsFocusOnFavorites()) return;             // 焦点在收藏坞：交给原生方向键导航
         if (e.Key is not (VirtualKey.Down or VirtualKey.Up or VirtualKey.Left or VirtualKey.Right)) return;
 
         e.Handled = true;
@@ -1390,6 +1403,15 @@ public sealed partial class MainWindow : Window
         }
         _active = Math.Clamp(_active + delta, 0, _items.Count - 1);
         SyncSelection();
+    }
+
+    /// <summary>焦点是否落在收藏坞（或其按钮）内；是则箭头键交给原生方向键导航。</summary>
+    private bool IsFocusOnFavorites()
+    {
+        if (FocusManager.GetFocusedElement() is not FrameworkElement fe) return false;
+        for (DependencyObject? p = fe; p is not null; p = VisualTreeHelper.GetParent(p))
+            if (ReferenceEquals(p, FavRoot)) return true;
+        return false;
     }
 
     /// <summary>按已布局的第一行元素推断平铺列数（跟随窗口宽度，不用硬编码）。</summary>
