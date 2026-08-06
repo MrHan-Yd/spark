@@ -72,7 +72,7 @@ public sealed partial class MainWindow : Window
     private bool _favTweening;
     private int _favAnimGen;
     private bool _favCollapsing;
-    private double _favH0, _favH1, _favO0, _favG0, _favA0;
+    private double _favH0, _favH1, _favO0, _favG0, _favA0, _favS0;
     /// <summary>分组列起始宽度（随动画同步收放，避免落定时列宽瞬间跳变造成尾部卡顿）。</summary>
     private double _favGroupsW0;
     private long _favTweenStart;
@@ -964,7 +964,8 @@ public sealed partial class MainWindow : Window
         _favH1 = collapsed ? 0 : h;
         _favO0 = FavBody.Opacity;
         _favG0 = FavGroups.Opacity;
-        _favA0 = FavChevronPath.RenderTransform is RotateTransform rt ? rt.Angle : 0;
+        _favA0 = FavChevronRotate.Angle;
+        _favS0 = FavChevronShift.Y;
         _favTweenStart = Environment.TickCount64;
         // 展开 240ms 轻快，收起 280ms（1.5 次方曲线下前后更均匀）
         _favTweenMs = collapsed ? 280 : 240;
@@ -987,8 +988,9 @@ public sealed partial class MainWindow : Window
 
         FavBody.Height = _favH0 + (_favH1 - _favH0) * k;
         FavBody.Opacity = _favO0 + ((_favCollapsing ? 0 : 1) - _favO0) * k;
-        if (FavChevronPath.RenderTransform is RotateTransform rt)
-            rt.Angle = _favA0 + ((_favCollapsing ? -90 : 0) - _favA0) * k;
+        FavChevronRotate.Angle = _favA0 + ((_favCollapsing ? -90 : 0) - _favA0) * k;
+        // 收起后箭头旋转成竖长 ">"：视觉重心比星星/文字高约 2px，随动画下移对齐（展开恢复）
+        FavChevronShift.Y = _favS0 + ((_favCollapsing ? 2 : 0) - _favS0) * k;
         FavGroups.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
         FavAddGroup.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
         // 布局型属性（间距/分组列宽/按钮宽）只在前半程收放，后半程保持终值——
@@ -1018,8 +1020,8 @@ public sealed partial class MainWindow : Window
         FavGroups.Opacity = collapsed ? 0 : 1;
         FavAddGroup.Opacity = collapsed ? 0 : 1;
         FavGroups.IsHitTestVisible = FavAddGroup.IsHitTestVisible = !collapsed;
-        if (FavChevronPath.RenderTransform is RotateTransform rt)
-            rt.Angle = collapsed ? -90 : 0;
+        FavChevronRotate.Angle = collapsed ? -90 : 0;
+        FavChevronShift.Y = collapsed ? 2 : 0;
     }
 
     private void OnFavToggle(object sender, RoutedEventArgs e)
