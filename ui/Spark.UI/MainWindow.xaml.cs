@@ -35,6 +35,10 @@ public sealed partial class MainWindow : Window
     private bool _gridView;
     private IntPtr _hwnd;
     private int _queryGen;
+    /// <summary>前台变化钩子句柄（失焦隐藏用，不依赖 Activated 事件）。</summary>
+    private IntPtr _fgHook;
+    /// <summary>钩子回调委托必须持有引用，否则被 GC 回收后回调悬空导致崩溃。</summary>
+    private readonly WinEventDelegate _fgHookProc;
     /// <summary>显示后短时忽略失焦，避免 ForceForeground / 热键抢焦导致闪一下就关。</summary>
     private long _ignoreDeactivateUntilTicks;
     /// <summary>合并 event + pipe 双通道重复 toggle。</summary>
@@ -42,6 +46,14 @@ public sealed partial class MainWindow : Window
 
     /// <summary>是否已把窗口放上屏幕；已显示过且没保存位置时不再重排（OS 保留拖拽后的位置）。</summary>
     private bool _everPlaced;
+    /// <summary>隐藏 pop-out 动画播放中（_visible 尚未复位，此时收到 toggle 应取消关闭）。</summary>
+    private bool _hideAnimating;
+    /// <summary>隐藏代数：显示/取消隐藏时 +1，让已排队的 _animOut.Completed→HideNow 失配跳过（防止刚显示的窗口又被延迟的 HideNow 关掉）。</summary>
+    private int _hideGen;
+    /// <summary>本次隐藏动画开始时的代数。</summary>
+    private int _animHideGen;
+    /// <summary>IME 组词中：期间箭头键交给输入法（不拦截）。</summary>
+    private bool _composing;
 
     // 弹出动画（对齐原型 pop-in / pop-out）
     private readonly CompositeTransform _pop = new();
@@ -61,11 +73,18 @@ public sealed partial class MainWindow : Window
         ResultGrid.ItemsSource = _items;
         LocalState.Load();
 
+        // 箭头键在根上全局接管（handledEventsToo=true：输入框有文本时会先消费箭头键并把事件标为已处理，
+        // 普通 KeyDown 收不到；这里在冒泡终点仍能收到），统一只控制下面选中项
+        Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnRootKeyDown), true);
+        // IME 组词期间不拦截箭头（组词光标移动由输入法管），否则会破坏中文输入
+        QueryBox.TextCompositionStarted += (_, _) => _composing = true;
+        QueryBox.TextCompositionEnded += (_, _) => _composing = false;
+
         Root.RenderTransform = _pop;
         // 拖拽 caption 区域跟随窗口尺寸（宽度滑杆/布局变化）
         Root.SizeChanged += (_, _) => UpdateDragRegions();
-
-        // 玻璃背景：先试 Acrylic，失败自动退回稳定深色（历史上有 Acrylic 闪退问题）
+        // 钩子回调委托持有引用防 GC（字段初始化器不能引用实例方法，放构造函数）
+        _fgHookProc = OnForegroundChanged;        // 玻璃背景：先试 Acrylic，失败自动退回稳定深色（历史上有 Acrylic 闪退问题）
         try
         {
             SystemBackdrop = new DesktopAcrylicBackdrop();
@@ -105,6 +124,11 @@ public sealed partial class MainWindow : Window
 
         Closed += async (_, _) =>
         {
+            if (_fgHook != IntPtr.Zero)
+            {
+                try { UnhookWinEvent(_fgHook); } catch { /* ignore */ }
+                _fgHook = IntPtr.Zero;
+            }
             _toggleWatcher?.Dispose();
             _toggleWatcher = null;
             await _host.DisposeAsync();
@@ -168,6 +192,8 @@ public sealed partial class MainWindow : Window
             ["FavBgBrush"] = dark ? 0x24000000u : 0x38FFFFFFu,
             ["FooterBgBrush"] = dark ? 0x1F000000u : 0x40FFFFFFu,
             ["GridTileBgBrush"] = dark ? 0x08FFFFFFu : 0x59FFFFFFu,
+            ["GridTileSelBgBrush"] = dark ? 0x1EFFFFFFu : 0x12000000u,
+            ["GridTileSelBorderBrush"] = dark ? 0x40FFFFFFu : 0x33000000u,
             ["SwitchTrackOffBrush"] = dark ? 0x52303038u : 0x33000000u,
             ["StarBrush"] = 0xFFFFD60Au,
             // 列表 / 平铺 选中态
@@ -251,7 +277,13 @@ public sealed partial class MainWindow : Window
 
         _animIn = BuildAnim(0, 1, 0.96, 1, 6, 0, inDur, ease);
         _animOut = BuildAnim(1, 0, 1, 0.97, 0, 4, outDur, ease);
-        _animOut.Completed += (_, _) => HideNow();
+        _animOut.Completed += (_, _) =>
+        {
+            _hideAnimating = false;
+            // 动画完成回调可能已排队：期间若窗口被重新显示/取消隐藏（代数已变），跳过隐藏
+            if (_animHideGen == _hideGen)
+                HideNow();
+        };
     }
 
     private Storyboard BuildAnim(double op0, double op1, double sc0, double sc1, double ty0, double ty1,
@@ -324,6 +356,31 @@ public sealed partial class MainWindow : Window
             return;
         _lastToggleTicks = now;
 
+        // 兜底：_visible 与窗口真实可见性可能错位（失焦隐藏路径异常/动画中断/外部隐藏）。
+        // 以真实状态为准，避免"窗口已隐藏但 _visible=true"导致快捷键第一次走关闭分支。
+        if (_hwnd != IntPtr.Zero && !IsWindowVisible(_hwnd) && _visible)
+        {
+            _visible = false;
+            _hideAnimating = false;
+            _animOut.Stop();
+            ResetPop();
+        }
+
+        // 隐藏 pop-out 播放中（失焦关闭中）按快捷键 = 取消关闭：窗口留下并抢回焦点。
+        // 否则会走"关闭"分支（_visible 尚未复位），导致"按一次像关闭，要按两次才唤起"。
+        if (_hideAnimating)
+        {
+            _hideGen++;  // 使已排队的 _animOut.Completed→HideNow 失配
+            _hideAnimating = false;
+            _animOut.Stop();
+            ResetPop();
+            _visible = true;
+            ForceForeground();
+            Activate();
+            QueryBox.Focus(FocusState.Programmatic);
+            return;
+        }
+
         if (_visible)
             HideLauncher();
         else
@@ -354,7 +411,6 @@ public sealed partial class MainWindow : Window
         var id = Win32Interop.GetWindowIdFromWindow(_hwnd);
         _appWindow = AppWindow.GetFromWindowId(id);
         _appWindow.Title = "Spark";
-
         var icon = FindIconPath();
         if (icon is not null)
         {
@@ -399,6 +455,30 @@ public sealed partial class MainWindow : Window
 
         MakeFrameless();
         PlaceWindow(LocalState.Ui.WindowWidth, 590);
+
+        // 前台变化钩子：点击外面/Alt+Tab 的本质是前台从本窗口切走。
+        // 不依赖 WinUI 的 Activated 事件（该事件在部分环境下不可靠/不触发），
+        // 用 Win32 EVENT_SYSTEM_FOREGROUND 精确感知"失焦"。
+        try
+        {
+            _fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                IntPtr.Zero, _fgHookProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        }
+        catch (Exception ex) { App.Log("WinEventHook", ex); }
+    }
+
+    /// <summary>前台窗口变化（全局钩子回调，钩子线程）。</summary>
+    private void OnForegroundChanged(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild,
+        uint dwEventThread, uint dwmsEventTime)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            if (hwnd == _hwnd) return;  // 前台变成自己（打开/抢焦点）
+            if (!_visible) return;
+            if (Environment.TickCount64 < _ignoreDeactivateUntilTicks) return;
+            if (!_hideOnDeactivate || SettingsPanel.Visibility == Visibility.Visible) return;
+            HideLauncher();
+        });
     }
 
     private void SetupTray()
@@ -534,8 +614,13 @@ public sealed partial class MainWindow : Window
             QueryBox.Text = "";
             _ = RefreshResultsAsync("");
             QueryBox.Focus(FocusState.Programmatic);
+            // 前台锁偶发拦截 SetForegroundWindow（窗口显示但未激活 → 点击外面不会触发失焦隐藏）。
+            // 延迟重试几次，确保窗口真正拿到前台。
+            _ = RetryFocusAsync();
 
             // pop-in（对齐原型 .launcher 入场）
+            _hideGen++;  // 使已排队的隐藏动画 Completed→HideNow 失配，防止刚显示的窗口被延迟关掉
+            _hideAnimating = false;
             _animOut.Stop();
             if (LocalState.Ui.ReduceMotion)
             {
@@ -558,6 +643,20 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>显示后延迟重试抢前台，直到窗口确实处于前台或状态变化。</summary>
+    private async Task RetryFocusAsync()
+    {
+        for (var i = 0; i < 3; i++)
+        {
+            await Task.Delay(120);
+            if (!_visible || _hwnd == IntPtr.Zero)
+                return;
+            if (GetForegroundWindow() == _hwnd)
+                return;
+            ForceForeground();
+        }
+    }
+
     public void HideLauncher()
     {
         // 保护期内禁止隐藏（防闪关）
@@ -572,10 +671,11 @@ public sealed partial class MainWindow : Window
             HideNow();
             return;
         }
+        _hideAnimating = true;
+        _animHideGen = ++_hideGen;
         _animIn.Stop();
         _animOut.Begin();
     }
-
     private void HideNow()
     {
         // 拖拽后的位置在隐藏时落盘（拖动过程不逐帧写盘；仅窗口真正显示过才会走到这里）
@@ -856,9 +956,24 @@ public sealed partial class MainWindow : Window
             pg.Fill = grid ? (Brush)res["TextPrimaryBrush"] : (Brush)res["TextTertiaryBrush"];
     }
 
-    private void OnViewList(object sender, RoutedEventArgs e) => SetView(false);
+    private void OnViewList(object sender, RoutedEventArgs e)
+    {
+        SetView(false);
+        SaveViewPreference();
+    }
 
-    private void OnViewGrid(object sender, RoutedEventArgs e) => SetView(true);
+    private void OnViewGrid(object sender, RoutedEventArgs e)
+    {
+        SetView(true);
+        SaveViewPreference();
+    }
+
+    /// <summary>记住用户视图偏好，下次启动沿用。</summary>
+    private void SaveViewPreference()
+    {
+        LocalState.Ui.DefaultView = _gridView ? "grid" : "list";
+        LocalState.SaveUi();
+    }
 
     // ==================== 设置 ====================
 
@@ -955,6 +1070,8 @@ public sealed partial class MainWindow : Window
         if (_syncing) return;
         LocalState.Ui.ReduceMotion = ReduceMotionSwitch.IsOn;
         LocalState.SaveUi();
+        _hideGen++;
+        _hideAnimating = false;
         _animIn.Stop();
         _animOut.Stop();
         ResetPop();
@@ -1053,18 +1170,58 @@ public sealed partial class MainWindow : Window
             await InvokeAsync();
             return;
         }
-        if (e.Key == VirtualKey.Down && _items.Count > 0)
+    }
+
+    /// <summary>根上 handledEventsToo 收箭头键：输入框有文本时 TextBox 已先消费箭头（光标移动），
+    /// 这里统一只移动下面选中项，并把输入框光标拉回末尾（搜索框只能输入/退格，不能移光标）。</summary>
+    private void OnRootKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (_composing) return;                       // IME 组词中不拦截
+        if (MainPanel.Visibility != Visibility.Visible) return; // 设置页里不动
+        if (QueryBox.FocusState == FocusState.Unfocused) return; // 焦点在网格/收藏等：交给原生处理
+        if (e.Key is not (VirtualKey.Down or VirtualKey.Up or VirtualKey.Left or VirtualKey.Right)) return;
+
+        e.Handled = true;
+        QueryBox.SelectionStart = QueryBox.Text.Length;
+        QueryBox.SelectionLength = 0;
+
+        if (_items.Count == 0) return;
+        int delta;
+        if (_gridView)
         {
-            e.Handled = true;
-            _active = Math.Min(_active + 1, _items.Count - 1);
-            SyncSelection();
+            // 平铺视图：按网格行列移动（列数跟随窗口宽度）
+            var cols = GridColumns();
+            delta = e.Key switch
+            {
+                VirtualKey.Left => -1,
+                VirtualKey.Right => 1,
+                VirtualKey.Up => -cols,
+                _ => cols,
+            };
         }
-        else if (e.Key == VirtualKey.Up && _items.Count > 0)
+        else
         {
-            e.Handled = true;
-            _active = Math.Max(_active - 1, 0);
-            SyncSelection();
+            // 列表视图：左右等价于上一条/下一条
+            delta = e.Key is VirtualKey.Up or VirtualKey.Left ? -1 : 1;
         }
+        _active = Math.Clamp(_active + delta, 0, _items.Count - 1);
+        SyncSelection();
+    }
+
+    /// <summary>按已布局的第一行元素推断平铺列数（跟随窗口宽度，不用硬编码）。</summary>
+    private int GridColumns()
+    {
+        if (ResultGrid.ItemsPanelRoot is not ItemsWrapGrid panel || panel.Children.Count == 0)
+            return 1;
+        var y0 = panel.Children[0].ActualOffset.Y;
+        var cols = 1;
+        for (var i = 1; i < panel.Children.Count; i++)
+        {
+            if (panel.Children[i].ActualOffset.Y > y0)
+                break;
+            cols++;
+        }
+        return cols;
     }
 
     private void SyncSelection()
@@ -1154,6 +1311,22 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
+        WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+    private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }

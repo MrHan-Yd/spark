@@ -25,6 +25,9 @@
       <SolidColorBrush x:Key="FavBgBrush" Color="#24000000"/>
       <SolidColorBrush x:Key="FooterBgBrush" Color="#1F000000"/>
       <SolidColorBrush x:Key="GridTileBgBrush" Color="#08FFFFFF"/>
+      <!-- 平铺选中框（中性灰，比平时卡片底明显）：深色 12% 白底 + 25% 白边 -->
+      <SolidColorBrush x:Key="GridTileSelBgBrush" Color="#1EFFFFFF"/>
+      <SolidColorBrush x:Key="GridTileSelBorderBrush" Color="#40FFFFFF"/>
       <SolidColorBrush x:Key="SwitchTrackOffBrush" Color="#52303038"/>
       <SolidColorBrush x:Key="StarBrush" Color="#FFD60A"/>
       <!-- 顶部高光（对应 .launcher-glass::before） -->
@@ -251,42 +254,98 @@
         </ListView.ItemTemplate>
       </ListView>
 
-      <!-- 平铺（对齐原型 .results-grid：48 icon/圆角12/选中描边） -->
+      <!-- 平铺（对齐原型 .fav-item：80px 小方卡 + 40 icon，一行 9 个）
+           默认模板的 ListViewItemPresenter 圆角只认主题资源 GridViewItemCornerRadius（=4），
+           样式里的 CornerRadius 不生效；这里自定义模板用 Border 画圆角卡（12）。
+           平时卡片透明不可见，只有选中（光标处）才显示 accent 圆角框，当作选中指示器 -->
       <GridView x:Name="ResultGrid" Grid.Row="2" Margin="8,6,8,4" MaxHeight="360"
                 SelectionMode="Single" IsItemClickEnabled="True" ItemClick="OnItemClick"
                 Background="Transparent" BorderThickness="0" Visibility="Collapsed">
         <GridView.ItemContainerStyle>
           <Style TargetType="GridViewItem">
-            <Setter Property="Width" Value="150"/>
-            <Setter Property="Height" Value="114"/>
-            <Setter Property="Margin" Value="4"/>
-            <Setter Property="Padding" Value="8,10"/>
-            <Setter Property="CornerRadius" Value="14"/>
-            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Width" Value="80"/>
+            <Setter Property="Height" Value="84"/>
+            <Setter Property="Margin" Value="3"/>
+            <Setter Property="Padding" Value="4,8"/>
             <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-            <Setter Property="Background" Value="{StaticResource GridTileBgBrush}"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="UseSystemFocusVisuals" Value="False"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Template">
+              <Setter.Value>
+                <ControlTemplate TargetType="GridViewItem">
+                  <Grid>
+                    <VisualStateManager.VisualStateGroups>
+                      <VisualStateGroup x:Name="CommonStates">
+                        <VisualState x:Name="Normal"/>
+                        <VisualState x:Name="PointerOver">
+                          <VisualState.Setters>
+                            <Setter Target="Card.Background" Value="{StaticResource RowHoverBrush}"/>
+                            <Setter Target="Card.BorderBrush" Value="{StaticResource DividerBrush}"/>
+                          </VisualState.Setters>
+                        </VisualState>
+                        <VisualState x:Name="Pressed">
+                          <VisualState.Setters>
+                            <Setter Target="CardScale.ScaleX" Value="0.96"/>
+                            <Setter Target="CardScale.ScaleY" Value="0.96"/>
+                          </VisualState.Setters>
+                        </VisualState>
+                        <VisualState x:Name="Selected">
+                          <VisualState.Setters>
+                            <Setter Target="Card.Background" Value="{StaticResource GridTileSelBgBrush}"/>
+                            <Setter Target="Card.BorderBrush" Value="{StaticResource GridTileSelBorderBrush}"/>
+                          </VisualState.Setters>
+                        </VisualState>
+                        <VisualState x:Name="PointerOverSelected">
+                          <VisualState.Setters>
+                            <Setter Target="Card.Background" Value="{StaticResource GridTileSelBgBrush}"/>
+                            <Setter Target="Card.BorderBrush" Value="{StaticResource GridTileSelBorderBrush}"/>
+                          </VisualState.Setters>
+                        </VisualState>
+                        <VisualState x:Name="PressedSelected">
+                          <VisualState.Setters>
+                            <Setter Target="Card.Background" Value="{StaticResource GridTileSelBgBrush}"/>
+                            <Setter Target="Card.BorderBrush" Value="{StaticResource GridTileSelBorderBrush}"/>
+                          </VisualState.Setters>
+                        </VisualState>
+                      </VisualStateGroup>
+                    </VisualStateManager.VisualStateGroups>
+                    <Border x:Name="Card"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="Transparent"
+                            BorderThickness="1"
+                            CornerRadius="12"
+                            RenderTransformOrigin="0.5,0.5">
+                      <Border.RenderTransform>
+                        <ScaleTransform x:Name="CardScale"/>
+                      </Border.RenderTransform>
+                      <ContentPresenter HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                        VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                                        Margin="{TemplateBinding Padding}"/>
+                    </Border>
+                  </Grid>
+                </ControlTemplate>
+              </Setter.Value>
+            </Setter>
           </Style>
         </GridView.ItemContainerStyle>
         <GridView.ItemTemplate>
           <DataTemplate>
-            <StackPanel Spacing="8" HorizontalAlignment="Center">
-              <Grid Width="48" Height="48" HorizontalAlignment="Center">
-                <Border CornerRadius="12" Background="#14FFFFFF"
-                        Visibility="{Binding IconImageVisibility}">
-                  <Image Source="{Binding IconImage}" Width="40" Height="40" Stretch="Uniform"
-                         HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                </Border>
-                <Border CornerRadius="12" Background="{Binding IconBrush}"
+            <StackPanel Spacing="6" HorizontalAlignment="Center" VerticalAlignment="Center">
+              <!-- 图标直接裸露（同收藏：无圆角底容器）；无图标时回退彩色字卡 -->
+              <Grid Width="40" Height="40" HorizontalAlignment="Center">
+                <Image Source="{Binding IconImage}" Width="36" Height="36" Stretch="Uniform"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                       Visibility="{Binding IconImageVisibility}"/>
+                <Border Width="36" Height="36" CornerRadius="10" Background="{Binding IconBrush}"
                         Visibility="{Binding IconTextVisibility}">
-                  <TextBlock Text="{Binding IconGlyph}" FontSize="16" FontWeight="Medium"
+                  <TextBlock Text="{Binding IconGlyph}" FontSize="12" FontWeight="SemiBold"
                              Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
               </Grid>
-              <TextBlock Text="{Binding Title}" FontSize="12" FontWeight="Medium"
-                         Foreground="{StaticResource TextPrimaryBrush}" TextAlignment="Center"
-                         TextTrimming="CharacterEllipsis" MaxLines="2" TextWrapping="Wrap"/>
-              <TextBlock Text="{Binding SourceLabel}" FontSize="10"
-                         Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+              <TextBlock Text="{Binding Title}" FontSize="10"
+                         Foreground="{StaticResource TextSecondaryBrush}" TextAlignment="Center"
+                         TextTrimming="CharacterEllipsis" MaxLines="1"/>
             </StackPanel>
           </DataTemplate>
         </GridView.ItemTemplate>

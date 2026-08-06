@@ -64,7 +64,7 @@ public sealed class AppUiState
     public bool HideAfterInvoke { get; set; } = true;
     public string Hotkey { get; set; } = "Alt+Space";
     public string Theme { get; set; } = "dark";
-    public string DefaultView { get; set; } = "list";
+    public string DefaultView { get; set; } = "grid";
     public int WindowWidth { get; set; } = 800;
     /// <summary>上次拖拽后的窗口位置（物理像素，屏幕坐标）；-1 = 未记录，居中显示。</summary>
     public int WindowX { get; set; } = -1;
