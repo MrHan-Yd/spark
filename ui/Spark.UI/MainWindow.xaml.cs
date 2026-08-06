@@ -13,6 +13,7 @@ using XamlPath = Microsoft.UI.Xaml.Shapes.Path;
 using Microsoft.Win32;
 using Spark.UI.Models;
 using Spark.UI.Services;
+using Windows.Foundation;
 using Windows.Graphics;
 using Windows.System;
 using Windows.UI;
@@ -39,6 +40,9 @@ public sealed partial class MainWindow : Window
     /// <summary>合并 event + pipe 双通道重复 toggle。</summary>
     private long _lastToggleTicks;
 
+    /// <summary>是否已把窗口放上屏幕；已显示过且没保存位置时不再重排（OS 保留拖拽后的位置）。</summary>
+    private bool _everPlaced;
+
     // 弹出动画（对齐原型 pop-in / pop-out）
     private readonly CompositeTransform _pop = new();
     private Storyboard _animIn = new();
@@ -58,6 +62,8 @@ public sealed partial class MainWindow : Window
         LocalState.Load();
 
         Root.RenderTransform = _pop;
+        // 拖拽 caption 区域跟随窗口尺寸（宽度滑杆/布局变化）
+        Root.SizeChanged += (_, _) => UpdateDragRegions();
 
         // 玻璃背景：先试 Acrylic，失败自动退回稳定深色（历史上有 Acrylic 闪退问题）
         try
@@ -73,6 +79,9 @@ public sealed partial class MainWindow : Window
         BuildAnimations();
 
         try { SetupChrome(); } catch (Exception ex) { App.Log("SetupChrome", ex); }
+        // WinUI 启动时会按 App 主题重设 DWM 深色属性，这里在 SetupChrome 之后再压一次，
+        // 否则浅色系统下圆角外框会是白色（即"外面那层白色"）
+        try { ApplyDwmDarkMode(); } catch (Exception ex) { App.Log("DwmDarkMode", ex); }
 
         _host.HostNotification += OnHostNotification;
 
@@ -187,6 +196,49 @@ public sealed partial class MainWindow : Window
 
         if (Root.Resources.TryGetValue("GlassHighlightBrush", out var g) && g is LinearGradientBrush hl)
             hl.GradientStops[0].Color = Color.FromArgb(dark ? (byte)0x14 : (byte)0x80, 0xFF, 0xFF, 0xFF);
+
+        // 内容/系统控件主题跟随玻璃主题（浅色系统下 TextBox 光标、滚动条、弹窗默认是浅色的）
+        Root.RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light;
+        ApplyDwmDarkMode();
+    }
+
+    /// <summary>DWM 圆角外框颜色跟随主题；WinUI 启动时按 App 主题重设过该属性，主题切换时再压一次。</summary>
+    private void ApplyDwmDarkMode()
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        bool dark = LocalState.Ui.Theme switch
+        {
+            "light" => false,
+            "dark" => true,
+            _ => SystemUsesDark(),
+        };
+        const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+        var v = dark ? 1 : 0;
+        DwmSetWindowAttribute(_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref v, sizeof(int));
+
+        // 圆角外框颜色：系统浅色主题下 DWM 会用白色画外框（就是"外面那层白色"），
+        // 深色属性只管标题栏，外框要用 DWMWA_BORDER_COLOR（34，Win11 22H2+）直接指定
+        const int DWMWA_BORDER_COLOR = 34;
+        var border = dark ? (int)0x001E1C1Cu : (int)0x00F2F2F7u; // COLORREF 0x00BBGGRR，取玻璃底色
+        DwmSetWindowAttribute(_hwnd, DWMWA_BORDER_COLOR, ref border, sizeof(int));
+    }
+
+    /// <summary>
+    /// 彻底去掉非客户区边框：WinUI 的 SetBorderAndTitleBar(false,false) 会残留 WS_DLGFRAME/WS_SYSMENU，
+    /// DWM 按系统浅色主题把这块 ~3px 画成白色（"外面那层白色"），客户区也相应内缩 3px。
+    /// 清掉后客户区 = 窗口，白圈消失。
+    /// </summary>
+    private void MakeFrameless()
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        const int GWL_STYLE = -16;
+        const int WS_DLGFRAME = 0x00400000;
+        const int WS_SYSMENU = 0x00080000;
+        var s = GetWindowLong(_hwnd, GWL_STYLE) & ~(WS_DLGFRAME | WS_SYSMENU);
+        SetWindowLong(_hwnd, GWL_STYLE, s);
+        // FRAMECHANGED 让样式立即生效，重算非客户区
+        const uint SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001;
+        SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE);
     }
 
     // ==================== 弹出动画（原型 pop-in 0.28s / pop-out 0.16s） ====================
@@ -332,13 +384,20 @@ public sealed partial class MainWindow : Window
 
         try
         {
+            // DWM 圆角：让窗口形状本身是圆角
             const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
             const int DWMWCP_ROUND = 2;
             var pref = DWMWCP_ROUND;
             DwmSetWindowAttribute(_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref pref, sizeof(int));
+
+            // 客户区填满整个窗口，避免 DWM 在四周留出系统边距
+            const int DWMWA_ALLOW_CLIENT_AREA_TO_FILL_ENTIRE_WINDOW = 14;
+            var allow = 1;
+            DwmSetWindowAttribute(_hwnd, DWMWA_ALLOW_CLIENT_AREA_TO_FILL_ENTIRE_WINDOW, ref allow, sizeof(int));
         }
         catch { /* ignore */ }
 
+        MakeFrameless();
         PlaceWindow(LocalState.Ui.WindowWidth, 590);
     }
 
@@ -372,9 +431,79 @@ public sealed partial class MainWindow : Window
         var area = DisplayArea.GetFromWindowId(_appWindow.Id, DisplayAreaFallback.Primary);
         if (area is null) return;
         var work = area.WorkArea;
-        _appWindow.Move(new PointInt32(
-            work.X + (work.Width - w) / 2,
-            work.Y + Math.Max(80, work.Height / 6)));
+
+        var hasSaved = LocalState.Ui.WindowX >= 0 && LocalState.Ui.WindowY >= 0;
+        var saved = hasSaved ? SavedWindowPos(w, h) : null;
+        if (saved is PointInt32 p)
+        {
+            _appWindow.Move(p);
+        }
+        else if (!_everPlaced || hasSaved)
+        {
+            // 首次显示，或保存的位置已失效（显示器拔掉等）→ 居中
+            _appWindow.Move(new PointInt32(
+                work.X + (work.Width - w) / 2,
+                work.Y + Math.Max(80, work.Height / 6)));
+        }
+        // 其余情况不重排：窗口已显示过，OS 保留拖拽后的位置
+        _everPlaced = true;
+    }
+
+    /// <summary>已保存的窗口位置；其中心点不再落在任何显示器工作区内时视为失效，返回 null。</summary>
+    private PointInt32? SavedWindowPos(int w, int h)
+    {
+        var x = LocalState.Ui.WindowX;
+        var y = LocalState.Ui.WindowY;
+        if (x < 0 || y < 0) return null;
+        var cx = x + w / 2;
+        var cy = y + h / 2;
+        // 不用 DisplayArea.FindAll()：该 API 在部分 WinAppSDK 版本上枚举会抛 InvalidCastException。
+        // 这里用 Win32 枚举显示器（虚拟屏幕坐标，与窗口位置同坐标系）。
+        var onScreen = false;
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
+            (IntPtr hMon, IntPtr hdc, ref RECT r, IntPtr data) =>
+            {
+                if (cx >= r.Left && cx < r.Right && cy >= r.Top && cy < r.Bottom)
+                    onScreen = true;
+                return true;
+            }, IntPtr.Zero);
+        return onScreen ? new PointInt32(x, y) : null;
+    }
+
+    // ==================== 拖拽 ====================
+
+    /// <summary>
+    /// 用 InputNonClientPointerSource 把"空白处"声明为标题栏区域（caption），系统原生拖动。
+    /// 只覆盖无交互控件的地方：主界面顶部留白条 + 底部整条底栏；设置页顶部留白条。
+    /// 用 WinUI 原生机制（1.6 起 XAML 内容在 DesktopChildSiteBridge 子窗口里，
+    /// WM_NCLBUTTONDOWN 伪装标题栏点击会失灵，所以不走 SendMessage 方案）。
+    /// </summary>
+    private void UpdateDragRegions()
+    {
+        if (_appWindow is null || Root.XamlRoot is null) return;
+        var scale = Root.XamlRoot.RasterizationScale;
+        var w = (int)Math.Round(Root.ActualWidth * scale);
+        var h = (int)Math.Round(Root.ActualHeight * scale);
+        var rects = new List<RectInt32>();
+
+        if (MainPanel.Visibility == Visibility.Visible)
+        {
+            // 主界面：搜索行顶部 16px 留白全宽 + 底栏整条（chips/文字均不可交互）
+            rects.Add(new RectInt32(0, 0, w, (int)Math.Round(16 * scale)));
+            if (FooterBar.ActualHeight > 0
+                && FooterBar.TransformToVisual(Root).TransformPoint(new Point(0, 0)) is Point fp)
+            {
+                rects.Add(new RectInt32(0, (int)Math.Round(fp.Y * scale), w,
+                    (int)Math.Round(FooterBar.ActualHeight * scale)));
+            }
+        }
+        else
+        {
+            // 设置页：顶栏 14px 留白全宽
+            rects.Add(new RectInt32(0, 0, w, (int)Math.Round(14 * scale)));
+        }
+        Microsoft.UI.Input.InputNonClientPointerSource.GetForWindowId(_appWindow.Id)
+            .SetRegionRects(Microsoft.UI.Input.NonClientRegionKind.Caption, rects.ToArray());
     }
 
     // ==================== 显示 / 隐藏 ====================
@@ -396,6 +525,8 @@ public sealed partial class MainWindow : Window
 
             // Show 之后 Resize 才生效（窗口未显示时 Resize 会被忽略）
             PlaceWindow(LocalState.Ui.WindowWidth, 590);
+            // 防止 WinUI 在显示时把 DLGFRAME 样式加回来（白圈来源）
+            try { MakeFrameless(); } catch { /* ignore */ }
 
             ForceForeground();
             Activate();
@@ -447,6 +578,17 @@ public sealed partial class MainWindow : Window
 
     private void HideNow()
     {
+        // 拖拽后的位置在隐藏时落盘（拖动过程不逐帧写盘；仅窗口真正显示过才会走到这里）
+        if (_appWindow is not null)
+        {
+            var pos = _appWindow.Position;
+            if (pos.X != LocalState.Ui.WindowX || pos.Y != LocalState.Ui.WindowY)
+            {
+                LocalState.Ui.WindowX = pos.X;
+                LocalState.Ui.WindowY = pos.Y;
+                LocalState.SaveUi();
+            }
+        }
         try { _appWindow?.Hide(); } catch { /* ignore */ }
         try
         {
@@ -728,12 +870,14 @@ public sealed partial class MainWindow : Window
             : "Spark UI · 未连接 Host（演示）";
         SyncSettingsUi();
         ShowPane("general");
+        UpdateDragRegions();
     }
 
     private void OnCloseSettings(object sender, RoutedEventArgs e)
     {
         SettingsPanel.Visibility = Visibility.Collapsed;
         QueryBox.Focus(FocusState.Programmatic);
+        UpdateDragRegions();
     }
 
     private void OnSettingsKeyDown(object sender, KeyRoutedEventArgs e)
@@ -1010,4 +1154,12 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left, Top, Right, Bottom; }
+
+    private delegate bool EnumMonitorsProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, EnumMonitorsProc lpfnEnum, IntPtr dwData);
 }

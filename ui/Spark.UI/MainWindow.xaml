@@ -6,7 +6,8 @@
     Title="Spark">
 
   <!-- 对齐 ui-prototype 主弹窗：颜色收成 Root.Resources 画刷，主题切换由代码改 Color（深/浅/跟随系统） -->
-  <Grid x:Name="Root" Background="#E61C1C1E">
+  <!-- 圆角：用 Grid.CornerRadius（配合 Popup 弹出动画的 Clip 配置）保证四角圆，覆盖在标题栏外 -->
+  <Grid x:Name="Root" Background="#E61C1C1E" CornerRadius="14">
     <Grid.Resources>
       <!-- 主题画刷（值取自 ui-prototype/styles.css 变量，alpha 已转 ARGB） -->
       <SolidColorBrush x:Key="GlassBgBrush" Color="#E61C1C1E"/>
@@ -49,6 +50,11 @@
       <SolidColorBrush x:Key="GridViewItemBorderBrushPointerOver" Color="#1AFFFFFF"/>
       <SolidColorBrush x:Key="GridViewItemBorderBrushSelected" Color="#590A84FF"/>
       <SolidColorBrush x:Key="GridViewItemBorderBrushSelectedPointerOver" Color="#590A84FF"/>
+
+      <!-- 搜索框聚焦态保持透明（默认模板 Focused 状态会覆盖 XAML 里的 Background=Transparent，浅色主题下变白底） -->
+      <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="Transparent"/>
+      <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="Transparent"/>
+      <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="Transparent"/>
 
       <!-- 设置页通用样式 -->
       <Style x:Key="NavItemStyle" TargetType="Button">
@@ -126,9 +132,6 @@
         </Setter>
       </Style>
     </Grid.Resources>
-
-    <!-- 窗体外框（1px 玻璃描边） -->
-    <Border BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1" IsHitTestVisible="False"/>
 
     <!-- ========== 搜索模式 ========== -->
     <Grid x:Name="MainPanel">
@@ -341,7 +344,7 @@
       </Border>
 
       <!-- 底栏（对齐原型 .footer：chips） -->
-      <Grid Grid.Row="4" Padding="14,8,14,10" Background="{StaticResource FooterBgBrush}"
+      <Grid x:Name="FooterBar" Grid.Row="4" Padding="14,8,14,10" Background="{StaticResource FooterBgBrush}"
             BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,1,0,0">
         <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
           <Border Background="{StaticResource ChipBgBrush}" CornerRadius="6" Padding="8,3">
@@ -554,7 +557,7 @@
     </Grid>
 
     <!-- 顶部高光（对应 .launcher-glass::before，置于最上避免被设置层盖住） -->
-    <Border IsHitTestVisible="False">
+    <Border IsHitTestVisible="False" CornerRadius="14">
       <Border.Background>
         <StaticResource ResourceKey="GlassHighlightBrush"/>
       </Border.Background>
