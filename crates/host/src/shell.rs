@@ -8,11 +8,20 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 /// Open a file, shortcut, or executable with the default verb.
 pub fn shell_open(target: &str) -> Result<()> {
+    shell_execute(target, "open")
+}
+
+/// Open elevated（触发 UAC）via the "runas" verb.
+pub fn shell_runas(target: &str) -> Result<()> {
+    shell_execute(target, "runas")
+}
+
+fn shell_execute(target: &str, verb: &str) -> Result<()> {
     if target.is_empty() {
         bail!("empty target");
     }
     let wide = to_wide(target);
-    let operation = to_wide("open");
+    let operation = to_wide(verb);
     // ShellExecuteW returns > 32 on success (as HINSTANCE cast).
     let rc = unsafe {
         ShellExecuteW(
@@ -26,7 +35,7 @@ pub fn shell_open(target: &str) -> Result<()> {
     };
     let code = rc.0 as isize;
     if code <= 32 {
-        bail!("ShellExecute failed for '{target}' (code {code})");
+        bail!("ShellExecute({verb}) failed for '{target}' (code {code})");
     }
     Ok(())
 }
@@ -73,6 +82,7 @@ pub fn invoke_action(target: Option<&str>, action_id: &str) -> Result<()> {
     let target = target.context("candidate has no target")?;
     match action_id {
         "open" | "" => shell_open(target),
+        "runas" => shell_runas(target),
         "reveal" => shell_reveal(target),
         other => bail!("unknown action: {other}"),
     }

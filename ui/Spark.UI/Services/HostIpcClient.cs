@@ -91,17 +91,28 @@ public sealed class HostIpcClient : IAsyncDisposable
                 try
                 {
                     // 读超时自愈：pipe 可能半死（Host 端 WriteFile 卡住、连接静默失效）。
+                    // Host 每 3s 有保活空行，健康连接不会触发超时；这里只兜底真死连接。
                     // 超时后主动断开，让 MaintainHostConnectionAsync 重连拿一条新连接。
                     var readTask = reader.ReadLineAsync(ct).AsTask();
                     _ = readTask.ContinueWith(t => _ = t.Exception,
                         TaskContinuationOptions.OnlyOnFaulted);
-                    line = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
+                    line = await readTask.WaitAsync(TimeSpan.FromSeconds(15));
                 }
                 catch (TimeoutException)
                 {
-                    // 读超时：pipe 可能半死，主动断开等重连自愈
-                    await TearDownAsync();
-                    break;
+                    // 读超时：Host 空闲不推送是常态，不代表连接死——写一个探针请求确认。
+                    // 探针写失败（管道已死/半死）才主动断开，让 MaintainHostConnectionAsync 重连自愈；
+                    // 写成功则继续读（探针的响应/错误会被本循环正常消费，健康空闲连接不再被误杀）。
+                    try
+                    {
+                        _writer?.WriteLine("{\"jsonrpc\":\"2.0\",\"id\":-1,\"method\":\"host.ping\"}");
+                        continue;
+                    }
+                    catch
+                    {
+                        await TearDownAsync();
+                        break;
+                    }
                 }
                 catch
                 {

@@ -77,8 +77,12 @@ impl UiHub {
         let snapshot: Vec<ClientWriter> = self.inner.lock().map(|g| g.clone()).unwrap_or_default();
         let mut dead = Vec::new();
         for c in snapshot.iter() {
-            if write_all_handle(c.handle.raw(), bytes).is_err() {
-                dead.push(c.id);
+            match write_all_handle(c.handle.raw(), bytes) {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!(client = c.id, ?e, "broadcast write failed");
+                    dead.push(c.id);
+                }
             }
         }
         if !dead.is_empty() {

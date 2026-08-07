@@ -54,6 +54,8 @@ public sealed partial class MainWindow : Window
     private int _animHideGen;
     /// <summary>IME 组词中：期间箭头键交给输入法（不拦截）。</summary>
     private bool _composing;
+    /// <summary>当前打开的动作菜单（右键/Tab 共用）；打开期间根上箭头键交给菜单，不移动选中项。</summary>
+    private MenuFlyout? _itemMenu;
 
     // 弹出动画（对齐原型 pop-in / pop-out）
     private readonly CompositeTransform _pop = new();
@@ -91,6 +93,9 @@ public sealed partial class MainWindow : Window
         // 箭头键在根上全局接管（handledEventsToo=true：输入框有文本时会先消费箭头键并把事件标为已处理，
         // 普通 KeyDown 收不到；这里在冒泡终点仍能收到），统一只控制下面选中项
         Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnRootKeyDown), true);
+        // 右键菜单：列表/平铺共用（handledEventsToo 保证行内元素命中也能收到）
+        ResultList.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
+        ResultGrid.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
         // IME 组词期间不拦截箭头（组词光标移动由输入法管），否则会破坏中文输入
         QueryBox.TextCompositionStarted += (_, _) => _composing = true;
         QueryBox.TextCompositionEnded += (_, _) => _composing = false;
@@ -824,14 +829,11 @@ public sealed partial class MainWindow : Window
             FavGroups.Children.Add(btn);
         }
 
-        // 收藏项（按分组过滤；无收藏时给默认演示项）
-        List<string> ids;
-        if (fav.Items.Count == 0)
-            ids = new List<string> { "app.wt", "app.code", "app.chrome", "app.explorer", "sys.settings" };
-        else
-            ids = fav.Items
-                .Where(x => fav.ActiveGroup == "all" || x.GroupId == fav.ActiveGroup)
-                .Select(x => x.ItemId).Distinct().ToList();
+        // 收藏项（按分组过滤；真实收藏可增删，不再给无法移除的演示项）
+        var entries = fav.Items
+            .Where(x => fav.ActiveGroup == "all" || x.GroupId == fav.ActiveGroup)
+            .ToList();
+        var ids = entries.Select(x => x.ItemId).Distinct().ToList();
 
         if (ids.Count == 0)
         {
@@ -846,8 +848,13 @@ public sealed partial class MainWindow : Window
 
         foreach (var id in ids)
         {
+            var entry = entries.FirstOrDefault(x => x.ItemId == id);
+            // 优先当前搜索结果/演示数据，其次用收藏时快照的元数据渲染（不在结果里也能显示卡片）
             var c = _items.FirstOrDefault(x => x.Id == id) ?? DemoData.Find(id);
+            if (c is null && entry is not null && !string.IsNullOrEmpty(entry.Title))
+                c = new CandidateDto { Id = id, Title = entry.Title, Target = entry.Target, IconPath = entry.IconPath };
             if (c is null) continue;
+            var title = entry?.Title ?? c.Title;
 
             var imgSrc = AppIconService.GetIcon(id, c.Target ?? c.IconPath);
             UIElement iconEl;
@@ -862,9 +869,13 @@ public sealed partial class MainWindow : Window
             }
             else
             {
+                // 与 Image 分支一致：显式居中（StackPanel 里默认 Stretch + 显式 Width
+                // 会左对齐，导致字形兜底图标偏左、与居中标题错位——收藏夹图标对齐问题）
                 iconEl = new Border
                 {
                     Width = 36, Height = 36, CornerRadius = new CornerRadius(10),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center,
                     Background = c.IconBrush,
                     Child = new TextBlock
                     {
@@ -883,7 +894,7 @@ public sealed partial class MainWindow : Window
             panel.Children.Add(iconEl);
             panel.Children.Add(new TextBlock
             {
-                Text = c.Title, FontSize = 10, Foreground = (Brush)res["TextSecondaryBrush"],
+                Text = title, FontSize = 10, Foreground = (Brush)res["TextSecondaryBrush"],
                 TextAlignment = TextAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis,
                 MaxLines = 1
             });
@@ -898,9 +909,8 @@ public sealed partial class MainWindow : Window
                 CornerRadius = new CornerRadius(12),
                 Tag = c.Id
             };
-            ToolTipService.SetToolTip(btn, c.Title);
+            ToolTipService.SetToolTip(btn, title);
             var itemId = c.Id;
-            var title = c.Title;
             btn.Click += async (_, _) =>
             {
                 try
@@ -911,11 +921,139 @@ public sealed partial class MainWindow : Window
                 catch (Exception ex) { App.Log("FavInvoke", ex); Footer.Text = "执行失败：" + title; }
                 if (LocalState.Ui.HideAfterInvoke) HideLauncher();
             };
+            // 右键收藏卡片：取消收藏
+            btn.RightTapped += (_, e) => ShowFavCardMenu(btn, e, itemId, title);
             FavItems.Children.Add(btn);
         }
 
         // 折叠状态由 ApplyFavCollapse 管（带动画），这里只同步提示文字
         ToolTipService.SetToolTip(FavToggle, fav.Expanded ? "收起收藏" : "展开收藏");
+    }
+
+    // ==================== 右键菜单 / 收藏增删 ====================
+
+    /// <summary>右键搜索结果（列表/平铺共用）：定位到命中项，在指针位置弹动作菜单。</summary>
+    private void OnResultRightTapped(object sender, RightTappedRoutedEventArgs e)
+    {
+        var node = e.OriginalSource as DependencyObject;
+        while (node is not null and not ListViewItem and not GridViewItem)
+            node = VisualTreeHelper.GetParent(node);
+        // 注意：自定义 ControlTemplate 下容器 DataContext 为 null，取 Content（= 数据项）
+        if (node is not ContentControl cc || cc.Content is not CandidateDto c) return;
+        _active = _items.IndexOf(c);
+        SyncSelection();
+        _itemMenu = BuildItemMenu(c);
+        _itemMenu.ShowAt(cc, new FlyoutShowOptions { Position = e.GetPosition(cc) });
+    }
+
+    /// <summary>构建搜索结果动作菜单：打开 / 管理员 / 打开位置 / 收藏（已收藏则取消收藏）。</summary>
+    private MenuFlyout BuildItemMenu(CandidateDto c)
+    {
+        var menu = new MenuFlyout();
+        var itemId = c.Id;
+
+        var open = new MenuFlyoutItem { Text = "打开", Icon = new FontIcon { Glyph = "\uE8A7" } };
+        open.Click += (_, _) => _ = InvokeActionAsync(itemId, "open");
+        menu.Items.Add(open);
+
+        var runas = new MenuFlyoutItem { Text = "以管理员身份打开", Icon = new FontIcon { Glyph = "\uE7EF" } };
+        runas.Click += (_, _) => _ = InvokeActionAsync(itemId, "runas");
+        menu.Items.Add(runas);
+
+        var reveal = new MenuFlyoutItem { Text = "打开文件位置", Icon = new FontIcon { Glyph = "\uE838" } };
+        reveal.Click += (_, _) => _ = InvokeActionAsync(itemId, "reveal");
+        menu.Items.Add(reveal);
+
+        menu.Items.Add(new MenuFlyoutSeparator());
+
+        var fav = LocalState.Fav;
+        if (fav.Items.Any(x => x.ItemId == itemId))
+        {
+            var unpin = new MenuFlyoutItem { Text = "取消收藏", Icon = new FontIcon { Glyph = "\uE74D" } };
+            unpin.Click += (_, _) => RemoveFavorite(itemId);
+            menu.Items.Add(unpin);
+        }
+        else
+        {
+            var sub = new MenuFlyoutSubItem { Text = "收藏到", Icon = new FontIcon { Glyph = "\uE734" } };
+            foreach (var g in fav.Groups)
+            {
+                var gid = g.Id;
+                var gi = new MenuFlyoutItem { Text = g.Name };
+                gi.Click += (_, _) => AddFavorite(c, gid);
+                sub.Items.Add(gi);
+            }
+            menu.Items.Add(sub);
+        }
+        return menu;
+    }
+
+    /// <summary>Tab 动作：对当前选中项弹出动作菜单（对齐原型 action-sheet）。</summary>
+    private void ShowActiveItemMenu()
+    {
+        if (_items.Count == 0 || _active < 0 || _active >= _items.Count) return;
+        var c = _items[_active];
+        var anchor = _gridView
+            ? ResultGrid.ContainerFromIndex(_active) as FrameworkElement
+            : ResultList.ContainerFromIndex(_active) as FrameworkElement;
+        // 容器未实现（离屏）：退回在列表/网格根上弹出
+        anchor ??= _gridView ? ResultGrid : ResultList;
+        _itemMenu = BuildItemMenu(c);
+        _itemMenu.ShowAt(anchor, new FlyoutShowOptions { Placement = FlyoutPlacementMode.BottomEdgeAlignedLeft });
+    }
+
+    /// <summary>右键收藏卡片：打开 / 取消收藏。</summary>
+    private void ShowFavCardMenu(FrameworkElement anchor, RightTappedRoutedEventArgs e, string itemId, string title)
+    {
+        var menu = new MenuFlyout();
+        var open = new MenuFlyoutItem { Text = "打开" };
+        open.Click += (_, _) => _ = InvokeActionAsync(itemId, "open", title);
+        menu.Items.Add(open);
+        menu.Items.Add(new MenuFlyoutSeparator());
+        var rm = new MenuFlyoutItem { Text = "取消收藏" };
+        rm.Click += (_, _) => RemoveFavorite(itemId);
+        menu.Items.Add(rm);
+        menu.ShowAt(anchor, new FlyoutShowOptions { Position = e.GetPosition(anchor) });
+    }
+
+    /// <summary>收藏当前项到指定分组；已在收藏则移动分组（对齐原型 pinToGroup）。</summary>
+    private void AddFavorite(CandidateDto c, string groupId)
+    {
+        var fav = LocalState.Fav;
+        var existing = fav.Items.FirstOrDefault(x => x.ItemId == c.Id);
+        if (existing is not null)
+        {
+            existing.GroupId = groupId;
+            existing.Title ??= c.Title;
+            existing.Target ??= c.Target;
+            existing.IconPath ??= c.IconPath;
+        }
+        else
+        {
+            fav.Items.Add(new FavEntryDto
+            {
+                ItemId = c.Id,
+                GroupId = groupId,
+                Title = c.Title,
+                Target = c.Target,
+                IconPath = c.IconPath,
+            });
+        }
+        var gname = fav.Groups.FirstOrDefault(g => g.Id == groupId)?.Name ?? groupId;
+        LocalState.SaveFav();
+        RenderFavorites();
+        ApplyFavCollapse(false, animate: true);
+        Footer.Text = $"已收藏到「{gname}」";
+    }
+
+    /// <summary>从收藏中移除（全部分组）。</summary>
+    private void RemoveFavorite(string itemId)
+    {
+        var fav = LocalState.Fav;
+        if (fav.Items.RemoveAll(x => x.ItemId == itemId) == 0) return;
+        LocalState.SaveFav();
+        RenderFavorites();
+        Footer.Text = "已取消收藏";
     }
 
     /// <summary>
@@ -1378,6 +1516,15 @@ public sealed partial class MainWindow : Window
         if (_composing) return;                       // IME 组词中不拦截
         if (MainPanel.Visibility != Visibility.Visible) return; // 设置页里不动
         if (IsFocusOnFavorites()) return;             // 焦点在收藏坞：交给原生方向键导航
+        if (_itemMenu?.IsOpen == true) return;        // 动作菜单打开中：方向键/回车交给菜单
+
+        if (e.Key == VirtualKey.Tab)
+        {
+            // Tab 动作（对齐原型 action-sheet）：对当前选中项弹出动作菜单
+            e.Handled = true;
+            ShowActiveItemMenu();
+            return;
+        }
         if (e.Key is not (VirtualKey.Down or VirtualKey.Up or VirtualKey.Left or VirtualKey.Right)) return;
 
         e.Handled = true;
@@ -1458,11 +1605,17 @@ public sealed partial class MainWindow : Window
     private async Task InvokeAsync()
     {
         if (_items.Count == 0 || _active < 0 || _active >= _items.Count) return;
-        var item = _items[_active];
-        Footer.Text = "执行中：" + item.Title;
+        await InvokeActionAsync(_items[_active].Id, "open");
+    }
+
+    /// <summary>按 action 执行（回车/点击与右键菜单共用；含错误处理与 HideAfterInvoke）。</summary>
+    private async Task InvokeActionAsync(string itemId, string actionId, string? titleOverride = null)
+    {
+        var title = titleOverride ?? _items.FirstOrDefault(x => x.Id == itemId)?.Title ?? itemId;
+        Footer.Text = "执行中：" + title;
         try
         {
-            var result = await _host.InvokeAsync(item.Id, "open", QueryBox.Text ?? "");
+            var result = await _host.InvokeAsync(itemId, actionId, QueryBox.Text ?? "");
             if (result is not null && result.Value.TryGetProperty("type", out var t)
                 && t.GetString() == "show_error"
                 && result.Value.TryGetProperty("message", out var msg))
@@ -1470,12 +1623,12 @@ public sealed partial class MainWindow : Window
                 Footer.Text = msg.GetString() ?? "执行失败";
                 return;
             }
-            Footer.Text = "已执行：" + item.Title;
+            Footer.Text = actionId == "runas" ? "已以管理员身份打开：" + title : "已执行：" + title;
         }
         catch (Exception ex)
         {
             App.Log("Invoke", ex);
-            Footer.Text = "执行失败：" + item.Title;
+            Footer.Text = "执行失败：" + title;
             return;
         }
         if (LocalState.Ui.HideAfterInvoke)

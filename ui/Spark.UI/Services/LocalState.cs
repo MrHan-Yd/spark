@@ -110,4 +110,8 @@ public sealed class FavEntryDto
 {
     public string ItemId { get; set; } = "";
     public string GroupId { get; set; } = "all";
+    /// <summary>收藏时快照的展示信息：不在当前搜索结果里时也能渲染卡片（旧数据为 null，回退按 ItemId 查找）。</summary>
+    public string? Title { get; set; }
+    public string? Target { get; set; }
+    public string? IconPath { get; set; }
 }
