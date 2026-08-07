@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod hotkey;
 mod ipc_server;
+mod probe;
 mod shell;
 mod single_instance;
 mod toggle_signal;
@@ -41,6 +42,10 @@ struct Cli {
     #[arg(long)]
     toggle: bool,
 
+    /// Print spark-ui window visibility, then exit (diagnostics)
+    #[arg(long)]
+    probe_ui: bool,
+
     /// Do not auto-spawn spark-ui on start
     #[arg(long)]
     no_ui: bool,
@@ -65,6 +70,11 @@ fn main() -> Result<()> {
             let hits = host.search(q);
             println!("{}", serde_json::to_string_pretty(&hits)?);
         }
+        return Ok(());
+    }
+
+    if cli.probe_ui {
+        probe::print_ui_visible()?;
         return Ok(());
     }
 

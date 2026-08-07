@@ -140,19 +140,19 @@ unsafe extern "system" fn wnd_proc(
 }
 
 fn on_toggle() {
-    // 1) Named event — UI 后台 WaitOne，最稳
+    // 1) Named event — UI 后台 WaitOne，唯一 toggle 通道（最稳）。
+    //    不再走 pipe 广播 ui.toggle：event 与 pipe 是两条独立通道，pipe 延迟
+    //    >300ms 到达时 UI 会收到第二次 toggle，把刚显示的窗口又关掉
+    //    （表现为"第一次热键没反应、第二次才唤醒"）。toggle 语义单一化。
     crate::toggle_signal::signal_toggle();
 
-    // 2) Pipe 通知（若 UI 长连接还在）——放后台线程发，消息循环线程
-    //    绝不能做可能阻塞的 pipe I/O（WriteFile 会卡在对端不读的连接上）。
+    // 只在 UI 进程完全不存在时才拉起，避免每次热键都重复 spawn。
+    // 若 UI 在运行但没连 pipe（演示模式），client_count 为 0 —— 此时
+    // 再 spawn 会产生多个 UI 实例抢同一个 auto-reset 事件，热键时灵时不灵。
     if let Some(ptr) = unsafe { HUB_PTR } {
         let hub = unsafe { &*ptr };
         let n = hub.client_count();
-        hub.notify_toggle_async();
-        info!(ui_clients = n, "toggle → event + pipe (async)");
-        // 只在 UI 进程完全不存在时才拉起，避免每次热键都重复 spawn。
-        // 若 UI 在运行但没连 pipe（演示模式），client_count 为 0 —— 此时
-        // 再 spawn 会产生多个 UI 实例抢同一个 auto-reset 事件，热键时灵时不灵。
+        info!(ui_clients = n, "toggle → event");
         if n == 0 && !crate::is_ui_running() {
             try_spawn_ui();
         }

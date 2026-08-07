@@ -3,8 +3,8 @@
 use crate::app::SharedHost;
 use anyhow::{Context, Result};
 use spark_ipc::{
-    decode_line, encode_line, HostMethod, InvokeParams, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, QueryParams, QueryResult, PIPE_PATH,
+    decode_line, encode_line, HostMethod, InvokeParams, JsonRpcRequest, JsonRpcResponse,
+    QueryParams, QueryResult, PIPE_PATH,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,13 +27,7 @@ use windows::Win32::System::Pipes::{
 /// Connected UI writers for Host→UI notifications.
 #[derive(Default, Clone)]
 pub struct UiHub {
-    inner: Arc<Mutex<Vec<ClientWriter>>>,
-}
-
-#[derive(Clone, Copy)]
-struct ClientWriter {
-    id: u64,
-    handle: SendHandle,
+    inner: Arc<Mutex<Vec<u64>>>,
 }
 
 /// HANDLE wrapper marked Send (pipe I/O is serialized by our design).
@@ -53,10 +47,10 @@ impl UiHub {
         Self::default()
     }
 
-    fn register(&self, handle: SendHandle) -> u64 {
+    fn register(&self) -> u64 {
         let id = NEXT_CLIENT.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut g) = self.inner.lock() {
-            g.push(ClientWriter { id, handle });
+            g.push(id);
             info!(client = id, clients = g.len(), "UI connected");
         }
         id
@@ -64,53 +58,8 @@ impl UiHub {
 
     fn unregister(&self, id: u64) {
         if let Ok(mut g) = self.inner.lock() {
-            g.retain(|c| c.id != id);
+            g.retain(|&c| c != id);
             info!(client = id, clients = g.len(), "UI disconnected");
-        }
-    }
-
-    pub fn broadcast_line(&self, line: &str) {
-        // 在锁外快照句柄，避免持锁期间做阻塞写（WriteFile 可能卡在对端不读的
-        // 僵尸连接上）；写不成功就把该客户端标记为失效，下次广播前清理。
-        let payload = format!("{line}\n");
-        let bytes = payload.as_bytes();
-        let snapshot: Vec<ClientWriter> = self.inner.lock().map(|g| g.clone()).unwrap_or_default();
-        let mut dead = Vec::new();
-        for c in snapshot.iter() {
-            match write_all_handle(c.handle.raw(), bytes) {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!(client = c.id, ?e, "broadcast write failed");
-                    dead.push(c.id);
-                }
-            }
-        }
-        if !dead.is_empty() {
-            if let Ok(mut g) = self.inner.lock() {
-                g.retain(|c| !dead.contains(&c.id));
-            }
-        }
-    }
-
-    /// 后台线程广播，保证调用方（消息循环线程）永远不被 pipe I/O 卡住。
-    pub fn notify_toggle_async(&self) {
-        let hub = self.clone();
-        let _ = std::thread::Builder::new()
-            .name("spark-broadcast".into())
-            .spawn(move || {
-                hub.notify_toggle();
-            });
-    }
-
-    pub fn notify_show(&self) {
-        if let Ok(line) = encode_line(&JsonRpcNotification::ui_show()) {
-            self.broadcast_line(&line);
-        }
-    }
-
-    pub fn notify_toggle(&self) {
-        if let Ok(line) = encode_line(&JsonRpcNotification::ui_toggle()) {
-            self.broadcast_line(&line);
         }
     }
 
@@ -204,8 +153,8 @@ fn create_pipe_instance() -> Result<HANDLE> {
 }
 
 fn handle_client(pipe: SendHandle, host: SharedHost, hub: UiHub) -> Result<()> {
-    let client_id = hub.register(pipe);
-    let result = client_read_loop(pipe, &host, &hub);
+    let client_id = hub.register();
+    let result = client_read_loop(pipe, &host);
     hub.unregister(client_id);
     unsafe {
         let _ = DisconnectNamedPipe(pipe.raw());
@@ -214,7 +163,7 @@ fn handle_client(pipe: SendHandle, host: SharedHost, hub: UiHub) -> Result<()> {
     result
 }
 
-fn client_read_loop(pipe: SendHandle, host: &SharedHost, hub: &UiHub) -> Result<()> {
+fn client_read_loop(pipe: SendHandle, host: &SharedHost) -> Result<()> {
     let raw = pipe.raw();
     let mut buf = vec![0u8; 64 * 1024];
     let mut acc: Vec<u8> = Vec::new();
@@ -231,7 +180,7 @@ fn client_read_loop(pipe: SendHandle, host: &SharedHost, hub: &UiHub) -> Result<
                     if line.is_empty() {
                         continue;
                     }
-                    if let Err(e) = dispatch_line(line, raw, host, hub) {
+                    if let Err(e) = dispatch_line(line, raw, host) {
                         warn!(?e, "dispatch");
                     }
                 }
@@ -250,7 +199,7 @@ fn client_read_loop(pipe: SendHandle, host: &SharedHost, hub: &UiHub) -> Result<
     Ok(())
 }
 
-fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost, hub: &UiHub) -> Result<()> {
+fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
     let req: JsonRpcRequest = decode_line(line)?;
     let id = req.id.clone();
 
@@ -264,8 +213,9 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost, hub: &UiHub) -> Re
             let resp = JsonRpcResponse::result(id, serde_json::json!({"ok": true}));
             reply(pipe, &resp)?;
         }
+        // 只打命名事件（唯一 toggle 通道）；不再广播 pipe ui.toggle ——
+        // 双通道竞态会让 UI 收到第二次 toggle（见 win_loop::on_toggle 注释）。
         crate::toggle_signal::signal_toggle();
-        hub.notify_toggle_async();
         return Ok(());
     }
 

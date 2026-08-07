@@ -394,9 +394,10 @@ public sealed partial class MainWindow : Window
                     if (Environment.TickCount64 < _ignoreDeactivateUntilTicks) return;
                     HideLauncher();
                     break;
-                case "ui.toggle":
-                    HandleToggle();
-                    break;
+                // 注意：没有 "ui.toggle" 分支。toggle 只认 SetEvent（ToggleWatcher）：
+                // pipe 广播与事件是两条独立通道，若 pipe 延迟 >300ms 到达会触发第二次
+                // HandleToggle，把刚显示的窗口又关掉（"第一次热键没反应、第二次才唤醒"）。
+                // Host 端也不再广播 ui.toggle。
             }
         });
     }
@@ -411,7 +412,11 @@ public sealed partial class MainWindow : Window
 
         // 兜底：_visible 与窗口真实可见性可能错位（失焦隐藏路径异常/动画中断/外部隐藏）。
         // 以真实状态为准，避免"窗口已隐藏但 _visible=true"导致快捷键第一次走关闭分支。
-        if (_hwnd != IntPtr.Zero && !IsWindowVisible(_hwnd) && _visible)
+        // 判断"视觉不可见"：pop-out 动画播完但 HideNow 未执行时窗口停在淡出态
+        // （Opacity≈0、未 SW_HIDE），此时 IsWindowVisible 仍为 true，需一并复位。
+        var visuallyHidden = _hwnd != IntPtr.Zero
+            && (!IsWindowVisible(_hwnd) || ContentClip.Opacity < 0.1);
+        if (visuallyHidden && _visible)
         {
             _visible = false;
             _hideAnimating = false;
@@ -435,7 +440,7 @@ public sealed partial class MainWindow : Window
         }
 
         if (_visible)
-            HideLauncher();
+            HideLauncher(byToggle: true);
         else
             ShowLauncher();
     }
@@ -690,7 +695,9 @@ public sealed partial class MainWindow : Window
                 _animIn.Begin();
             }
 
-            // 焦点落稳后再延长一点保护
+            // 焦点落稳后再延长一点保护。注意不能太长：用户可能马上点击外面
+            // 触发失焦隐藏，保护期过长会把这真实的点击也拦掉（表现为点击外面
+            // 没隐藏、第一次热键变"关闭"）。400ms 足够覆盖抢前台过程的瞬态。
             _ignoreDeactivateUntilTicks = Environment.TickCount64 + 400;
         }
         catch (Exception ex)
@@ -715,8 +722,18 @@ public sealed partial class MainWindow : Window
 
     public void HideLauncher()
     {
+        HideLauncher(byToggle: false);
+    }
+
+    /// <summary>
+    /// byToggle=true：热键主动隐藏，绕过保护期——保护期只防被动隐藏源
+    /// （FgHook/Deactivated 在显示后短时间内误杀刚弹出的窗口），不能吞掉
+    /// 用户明确按热键的隐藏意图（否则"显示后短时间内按热键没反应"）。
+    /// </summary>
+    public void HideLauncher(bool byToggle)
+    {
         // 保护期内禁止隐藏（防闪关）
-        if (Environment.TickCount64 < _ignoreDeactivateUntilTicks && _visible)
+        if (!byToggle && Environment.TickCount64 < _ignoreDeactivateUntilTicks && _visible)
             return;
         if (!_visible)
             return;
@@ -762,6 +779,12 @@ public sealed partial class MainWindow : Window
         {
             if (_hwnd == IntPtr.Zero)
                 _hwnd = WindowNative.GetWindowHandle(this);
+
+            // 前台锁绕过：模拟一次 Alt 键让本进程获得"最近输入"资格，
+            // 否则点击外面后（输入权在别的进程）SetForegroundWindow 会被拒，
+            // 窗口显示后保护期一过就被 FgHook 关掉（"第一次热键没反应"）。
+            keybd_event(0x12 /*VK_MENU*/, 0, 0x0001 /*KEYEVENTF_EXTENDEDKEY*/, UIntPtr.Zero);
+            keybd_event(0x12, 0, 0x0001 | 0x0002 /*KEYEVENTF_KEYUP*/, UIntPtr.Zero);
 
             // AttachThreadInput 技巧，提高 SetForegroundWindow 成功率
             var fg = GetForegroundWindow();
@@ -1735,6 +1758,9 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
