@@ -2,7 +2,7 @@
 
 > 产品：**Spark** — Windows 专用、性能优先的全局效率启动器  
 > 宿主：**Rust**（`spark-host`）  
-> UI：**C# + WinUI 3**（`spark-ui`）— 定稿见 [TECH_STACK.md](./TECH_STACK.md)  
+> UI：**C# + WinUI 3**（`Spark`）— 定稿见 [TECH_STACK.md](./TECH_STACK.md)  
 > 插件：开放生态（独立进程；WASM 为 P2）
 
 ---
@@ -72,7 +72,7 @@
 | 进程 | 职责 | 生命周期 | 语言 |
 |------|------|----------|------|
 | **host**（`spark-host`） | 热键、托盘、索引、路由、插件管理、IPC | 常驻 | **Rust** |
-| **ui**（`spark-ui`） | 搜索框、结果列表、设置页、主题、收藏 | 常驻隐藏或随 Host 拉起 | **C# + WinUI 3** |
+| **ui**（`Spark`） | 搜索框、结果列表、设置页、主题、收藏 | 常驻隐藏或随 Host 拉起 | **C# + WinUI 3** |
 | **plugin-*** | 具体能力（翻译、OCR、截图等） | 按需启动，空闲回收 | 任意（Rust/C#/Go/Python…） |
 | **indexer-worker**（可选） | 重扫描、缩略图、深目录遍历 | 任务型 | Rust |
 
@@ -85,7 +85,7 @@
 **落地节奏（定稿）：**
 
 - **MVP**：Host + UI **双进程**（Host 可自动 spawn UI）+ 插件独立进程；协议按双进程写死  
-- **不做**：以 Electron/Tauri WebView 替代 `spark-ui`  
+- **不做**：以 Electron/Tauri WebView 替代 `Spark`  
 - **不做**：把索引/插件生命周期长期放在 C# 内
 
 ---
@@ -314,7 +314,7 @@ spark/
     plugin-manager/          # 发现/启停/权限
     sdk/                     # 插件 Rust SDK
   ui/
-    Spark.UI/                # C# WinUI 3 → spark-ui.exe
+    Spark.UI/                # C# WinUI 3 → Spark.exe
   plugins/
     echo/                    # 示例插件
   brand/
@@ -334,7 +334,7 @@ spark/
 ```
 安装包
   ├─ spark-host.exe      # 自启、单实例、热键/托盘
-  ├─ spark-ui.exe        # C# WinUI 主窗（可由 host 拉起）
+  ├─ Spark.exe           # C# WinUI 主窗（可由 host 拉起）
   ├─ resources/          # 含 brand 图标
   ├─ plugins/ builtin/
   └─ uninstall

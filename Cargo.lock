@@ -428,6 +428,7 @@ dependencies = [
  "spark-core",
  "thiserror",
  "tracing",
+ "windows",
 ]
 
 [[package]]

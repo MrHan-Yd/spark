@@ -17,7 +17,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
-    <AssemblyName>spark-ui</AssemblyName>
+    <AssemblyName>Spark</AssemblyName>
     <!-- 任务栏 / 资源管理器 应用图标（brand 四芒星） -->
     <ApplicationIcon>Assets\spark.ico</ApplicationIcon>
   </PropertyGroup>

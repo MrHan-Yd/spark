@@ -182,18 +182,26 @@ public sealed class HostIpcClient : IAsyncDisposable
     {
         await EnsureConnectedAsync(ct);
         if (!IsConnected)
+        {
+            App.Log("QueryFallback", new InvalidOperationException("not connected"));
             return DemoData.Query(text);
+        }
 
         try
         {
             var result = await CallAsync("host.query", new { text, limit }, ct);
             if (result.ValueKind == JsonValueKind.Undefined)
+            {
+                App.Log("QueryFallback",
+                    new InvalidOperationException($"undefined result; writerNull={_writer is null}"));
                 return DemoData.Query(text);
+            }
             return JsonSerializer.Deserialize<QueryResultDto>(result.GetRawText())
                    ?? new QueryResultDto();
         }
-        catch
+        catch (Exception ex)
         {
+            App.Log("QueryFallback", ex);
             return DemoData.Query(text);
         }
     }

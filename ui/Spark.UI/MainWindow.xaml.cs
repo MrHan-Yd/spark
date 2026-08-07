@@ -368,14 +368,22 @@ public sealed partial class MainWindow : Window
 
     private async Task MaintainHostConnectionAsync()
     {
+        var wasConnected = _host.IsConnected;
         while (true)
         {
             try
             {
                 if (!_host.IsConnected)
+                {
                     await _host.EnsureConnectedAsync();
+                    // 从"未连接"变为"已连接"：首启的 DemoData 兜底已过期，
+                    // 自动补一次刷新拿到完整列表（否则要等用户按热键唤醒才看得到）
+                    if (_host.IsConnected && !wasConnected)
+                        DispatcherQueue.TryEnqueue(() => _ = RefreshResultsAsync(QueryBox.Text));
+                }
             }
             catch { /* ignore */ }
+            wasConnected = _host.IsConnected;
             await Task.Delay(2000);
         }
     }
@@ -1057,6 +1065,25 @@ public sealed partial class MainWindow : Window
         var open = new MenuFlyoutItem { Text = "打开", Icon = new FontIcon { Glyph = "\uE8A7" } };
         open.Click += (_, _) => _ = InvokeActionAsync(itemId, "open");
         menu.Items.Add(open);
+
+        // 附属快捷方式动作（如"Chrome 无痕模式"）：同一应用合并后的其他打开方式
+        var altActions = c.Actions
+            .Where(a => !a.IsDefault
+                        && a.Id is not ("open" or "runas" or "reveal")
+                        && !string.IsNullOrWhiteSpace(a.Title))
+            .ToList();
+        if (altActions.Count > 0)
+        {
+            var sub = new MenuFlyoutSubItem { Text = "打开方式", Icon = new FontIcon { Glyph = "\uE8A7" } };
+            foreach (var a in altActions)
+            {
+                var aid = a.Id;
+                var mi = new MenuFlyoutItem { Text = a.Title };
+                mi.Click += (_, _) => _ = InvokeActionAsync(itemId, aid);
+                sub.Items.Add(mi);
+            }
+            menu.Items.Add(sub);
+        }
 
         var runas = new MenuFlyoutItem { Text = "以管理员身份打开", Icon = new FontIcon { Glyph = "\uE7EF" } };
         runas.Click += (_, _) => _ = InvokeActionAsync(itemId, "runas");

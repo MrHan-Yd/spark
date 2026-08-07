@@ -1,4 +1,4 @@
-# Build and launch spark-ui
+# Build and launch Spark
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
@@ -13,21 +13,21 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # 可能路径（按优先级）
 $candidates = @(
-    "$root\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\win-x64\spark-ui.exe",
-    "$root\ui\Spark.UI\bin\x64\Debug\net8.0-windows10.0.19041.0\win-x64\spark-ui.exe",
-    "$root\ui\Spark.UI\bin\x64\Debug\net8.0-windows10.0.19041.0\spark-ui.exe",
-    "$root\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\spark-ui.exe"
+    "$root\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\win-x64\Spark.exe",
+    "$root\ui\Spark.UI\bin\x64\Debug\net8.0-windows10.0.19041.0\win-x64\Spark.exe",
+    "$root\ui\Spark.UI\bin\x64\Debug\net8.0-windows10.0.19041.0\Spark.exe",
+    "$root\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\Spark.exe"
 )
 
 $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $exe) {
-    Write-Host "未找到 spark-ui.exe，搜索 bin 目录..." -ForegroundColor Yellow
-    $exe = Get-ChildItem -Path "$root\ui\Spark.UI\bin" -Recurse -Filter "spark-ui.exe" -ErrorAction SilentlyContinue |
+    Write-Host "未找到 Spark.exe，搜索 bin 目录..." -ForegroundColor Yellow
+    $exe = Get-ChildItem -Path "$root\ui\Spark.UI\bin" -Recurse -Filter "Spark.exe" -ErrorAction SilentlyContinue |
         Select-Object -First 1 -ExpandProperty FullName
 }
 
 if (-not $exe) {
-    Write-Host "构建成功但找不到 spark-ui.exe" -ForegroundColor Red
+    Write-Host "构建成功但找不到 Spark.exe" -ForegroundColor Red
     exit 1
 }
 

@@ -42,11 +42,11 @@ struct Cli {
     #[arg(long)]
     toggle: bool,
 
-    /// Print spark-ui window visibility, then exit (diagnostics)
+    /// Print spark window visibility, then exit (diagnostics)
     #[arg(long)]
     probe_ui: bool,
 
-    /// Do not auto-spawn spark-ui on start
+    /// Do not auto-spawn spark on start
     #[arg(long)]
     no_ui: bool,
 }
@@ -133,17 +133,17 @@ fn main() -> Result<()> {
 fn try_spawn_ui_on_boot() {
     // If UI already running, it will connect; else spawn.
     if is_ui_running() {
-        info!("spark-ui already running");
+        info!("spark already running");
         return;
     }
     let candidates = [
-        "ui/Spark.UI/bin/Debug/net8.0-windows10.0.19041.0/win-x64/spark-ui.exe",
-        "ui/Spark.UI/bin/Release/net8.0-windows10.0.19041.0/win-x64/spark-ui.exe",
+        "ui/Spark.UI/bin/Debug/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
+        "ui/Spark.UI/bin/Release/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
     ];
     for c in candidates {
         let p = std::path::PathBuf::from(c);
         if p.is_file() {
-            info!(path = %p.display(), "spawning spark-ui on boot");
+            info!(path = %p.display(), "spawning spark on boot");
             let mut cmd = std::process::Command::new(&p);
             if let Some(dir) = p.parent() {
                 cmd.current_dir(dir);
@@ -154,19 +154,19 @@ fn try_spawn_ui_on_boot() {
             }
         }
     }
-    info!("spark-ui.exe not found — start UI manually for IPC");
+    info!("Spark.exe not found — start UI manually for IPC");
 }
 
 pub(crate) fn is_ui_running() -> bool {
     // Lightweight: try open pipe is not enough (host is the server).
     // Check process name.
     std::process::Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq spark-ui.exe", "/NH"])
+        .args(["/FI", "IMAGENAME eq Spark.exe", "/NH"])
         .output()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .to_lowercase()
-                .contains("spark-ui")
+                .contains("spark.exe")
         })
         .unwrap_or(false)
 }

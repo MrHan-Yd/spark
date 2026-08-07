@@ -24,6 +24,10 @@ pub struct Action {
     pub id: String,
     pub title: String,
     pub is_default: bool,
+    /// Optional per-action launch target (e.g. a merged secondary shortcut);
+    /// falls back to the candidate's own target when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 impl Action {
@@ -32,6 +36,7 @@ impl Action {
             id: "open".into(),
             title: "打开".into(),
             is_default: true,
+            target: None,
         }
     }
 
@@ -40,6 +45,7 @@ impl Action {
             id: "reveal".into(),
             title: "打开文件位置".into(),
             is_default: false,
+            target: None,
         }
     }
 }

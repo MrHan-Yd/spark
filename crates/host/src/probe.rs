@@ -1,4 +1,4 @@
-//! One-shot diagnostics: is the spark-ui launcher window visible?
+//! One-shot diagnostics: is the spark launcher window visible?
 //! `spark-host --probe-ui`（继承当前控制台，不会创建新窗口抢前台，
 //! 适合无人值守验证"窗口显示后是否保持"）。
 
@@ -17,7 +17,7 @@ pub fn print_ui_visible() -> Result<()> {
         )
     };
     if !found {
-        println!("spark-ui window: NOT FOUND");
+        println!("Spark window: NOT FOUND");
     }
     Ok(())
 }
@@ -28,7 +28,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
     if title == "Spark" {
         let visible = IsWindowVisible(hwnd).as_bool();
-        println!("spark-ui window: {hwnd:?} visible={visible}");
+        println!("Spark window: {hwnd:?} visible={visible}");
         *(lparam.0 as *mut bool) = true;
         BOOL(0) // stop enumerating
     } else {

@@ -71,7 +71,7 @@ Spark = Rust Host（热键 / 索引 / 插件 / IPC）
                 │ Named Pipe（JSON-RPC）
                 │ 可选：共享内存（大 payload）
 ┌───────────────▼─────────────────────────┐
-│  spark-ui.exe            (C# WinUI 3)   │
+│  Spark.exe               (C# WinUI 3)   │
 │  · 唯一用户主窗口（搜索 / 设置页内切换） │
 │  · 列表 · 平铺 · 收藏分组 · 主题        │
 │  · 不负责全盘索引与插件生命周期          │
@@ -86,7 +86,7 @@ Spark = Rust Host（热键 / 索引 / 插件 / IPC）
 | 进程 | 二进制（建议名） | 语言 | 职责 |
 |------|------------------|------|------|
 | Host | `spark-host.exe` | Rust | 热键、托盘、索引、路由、插件、配置权威源 |
-| UI | `spark-ui.exe` | C# / WinUI 3 | 主窗展示与交互；经 IPC 调 Host |
+| UI | `Spark.exe` | C# / WinUI 3 | 主窗展示与交互；经 IPC 调 Host |
 | Plugin | 插件自带 `main` | 任意 | 查询/执行；经 Host 中转 |
 
 ### 4.1 启动关系
@@ -198,7 +198,7 @@ spark/
 |------|------|
 | Host | Rust stable、MSVC 工具链、Windows SDK |
 | UI | Visual Studio 2022 + Windows App SDK / WinUI 3 工作负载 |
-| 联调 | 先起 `spark-host`，再起 `spark-ui`；或 Host 自动 spawn UI |
+| 联调 | 先起 `spark-host`，再起 `Spark`；或 Host 自动 spawn UI |
 | 原型 | 浏览器打开 `ui-prototype/`（仅设计参考） |
 
 ---

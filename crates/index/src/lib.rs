@@ -2,10 +2,12 @@
 
 mod apps;
 mod history;
+mod lnk;
 mod memory;
 
 pub use apps::enumerate_start_menu_apps;
 pub use history::HistoryStore;
+pub use lnk::resolve_lnk;
 pub use memory::MemoryIndex;
 
 use spark_core::{rank_candidates, Candidate, Query, Source};
@@ -36,7 +38,9 @@ impl AppIndex {
         for app in enumerate_start_menu_apps() {
             memory.upsert(app);
         }
-        let history = HistoryStore::load();
+        let mut history = HistoryStore::load();
+        // Shortcut merging changed the id space; re-point stale history rows
+        history.reconcile(&memory);
         Self { memory, history }
     }
 

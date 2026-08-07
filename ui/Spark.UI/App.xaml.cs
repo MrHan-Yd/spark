@@ -28,8 +28,8 @@ public partial class App : Application
     {
         try
         {
-            // 单实例：已有 spark-ui 在跑时，唤醒它（发 toggle 事件）并退出自己。
-            // Host 热键路径只会在没有 spark-ui 进程时才拉起，这里兜底防止手动重复启动。
+            // 单实例：已有 spark 在跑时，唤醒它（发 toggle 事件）并退出自己。
+            // Host 热键路径只会在没有 spark 进程时才拉起，这里兜底防止手动重复启动。
             var m = new Mutex(false, "Local\\SparkUISingleInstance_v1", out var createdNew);
             bool owned;
             try { owned = m.WaitOne(0); }

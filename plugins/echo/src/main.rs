@@ -23,6 +23,7 @@ impl Plugin for Echo {
                 id: "copy".into(),
                 title: "复制".into(),
                 is_default: true,
+                target: None,
             }],
             plugin_id: Some(self.id().into()),
         })

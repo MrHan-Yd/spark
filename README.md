@@ -5,7 +5,7 @@ Windows 效率启动器：**性能优先**的全局唤起工具（类似 uTools 
 | | |
 |--|--|
 | Host | **Rust** · `spark-host`（热键 / 索引 / 启动 / 托盘 / IPC） |
-| UI | **C# WinUI 3** · `spark-ui`（搜索窗） |
+| UI | **C# WinUI 3** · `Spark`（搜索窗） |
 | 插件 | 独立进程 + `plugin.json`（P1） |
 | 热键 | 默认 **Alt+Space**（可改，见配置） |
 | IPC | Named Pipe `\\.\pipe\spark.host.ipc` |
@@ -22,7 +22,7 @@ spark/
 │   ├── plugin-manager/   # 清单扫描
 │   └── sdk/              # 插件 Rust SDK
 ├── plugins/echo/         # 示例插件
-├── ui/Spark.UI/          # C# WinUI → spark-ui.exe
+├── ui/Spark.UI/          # C# WinUI → Spark.exe
 ├── brand/                # Logo
 ├── docs/                 # 架构 / 设计 / 功能 / 技术栈
 ├── ui-prototype/         # HTML 交互原型（非生产）
@@ -73,7 +73,7 @@ cargo run -p spark-host -- --no-ui
 
 | 参数 | 含义 |
 |------|------|
-| （无） | 常驻；若找到 `spark-ui.exe` 会尝试自动拉起 UI |
+| （无） | 常驻；若找到 `Spark.exe` 会尝试自动拉起 UI |
 | `--no-ui` | 只起 Host，**不**自动拉 UI（联调时推荐） |
 | `--query term` | 一次性搜索，打印 JSON 后退出 |
 | `--query 记事 --launch` | 搜索并启动第一条 |
@@ -112,11 +112,11 @@ cd D:\demo\test01\spark
 **手动：**
 
 ```powershell
-Stop-Process -Name spark-ui -Force -ErrorAction SilentlyContinue
+Stop-Process -Name Spark -Force -ErrorAction SilentlyContinue
 dotnet build ui\Spark.UI\Spark.UI.csproj -c Debug
 
 $dir = "D:\demo\test01\spark\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\win-x64"
-Start-Process "$dir\spark-ui.exe" -WorkingDirectory $dir
+Start-Process "$dir\Spark.exe" -WorkingDirectory $dir
 ```
 
 > 必须从 **`win-x64` 输出目录** 启动，并设置 `WorkingDirectory`。  
@@ -124,7 +124,7 @@ Start-Process "$dir\spark-ui.exe" -WorkingDirectory $dir
 
 成功时：
 
-- 进程 `spark-ui` 在跑；窗口默认**隐藏**（uTools 风格）
+- 进程 `Spark` 在跑；窗口默认**隐藏**（uTools 风格）
 - 已连上 Host 时，底栏/状态为 **Host · 极速**（未连则为演示数据）
 - **Alt+Space** 或 Host 托盘「显示」→ 弹出搜索窗
 - 输入搜开始菜单应用 → **Enter** 由 Host 启动
@@ -171,7 +171,7 @@ cargo run -p spark-plugin-echo -- hello
 ## 停止
 
 ```powershell
-Stop-Process -Name spark-host, spark-ui -Force -ErrorAction SilentlyContinue
+Stop-Process -Name spark-host, Spark -Force -ErrorAction SilentlyContinue
 ```
 
 也可：Host 托盘 → **退出**（结束 Host；UI 需自行关或再 Stop-Process）。
@@ -206,7 +206,7 @@ forward toggle failed … CreateFile pipe … 拒绝访问 (0x80070005)
 Get-Process spark-host -ErrorAction SilentlyContinue
 
 # 结束所有 Host（必要时连 UI 一起清）
-Stop-Process -Name spark-host, spark-ui -Force -ErrorAction SilentlyContinue
+Stop-Process -Name spark-host, Spark -Force -ErrorAction SilentlyContinue
 
 # 再启动
 cd D:\demo\test01\spark

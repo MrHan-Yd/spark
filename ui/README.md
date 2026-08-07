@@ -1,6 +1,6 @@
 # Spark UI — C# · WinUI 3
 
-生产界面：`spark-ui.exe`（项目程序集名 `spark-ui`）。
+生产界面：`Spark.exe`（项目程序集名 `Spark`）。
 
 ## 结构
 

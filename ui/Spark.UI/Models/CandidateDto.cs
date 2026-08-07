@@ -34,6 +34,10 @@ public sealed class CandidateDto : INotifyPropertyChanged
     [JsonPropertyName("plugin_id")]
     public string? PluginId { get; set; }
 
+    /// <summary>Secondary actions (merged shortcut variants, e.g. "Chrome 无痕模式").</summary>
+    [JsonPropertyName("actions")]
+    public List<ActionDto> Actions { get; set; } = new();
+
     [JsonIgnore]
     public string Kind => Source switch
     {
@@ -129,4 +133,21 @@ public sealed class QueryResultDto
 
     [JsonPropertyName("partial")]
     public bool Partial { get; set; }
+}
+
+/// <summary>An action on a result row; merged shortcut variants carry their
+/// own target on the host side.</summary>
+public sealed class ActionDto
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = "";
+
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = "";
+
+    [JsonPropertyName("is_default")]
+    public bool IsDefault { get; set; }
+
+    [JsonPropertyName("target")]
+    public string? Target { get; set; }
 }

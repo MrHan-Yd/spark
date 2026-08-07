@@ -69,7 +69,19 @@ impl HostApp {
             params.action_id.as_str()
         };
 
-        match shell::invoke_action(item.target.as_deref(), action) {
+        // Secondary shortcut actions carry their own target (the merged .lnk);
+        // built-in actions (open/runas/reveal) always use the row's target.
+        let action_target = if matches!(action, "open" | "runas" | "reveal") {
+            None
+        } else {
+            item.actions
+                .iter()
+                .find(|a| a.id == action)
+                .and_then(|a| a.target.clone())
+        };
+        let target = action_target.as_deref().or(item.target.as_deref());
+
+        match shell::invoke_action(target, action) {
             Ok(()) => {
                 self.index.record_usage(&item);
                 Ok(InvokeResult::Close {

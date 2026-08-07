@@ -6,8 +6,8 @@ if (-not (Test-Path "$Root\ui\Spark.UI\Spark.UI.csproj")) {
 }
 Set-Location $Root
 
-Write-Host "== stop old spark-ui ==" -ForegroundColor Cyan
-Get-Process spark-ui -ErrorAction SilentlyContinue | Stop-Process -Force
+Write-Host "== stop old Spark ==" -ForegroundColor Cyan
+Get-Process Spark -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400
 
 Write-Host "== clean ==" -ForegroundColor Cyan
@@ -18,7 +18,7 @@ dotnet build "ui\Spark.UI\Spark.UI.csproj" -c Debug
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
 $dir = Join-Path $Root "ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\win-x64"
-$exe = Join-Path $dir "spark-ui.exe"
+$exe = Join-Path $dir "Spark.exe"
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
 Write-Host "== run ==" -ForegroundColor Cyan
@@ -27,7 +27,7 @@ Write-Host "log: $env:LOCALAPPDATA\Spark\ui-crash.log"
 Start-Process -FilePath $exe -WorkingDirectory $dir
 
 Start-Sleep -Seconds 2
-$p = Get-Process spark-ui -ErrorAction SilentlyContinue
+$p = Get-Process Spark -ErrorAction SilentlyContinue
 if ($p) {
     Write-Host "OK pid=$($p.Id) hwnd=$($p.MainWindowHandle)" -ForegroundColor Green
 } else {

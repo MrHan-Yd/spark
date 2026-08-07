@@ -77,8 +77,7 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
         }
     }
 
-    let tray =
-        TrayIcon::add(hwnd, "Spark — Alt+Space 唤起", icon_path.as_deref()).context("tray icon")?;
+    let tray = TrayIcon::add(hwnd, "Spark", icon_path.as_deref()).context("tray icon")?;
     info!(
         ui_clients = hub.client_count(),
         "tray ready; message loop running"
@@ -162,11 +161,11 @@ fn on_toggle() {
 }
 
 fn try_spawn_ui() {
-    // Look for spark-ui near host or in known build output
+    // Look for spark near host or in known build output
     let candidates = [
-        "ui/Spark.UI/bin/Debug/net8.0-windows10.0.19041.0/win-x64/spark-ui.exe",
-        "ui/Spark.UI/bin/Release/net8.0-windows10.0.19041.0/win-x64/spark-ui.exe",
-        "spark-ui.exe",
+        "ui/Spark.UI/bin/Debug/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
+        "ui/Spark.UI/bin/Release/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
+        "Spark.exe",
     ];
     let mut path = None;
     for c in candidates {
@@ -179,7 +178,7 @@ fn try_spawn_ui() {
     if path.is_none() {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                let p = dir.join("spark-ui.exe");
+                let p = dir.join("Spark.exe");
                 if p.is_file() {
                     path = Some(p);
                 }
@@ -187,7 +186,7 @@ fn try_spawn_ui() {
         }
     }
     if let Some(p) = path {
-        info!(path = %p.display(), "spawning spark-ui");
+        info!(path = %p.display(), "spawning spark");
         let mut cmd = std::process::Command::new(&p);
         if let Some(dir) = p.parent() {
             cmd.current_dir(dir);
@@ -196,7 +195,7 @@ fn try_spawn_ui() {
             warn!(?e, "failed to spawn UI");
         }
     } else {
-        warn!("no UI clients and spark-ui.exe not found — start UI manually");
+        warn!("no UI clients and Spark.exe not found — start UI manually");
     }
 }
 

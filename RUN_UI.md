@@ -43,7 +43,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_ui.ps1
 
 ```powershell
 # 1. 杀掉旧进程
-Stop-Process -Name spark-ui -Force -ErrorAction SilentlyContinue
+Stop-Process -Name Spark -Force -ErrorAction SilentlyContinue
 
 # 2. 编译
 cd D:\demo\test01\spark
@@ -51,7 +51,7 @@ dotnet build ui\Spark.UI\Spark.UI.csproj -c Debug
 
 # 3. 从 win-x64 输出目录启动（WorkingDirectory 必对）
 $dir = "D:\demo\test01\spark\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\win-x64"
-Start-Process "$dir\spark-ui.exe" -WorkingDirectory $dir
+Start-Process "$dir\Spark.exe" -WorkingDirectory $dir
 ```
 
 > 不要用 `dotnet run` 当日常启动方式（输出路径易错）。
@@ -68,11 +68,11 @@ Start-Process "$dir\spark-ui.exe" -WorkingDirectory $dir
 
 ## 若仍弹 XAML / 闪退
 
-1. 任务管理器结束所有 `spark-ui`
+1. 任务管理器结束所有 `Spark`
 2. 确认 exe 是刚编的：
 
 ```powershell
-Get-Item "D:\demo\test01\spark\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\win-x64\spark-ui.exe" |
+Get-Item "D:\demo\test01\spark\ui\Spark.UI\bin\Debug\net8.0-windows10.0.19041.0\win-x64\Spark.exe" |
   Select-Object FullName, LastWriteTime, Length
 ```
 

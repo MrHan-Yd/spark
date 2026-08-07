@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
+use tracing::debug;
 use windows::core::PCWSTR;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -84,7 +85,11 @@ pub fn invoke_action(target: Option<&str>, action_id: &str) -> Result<()> {
         "open" | "" => shell_open(target),
         "runas" => shell_runas(target),
         "reveal" => shell_reveal(target),
-        other => bail!("unknown action: {other}"),
+        // Secondary shortcut actions (merged .lnk): open their own target
+        other => {
+            debug!(action = other, "falling back to default open");
+            shell_open(target)
+        }
     }
 }
 

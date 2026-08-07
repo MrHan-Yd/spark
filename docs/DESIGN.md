@@ -513,7 +513,7 @@ repo/
     host/                 # 二进制入口
     sdk/
     ui-bridge/
-  ui/Spark.UI/            # C# WinUI 3 → spark-ui
+  ui/Spark.UI/            # C# WinUI 3 → Spark
   plugins/
     echo/
       plugin.json
