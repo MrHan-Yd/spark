@@ -38,6 +38,16 @@
         <GradientStop Offset="0" Color="#14FFFFFF"/>
         <GradientStop Offset="0.28" Color="#00FFFFFF"/>
       </LinearGradientBrush>
+      <!-- 收藏卡片模板：无状态模板，杜绝 Button 默认主题在悬停/按下时注入边框/底色；
+           选中态完全由代码控制（与结果列表一致的 RowActive/RowHover 画刷，默认无边框） -->
+      <ControlTemplate x:Key="FavCardTemplate" TargetType="Button">
+        <Border Background="{TemplateBinding Background}"
+                BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="{TemplateBinding BorderThickness}"
+                CornerRadius="12">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+      </ControlTemplate>
       <!-- 窗口圆角：与 DWM 实际裁剪半径一致（见文件头注释），ContentClip/高光/描边三处共用 -->
       <CornerRadius x:Key="WinCornerRadius">5</CornerRadius>
       <RadialGradientBrush x:Key="WpSpotTL" GradientOrigin="0.2,0.3" Center="0.2,0.3" RadiusX="0.95" RadiusY="0.75">

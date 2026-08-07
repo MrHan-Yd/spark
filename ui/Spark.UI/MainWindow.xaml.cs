@@ -29,6 +29,8 @@ public sealed partial class MainWindow : Window
     private TrayService? _tray;
     private ToggleWatcher? _toggleWatcher;
     private int _active;
+    /// <summary>收藏卡片选中索引（-1 = 未选中，焦点在结果区）；方向键可在结果区 ↔ 收藏区之间移动。</summary>
+    private int _favActive = -1;
     private bool _hideOnDeactivate = true;
     private bool _loaded;
     private bool _visible;
@@ -683,6 +685,9 @@ public sealed partial class MainWindow : Window
             QueryBox.Text = "";
             _ = RefreshResultsAsync("");
             QueryBox.Focus(FocusState.Programmatic);
+            // 唤起时收藏选中态复位（上一轮导航状态不残留）
+            _favActive = -1;
+            UpdateFavCardStates();
             // 前台锁偶发拦截 SetForegroundWindow（窗口显示但未激活 → 点击外面不会触发失焦隐藏）。
             // 延迟重试几次，确保窗口真正拿到前台。
             _ = RetryFocusAsync();
@@ -884,6 +889,9 @@ public sealed partial class MainWindow : Window
             _active = 0;
             ResultList.SelectedIndex = 0;
             ResultGrid.SelectedIndex = 0;
+            // 输入搜索后焦点回到结果区，收藏选中态复位
+            _favActive = -1;
+            UpdateFavCardStates();
         }
     }
 
@@ -895,6 +903,7 @@ public sealed partial class MainWindow : Window
         var oldBodyH = FavBody.Visibility == Visibility.Visible ? FavBody.ActualHeight : 0;
         FavGroups.Children.Clear();
         FavItems.Children.Clear();
+        _favActive = -1;  // 收藏内容重建后选中态复位
         var fav = LocalState.Fav;
         var res = Root.Resources;
         FavCount.Text = fav.Items.Count > 0 ? $"({fav.Items.Count})" : "";
@@ -1004,12 +1013,21 @@ public sealed partial class MainWindow : Window
             {
                 Content = panel,
                 Padding = new Thickness(0),
-                Background = new SolidColorBrush(Color.FromArgb(0x0A, 0xFF, 0xFF, 0xFF)),
+                Background = new SolidColorBrush(Colors.Transparent),
                 BorderThickness = new Thickness(1),
-                BorderBrush = (Brush)res["DividerBrush"],
-                CornerRadius = new CornerRadius(12),
+                BorderBrush = new SolidColorBrush(Colors.Transparent),
+                UseSystemFocusVisuals = false,
+                Template = (ControlTemplate)Root.Resources["FavCardTemplate"],
                 Tag = c.Id
             };
+            // 无默认边框/底色；悬停与键盘选中（光标）复用结果列表的 hover/active 样式
+            btn.PointerEntered += (_, _) =>
+            {
+                var hover = (Brush)Root.Resources["RowHoverBrush"];
+                btn.Background = hover;
+                btn.BorderBrush = hover;
+            };
+            btn.PointerExited += (_, _) => UpdateFavCardStates();
             ToolTipService.SetToolTip(btn, title);
             var itemId = c.Id;
             btn.Click += async (_, _) =>
@@ -1029,6 +1047,7 @@ public sealed partial class MainWindow : Window
 
         // 折叠状态由 ApplyFavCollapse 管（带动画），这里只同步提示文字
         ToolTipService.SetToolTip(FavToggle, fav.Expanded ? "收起收藏" : "展开收藏");
+        UpdateFavCardStates();
         AnimateFavBodyHeight(oldBodyH);
     }
 
@@ -1083,6 +1102,7 @@ public sealed partial class MainWindow : Window
         // 注意：自定义 ControlTemplate 下容器 DataContext 为 null，取 Content（= 数据项）
         if (node is not ContentControl cc || cc.Content is not CandidateDto c) return;
         _active = _items.IndexOf(c);
+        _favActive = -1;  // 右键结果区 = 焦点回结果区，收藏选中态复位
         SyncSelection();
         _itemMenu = BuildItemMenu(c);
         _itemMenu.ShowAt(cc, new FlyoutShowOptions { Position = e.GetPosition(cc) });
@@ -1645,22 +1665,6 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        if (e.Key == VirtualKey.Escape)
-        {
-            e.Handled = true;
-            if (SettingsPanel.Visibility == Visibility.Visible)
-            {
-                OnCloseSettings(sender, e);
-                return;
-            }
-            if (!string.IsNullOrEmpty(QueryBox.Text))
-            {
-                QueryBox.Text = "";
-                await RefreshResultsAsync("");
-            }
-            else HideLauncher();
-            return;
-        }
         if (e.Key == VirtualKey.Enter)
         {
             e.Handled = true;
@@ -1670,25 +1674,42 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>根上 handledEventsToo 收箭头键（冒泡终点）：输入框有文本时 TextBox 已先消费箭头（光标移动），
-    /// 这里仍能收到，统一只移动下面选中项，并把输入框光标拉回末尾（搜索框只能输入/退格，不能移光标）。
-    /// 列表/平铺都走这里：列表视图左右等价上一条/下一条，平铺按网格行列移动。
-    /// 焦点在收藏坞交互件上时不接管（方向键留给按钮导航）；其余位置（搜索框/列表/平铺/视图切换…）箭头键都移动结果选中项——
-    /// 列表视图点击条目后焦点落在 ListViewItem 上，原生 ListView 只处理上下、左右是死键（平铺原生是 2D 没这问题），
-    /// 必须在这里统一接管，两视图行为才一致。
+    /// 这里仍能收到，统一只控制选中项，并把输入框光标拉回末尾（搜索框只能输入/退格，不能移光标）。
+    /// 列表/平铺/收藏区都走这里：列表视图左右等价上一条/下一条，平铺按网格行列移动
+    /// （直上直下：正下方没有元素不跳到最后）；结果区末尾继续往下进入收藏区，
+    /// 收藏区首位继续往上回到结果区（_favActive 跟踪）。
+    /// 焦点在收藏坞交互件上（点了卡片/分组）时也纳入收藏区导航，不交给原生方向键。
     /// 注意：焦点在条目上时原生 ListView/GridView 会先于本处理器移动选中（键盘光标跟随），
     /// 因此这里从 _active（按下前的值）计算目标并绝对赋值；若读 SelectedIndex 重算会叠加上原生那一步，造成双重移动。</summary>
     private void OnRootKeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (_composing) return;                       // IME 组词中不拦截
         if (MainPanel.Visibility != Visibility.Visible) return; // 设置页里不动
-        if (IsFocusOnFavorites()) return;             // 焦点在收藏坞：交给原生方向键导航
         if (_itemMenu?.IsOpen == true) return;        // 动作菜单打开中：方向键/回车交给菜单
 
+        if (e.Key == VirtualKey.Escape)
+        {
+            // Esc 在根上统一处理（焦点可能在搜索框/结果/收藏任意位置）
+            e.Handled = true;
+            if (SettingsPanel.Visibility == Visibility.Visible)
+            {
+                OnCloseSettings(sender, e);
+                return;
+            }
+            if (!string.IsNullOrEmpty(QueryBox.Text))
+            {
+                QueryBox.Text = "";
+                _ = RefreshResultsAsync("");
+                return;
+            }
+            HideLauncher();
+            return;
+        }
         if (e.Key == VirtualKey.Tab)
         {
             // Tab 动作（对齐原型 action-sheet）：对当前选中项弹出动作菜单
             e.Handled = true;
-            ShowActiveItemMenu();
+            if (_favActive < 0) ShowActiveItemMenu();
             return;
         }
         if (e.Key is not (VirtualKey.Down or VirtualKey.Up or VirtualKey.Left or VirtualKey.Right)) return;
@@ -1696,28 +1717,144 @@ public sealed partial class MainWindow : Window
         e.Handled = true;
         QueryBox.SelectionStart = QueryBox.Text.Length;
         QueryBox.SelectionLength = 0;
+        // 鼠标点过收藏坞（焦点落在交互件上）且尚未进入收藏区导航 → 从当前卡片进入
+        if (IsFocusOnFavorites() && _favActive < 0)
+            _favActive = 0;
+        MoveSelection(e.Key);
+    }
 
-        if (_items.Count == 0) return;
-        int delta;
+    /// <summary>方向键移动选中：结果区 ↔ 收藏区无缝衔接。
+    /// 平铺视图"直上直下"：正下方没有元素就停在原地，不跳到最后；
+    /// 结果区末尾继续往下进入收藏区，收藏区首位继续往上回到结果区。</summary>
+    private void MoveSelection(VirtualKey key)
+    {
+        var favCount = FavBody.Visibility == Visibility.Visible ? FavButtons().Count : 0;
+
+        // 收藏区：一行卡片，右/下 = 下一张，左/上 = 上一张，首位再往上是回结果区
+        if (_favActive >= 0)
+        {
+            switch (key)
+            {
+                case VirtualKey.Right or VirtualKey.Down when _favActive < favCount - 1:
+                    _favActive++;
+                    break;
+                case VirtualKey.Left or VirtualKey.Up when _favActive > 0:
+                    _favActive--;
+                    break;
+                case VirtualKey.Left or VirtualKey.Up:
+                    _favActive = -1;
+                    SyncSelection();
+                    return;
+                default:
+                    break; // 右/下到末尾：停在原地
+            }
+            SyncFavSelection();
+            return;
+        }
+
+        // 结果区
+        if (_items.Count == 0)
+        {
+            if (favCount > 0 && key is VirtualKey.Down or VirtualKey.Right)
+            {
+                _favActive = 0;
+                SyncFavSelection();
+            }
+            return;
+        }
+
         if (_gridView)
         {
-            // 平铺视图：按网格行列移动（列数跟随窗口宽度）
-            var cols = GridColumns();
-            delta = e.Key switch
+            var cols = Math.Max(1, GridColumns());
+            switch (key)
             {
-                VirtualKey.Left => -1,
-                VirtualKey.Right => 1,
-                VirtualKey.Up => -cols,
-                _ => cols,
-            };
+                case VirtualKey.Left:
+                    if (_active > 0) _active--;
+                    break;
+                case VirtualKey.Right:
+                    if (_active < _items.Count - 1) _active++;
+                    break;
+                case VirtualKey.Up:
+                    if (_active >= cols) _active -= cols; // 顶行没有元素：停在原地
+                    break;
+                case VirtualKey.Down:
+                    var below = _active + cols;
+                    if (below < _items.Count)
+                        _active = below;
+                    else if (favCount > 0)
+                    {
+                        _favActive = 0;
+                        SyncFavSelection();
+                        return;
+                    }
+                    // 底行正下方没有元素（且无收藏）：停在原地，不跳到最后
+                    break;
+            }
         }
         else
         {
-            // 列表视图：左右等价于上一条/下一条
-            delta = e.Key is VirtualKey.Up or VirtualKey.Left ? -1 : 1;
+            switch (key)
+            {
+                case VirtualKey.Up or VirtualKey.Left:
+                    if (_active > 0) _active--;
+                    break;
+                case VirtualKey.Down or VirtualKey.Right:
+                    if (_active < _items.Count - 1)
+                        _active++;
+                    else if (favCount > 0)
+                    {
+                        _favActive = 0;
+                        SyncFavSelection();
+                        return;
+                    }
+                    break;
+            }
         }
-        _active = Math.Clamp(_active + delta, 0, _items.Count - 1);
         SyncSelection();
+    }
+
+    /// <summary>收藏区选中：刷新卡片边框 + 取消结果区选中 + 聚焦当前卡片。</summary>
+    private void SyncFavSelection()
+    {
+        UpdateFavCardStates();
+        ResultList.SelectedIndex = -1;
+        ResultGrid.SelectedIndex = -1;
+        var i = 0;
+        foreach (var child in FavItems.Children)
+        {
+            if (child is not Button b) continue;
+            if (i == _favActive)
+            {
+                b.Focus(FocusState.Programmatic);
+                try { b.StartBringIntoView(); } catch { /* ignore */ }
+            }
+            i++;
+        }
+    }
+
+    /// <summary>收藏卡片按钮（排除空态占位 TextBlock）。</summary>
+    private List<Button> FavButtons() => FavItems.Children.OfType<Button>().ToList();
+
+    /// <summary>按 _favActive 刷新所有收藏卡片状态（默认无边框，光标选中才显示）。</summary>
+    private void UpdateFavCardStates()
+    {
+        var i = 0;
+        foreach (var child in FavItems.Children)
+        {
+            if (child is not Button b) continue;
+            SetFavCardState(b, i == _favActive);
+            i++;
+        }
+    }
+
+    /// <summary>收藏卡片选中态：与结果列表一致——选中用 RowActiveBrush（底+边框），
+    /// 未选中全透明（默认无边框，光标移上去才有）。</summary>
+    private void SetFavCardState(Button b, bool selected)
+    {
+        var res = Root.Resources;
+        var brush = selected ? (Brush)res["RowActiveBrush"] : new SolidColorBrush(Colors.Transparent);
+        b.Background = brush;
+        b.BorderBrush = brush;
     }
 
     /// <summary>焦点是否落在收藏坞（或其按钮）内；是则箭头键交给原生方向键导航。</summary>
@@ -1747,6 +1884,7 @@ public sealed partial class MainWindow : Window
 
     private void SyncSelection()
     {
+        UpdateFavCardStates();  // 结果区选中时收藏卡片保持默认无边框
         if (_gridView)
         {
             ResultGrid.SelectedIndex = _active;
