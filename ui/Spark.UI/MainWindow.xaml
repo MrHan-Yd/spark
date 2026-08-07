@@ -6,11 +6,14 @@
     Title="Spark">
 
   <!-- 对齐 ui-prototype 主弹窗：颜色收成 Root.Resources 画刷，主题切换由代码改 Color（深/浅/跟随系统） -->
-  <!-- 圆角：用 Grid.CornerRadius（配合 Popup 弹出动画的 Clip 配置）保证四角圆，覆盖在标题栏外 -->
-  <Grid x:Name="Root" Background="#E61C1C1E" CornerRadius="14">
+  <!-- 圆角：DWM 按系统设置裁窗口圆角（默认 ~8px，实测本机约 5px，不能按窗口单独调大；DeviceCornerRadius=On 时更大）。
+       WinCornerRadius 必须与 DWM 弧线重合：XAML 圆角比 DWM 大（或小）时，两弧之间的楔形区会露出
+       Root 的壁纸基底（近黑 #0D1220）——这就是四角的"黑贴片"。圆角外的楔形区属于窗口外、显示桌面背景 -->
+  <!-- 背景：Root 铺壁纸基底渐变（不透明，铺满整个矩形，DWM 负责裁圆角；ApplyTheme 里赋 WpBaseBrush 实例）→
+       弹出动画期间窗口底层是壁纸色，不会先露出黑色；壁纸色斑/玻璃在 ContentClip 内叠加 -->
+  <Grid x:Name="Root">
     <Grid.Resources>
       <!-- 主题画刷（值取自 ui-prototype/styles.css 变量，alpha 已转 ARGB） -->
-      <SolidColorBrush x:Key="GlassBgBrush" Color="#E61C1C1E"/>
       <SolidColorBrush x:Key="GlassBorderBrush" Color="#24FFFFFF"/>
       <SolidColorBrush x:Key="TextPrimaryBrush" Color="#EBEBEB"/>
       <SolidColorBrush x:Key="TextSecondaryBrush" Color="#8CFFFFFF"/>
@@ -35,6 +38,32 @@
         <GradientStop Offset="0" Color="#14FFFFFF"/>
         <GradientStop Offset="0.28" Color="#00FFFFFF"/>
       </LinearGradientBrush>
+      <!-- 窗口圆角：与 DWM 实际裁剪半径一致（见文件头注释），ContentClip/高光/描边三处共用 -->
+      <CornerRadius x:Key="WinCornerRadius">5</CornerRadius>
+      <RadialGradientBrush x:Key="WpSpotTL" GradientOrigin="0.2,0.3" Center="0.2,0.3" RadiusX="0.95" RadiusY="0.75">
+        <GradientStop Offset="0" Color="#2E5AA6"/>
+        <GradientStop Offset="0.65" Color="#002E5AA6"/>
+      </RadialGradientBrush>
+      <!-- 壁纸基底渐变（对齐 .desktop-wallpaper 深色基底；浅色由代码切） -->
+      <LinearGradientBrush x:Key="WpBaseBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Offset="0" Color="#0D1220"/>
+        <GradientStop Offset="0.4" Color="#162033"/>
+        <GradientStop Offset="1" Color="#0F1A28"/>
+      </LinearGradientBrush>
+      <RadialGradientBrush x:Key="WpSpotTR" GradientOrigin="0.8,0.2" Center="0.8,0.2" RadiusX="0.85" RadiusY="0.65">
+        <GradientStop Offset="0" Color="#7C2F98"/>
+        <GradientStop Offset="0.6" Color="#007C2F98"/>
+      </RadialGradientBrush>
+      <RadialGradientBrush x:Key="WpSpotBR" GradientOrigin="0.6,0.8" Center="0.6,0.8" RadiusX="0.75" RadiusY="0.55">
+        <GradientStop Offset="0" Color="#1A7050"/>
+        <GradientStop Offset="0.55" Color="#001A7050"/>
+      </RadialGradientBrush>
+      <RadialGradientBrush x:Key="WpSpotBL" GradientOrigin="0.1,0.9" Center="0.1,0.9" RadiusX="0.7" RadiusY="0.7">
+        <GradientStop Offset="0" Color="#5F3696"/>
+        <GradientStop Offset="0.55" Color="#005F3696"/>
+      </RadialGradientBrush>
+      <!-- 玻璃叠加：38% 底（比原型 55% 更透，壁纸色斑透过玻璃仍可见，观感对齐 glass-bg + 壁纸的层次） -->
+      <SolidColorBrush x:Key="GlassOverlayBrush" Color="#611C1C1E"/>
 
       <!-- 列表/平铺选中态：对齐 .result-item.active（accent-soft 圆角蓝） -->
       <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="#14FFFFFF"/>
@@ -135,6 +164,18 @@
         </Setter>
       </Style>
     </Grid.Resources>
+
+    <!-- ========== 内容层（含壁纸色斑/玻璃）：CornerRadius = WinCornerRadius，与 DWM 弧线重合 ==========
+         壁纸基底由 Root 提供（不透明，动画期间不露黑）；这里只叠色斑 + 玻璃，
+         圆角外的楔形区没有任何内容，属于窗口外、显示桌面背景（白底=白、黑底=黑） -->
+    <Grid x:Name="ContentClip" CornerRadius="{StaticResource WinCornerRadius}">
+      <Grid x:Name="Wallpaper" IsHitTestVisible="False">
+        <Border Background="{StaticResource WpSpotTL}"/>
+        <Border Background="{StaticResource WpSpotTR}"/>
+        <Border Background="{StaticResource WpSpotBR}"/>
+        <Border Background="{StaticResource WpSpotBL}"/>
+      </Grid>
+      <Border x:Name="GlassOverlay" IsHitTestVisible="False" Background="{StaticResource GlassOverlayBrush}"/>
 
     <!-- ========== 搜索模式 ========== -->
     <Grid x:Name="MainPanel">
@@ -424,8 +465,8 @@
       </Grid>
     </Grid>
 
-    <!-- ========== 设置模式（同一主窗内切换，对齐原型 .mode-settings） ========== -->
-    <Grid x:Name="SettingsPanel" Visibility="Collapsed" Background="{StaticResource GlassBgBrush}"
+    <!-- ========== 设置模式（同一主窗内切换，对齐原型 mode-settings） ========== -->
+    <Grid x:Name="SettingsPanel" Visibility="Collapsed" Background="Transparent"
           KeyDown="OnSettingsKeyDown">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
@@ -619,10 +660,16 @@
     </Grid>
 
     <!-- 顶部高光（对应 .launcher-glass::before，置于最上避免被设置层盖住） -->
-    <Border IsHitTestVisible="False" CornerRadius="14">
-      <Border.Background>
-        <StaticResource ResourceKey="GlassHighlightBrush"/>
-      </Border.Background>
-    </Border>
+      <Border IsHitTestVisible="False" CornerRadius="{StaticResource WinCornerRadius}">
+        <Border.Background>
+          <StaticResource ResourceKey="GlassHighlightBrush"/>
+        </Border.Background>
+      </Border>
+    </Grid>
+
+    <!-- 玻璃描边（对齐原型 launcher-glass 1px 边框）：CornerRadius 与 DWM/ContentClip 圆角一致，
+         描边弧线正好落在窗口可见边缘内，四角不会断线 -->
+    <Border IsHitTestVisible="False" CornerRadius="{StaticResource WinCornerRadius}"
+            BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"/>
   </Grid>
 </Window>

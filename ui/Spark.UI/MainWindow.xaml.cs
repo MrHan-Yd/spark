@@ -61,7 +61,6 @@ public sealed partial class MainWindow : Window
     private readonly CompositeTransform _pop = new();
     private Storyboard _animIn = new();
     private Storyboard _animOut = new();
-    private bool _acrylicOk;
     /// <summary>同步设置控件时避免触发保存/换主题副作用。</summary>
     private bool _syncing;
     /// <summary>列表/平铺切换动画；_viewAnimGen 让旧动画的 Completed 回调失配（快速连续切换不误折叠面板）。</summary>
@@ -77,6 +76,8 @@ public sealed partial class MainWindow : Window
     private double _favH0, _favH1, _favO0, _favG0, _favA0, _favS0;
     /// <summary>分组列起始宽度（随动画同步收放，避免落定时列宽瞬间跳变造成尾部卡顿）。</summary>
     private double _favGroupsW0;
+    /// <summary>仅主体高度过渡（收藏内容空↔有项）：不动抽屉的间距/分组列宽/加号按钮收放。</summary>
+    private bool _favHeightOnly;
     private long _favTweenStart;
     private int _favTweenMs;
 
@@ -100,17 +101,16 @@ public sealed partial class MainWindow : Window
         QueryBox.TextCompositionStarted += (_, _) => _composing = true;
         QueryBox.TextCompositionEnded += (_, _) => _composing = false;
 
-        Root.RenderTransform = _pop;
+        Root.RenderTransform = null;
+        // 动画只作用于 ContentClip：Root 固定铺壁纸基底（不透明），弹出动画期间窗口底层始终是壁纸色，
+        // 不会先露出窗口底层（黑色）；ContentClip 从 0.96 缩放 + 透明度淡入展开。
+        ContentClip.RenderTransform = _pop;
         // 拖拽 caption 区域跟随窗口尺寸（宽度滑杆/布局变化）
         Root.SizeChanged += (_, _) => UpdateDragRegions();
         // 钩子回调委托持有引用防 GC（字段初始化器不能引用实例方法，放构造函数）
-        _fgHookProc = OnForegroundChanged;        // 玻璃背景：先试 Acrylic，失败自动退回稳定深色（历史上有 Acrylic 闪退问题）
-        try
-        {
-            SystemBackdrop = new DesktopAcrylicBackdrop();
-            _acrylicOk = true;
-        }
-        catch (Exception ex) { App.Log("AcrylicBackdrop", ex); _acrylicOk = false; }
+        _fgHookProc = OnForegroundChanged;        // 背景：自绘壁纸渐变 + 玻璃叠加（对齐 ui-prototype .desktop-wallpaper / .launcher-glass）。
+        // 不用 SystemBackdrop/Acrylic：实测部分环境 DesktopAcrylicBackdrop 静默回退成纯色（#202020），
+        // 自绘渐变在任何机器上效果一致，且窗口后面的内容不会干扰视觉。
 
         _hideOnDeactivate = LocalState.Ui.HideOnFocusLost;
         ApplyTheme();
@@ -199,7 +199,8 @@ public sealed partial class MainWindow : Window
         // key → ARGB；深/浅各一套，值对齐 styles.css 变量
         var pal = new Dictionary<string, uint>
         {
-            ["GlassBgBrush"] = _acrylicOk ? (dark ? 0x8C1C1C1Eu : 0x8CF2F2F7u) : (dark ? 0xFF1C1C1Eu : 0xFFF2F2F7u),
+            // 玻璃叠加：38% 底（比原型 55% 更透，壁纸色斑透过玻璃仍可见）
+            ["GlassOverlayBrush"] = dark ? 0x611C1C1Eu : 0x61FFFFFFu,
             ["GlassBorderBrush"] = dark ? 0x24FFFFFFu : 0xA6FFFFFFu,
             ["TextPrimaryBrush"] = dark ? 0xFFEBEBEBu : 0xE0000000u,
             ["TextSecondaryBrush"] = dark ? 0x8CFFFFFFu : 0x80000000u,
@@ -244,6 +245,36 @@ public sealed partial class MainWindow : Window
 
         if (Root.Resources.TryGetValue("GlassHighlightBrush", out var g) && g is LinearGradientBrush hl)
             hl.GradientStops[0].Color = Color.FromArgb(dark ? (byte)0x14 : (byte)0x80, 0xFF, 0xFF, 0xFF);
+
+        // 壁纸基底渐变（对齐 .desktop-wallpaper 深/浅两套）
+        if (Root.Resources.TryGetValue("WpBaseBrush", out var wb) && wb is LinearGradientBrush wpBase)
+        {
+            wpBase.GradientStops[0].Color = dark ? Color.FromArgb(0xFF, 0x0D, 0x12, 0x20) : Color.FromArgb(0xFF, 0xD4, 0xDC, 0xEC);
+            wpBase.GradientStops[1].Color = dark ? Color.FromArgb(0xFF, 0x16, 0x20, 0x33) : Color.FromArgb(0xFF, 0xE8, 0xEE, 0xF8);
+            wpBase.GradientStops[2].Color = dark ? Color.FromArgb(0xFF, 0x0F, 0x1A, 0x28) : Color.FromArgb(0xFF, 0xCF, 0xD8, 0xE8);
+            // Root 铺同实例（不透明壁纸底）：弹出动画期间窗口底层是壁纸色，不会先露黑；
+            // 与 ContentClip 内色斑/玻璃叠加后即完整壁纸，主题切换时此实例同步变色。
+            Root.Background = wpBase;
+        }
+        // 4 个 radial 色斑（深/浅两套；浅色无 BL 色斑 → 透明）
+        (string key, uint darkC, uint lightC)[] spots =
+        {
+            ("WpSpotTL", 0xFF2E5AA6u, 0xFFA8C8FFu),
+            ("WpSpotTR", 0xFF7C2F98u, 0xFFF5C6E8u),
+            ("WpSpotBR", 0xFF1A7050u, 0xFFB8F0D8u),
+            ("WpSpotBL", 0xFF5F3696u, 0x003A2060u),
+        };
+        foreach (var (key, darkC, lightC) in spots)
+        {
+            if (Root.Resources.TryGetValue(key, out var s) && s is RadialGradientBrush rb && rb.GradientStops.Count > 0)
+            {
+                var c = dark ? darkC : lightC;
+                rb.GradientStops[0].Color = Color.FromArgb((byte)(c >> 24), (byte)(c >> 16), (byte)(c >> 8), (byte)c);
+                // 末端透明 stop 保留原 alpha=0，仅换 RGB
+                if (rb.GradientStops.Count > 1)
+                    rb.GradientStops[1].Color = Color.FromArgb(0, (byte)(c >> 16), (byte)(c >> 8), (byte)c);
+            }
+        }
 
         // 内容/系统控件主题跟随玻璃主题（浅色系统下 TextBox 光标、滚动条、弹窗默认是浅色的）
         Root.RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light;
@@ -319,7 +350,7 @@ public sealed partial class MainWindow : Window
             Storyboard.SetTargetProperty(a, prop);
             sb.Children.Add(a);
         }
-        Add(Root, "Opacity", op0, op1);
+        Add(ContentClip, "Opacity", op0, op1);
         Add(_pop, "ScaleX", sc0, sc1);
         Add(_pop, "ScaleY", sc0, sc1);
         Add(_pop, "TranslateY", ty0, ty1);
@@ -328,7 +359,7 @@ public sealed partial class MainWindow : Window
 
     private void ResetPop()
     {
-        Root.Opacity = 1;
+        ContentClip.Opacity = 1;
         _pop.ScaleX = _pop.ScaleY = 1;
         _pop.TranslateY = 0;
     }
@@ -462,7 +493,10 @@ public sealed partial class MainWindow : Window
 
         try
         {
-            // DWM 圆角：让窗口形状本身是圆角
+            // DWM 圆角：窗口形状由 DWM 按系统设置裁圆角（默认 ~8px，实测本机约 5px，不可按窗口调大），
+            // 圆角外的楔形区属于窗口外、显示桌面背景。壁纸/玻璃/内容层全部收在
+            // ContentClip(CornerRadius=WinCornerRadius=5) 内与 DWM 弧线重合——XAML 圆角大于 DWM 圆角时
+            // 两弧之间的楔形区会露出 Root 的壁纸基底（近黑 #0D1220），就是四角的黑贴片。
             const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
             const int DWMWCP_ROUND = 2;
             var pref = DWMWCP_ROUND;
@@ -650,7 +684,7 @@ public sealed partial class MainWindow : Window
             }
             else
             {
-                Root.Opacity = 0;
+                ContentClip.Opacity = 0;
                 _pop.ScaleX = _pop.ScaleY = 0.96;
                 _pop.TranslateY = 6;
                 _animIn.Begin();
@@ -794,6 +828,8 @@ public sealed partial class MainWindow : Window
 
     private void RenderFavorites()
     {
+        // 记录当前主体实际高度：换内容后自然高度会变化（空↔有项约 12px），平滑过渡而非跳变
+        var oldBodyH = FavBody.Visibility == Visibility.Visible ? FavBody.ActualHeight : 0;
         FavGroups.Children.Clear();
         FavItems.Children.Clear();
         var fav = LocalState.Fav;
@@ -808,7 +844,9 @@ public sealed partial class MainWindow : Window
             {
                 Content = g.Name,
                 FontSize = 11,
-                FontWeight = active ? FontWeights.SemiBold : FontWeights.Medium,
+                // 选中态不加粗：加粗中文笔画会变矮/挤压（如"工"），且 pill 宽度随选中跳动；
+                // 用背景/边框/前景色区分即可
+                FontWeight = FontWeights.Medium,
                 Padding = new Thickness(10, 4, 10, 4),
                 CornerRadius = new CornerRadius(999),
                 BorderThickness = new Thickness(1),
@@ -928,6 +966,47 @@ public sealed partial class MainWindow : Window
 
         // 折叠状态由 ApplyFavCollapse 管（带动画），这里只同步提示文字
         ToolTipService.SetToolTip(FavToggle, fav.Expanded ? "收起收藏" : "展开收藏");
+        AnimateFavBodyHeight(oldBodyH);
+    }
+
+    /// <summary>
+    /// 收藏内容高度过渡：分组切换/增删后主体自然高度变化（空↔有项），从当前实际高度平滑收放到新高度。
+    /// 复用抽屉的渲染帧驱动；折叠动画进行中或折叠态时跳过（由 ApplyFavCollapse 接管）。
+    /// </summary>
+    private void AnimateFavBodyHeight(double h0)
+    {
+        // 窗口未上屏（启动首帧）或减少动画：直接落定自然高度，不播过渡
+        if (!_visible || LocalState.Ui.ReduceMotion) return;
+        if (FavBody.Visibility != Visibility.Visible) return;
+        // 抽屉动画进行中交给它；仅当正在跑"纯高度过渡"时可中途续动（连续快速切分组）
+        if (_favTweening && !_favHeightOnly) return;
+        if (h0 <= 0) return;
+
+        // 内容已换好：先量出新自然高度（此刻尚未渲染，量完压回旧高度起动画，不闪一帧新高度）
+        FavBody.Height = double.NaN;
+        FavBody.UpdateLayout();
+        var h1 = FavBody.ActualHeight;
+        if (h1 <= 0 || Math.Abs(h1 - h0) < 0.5)
+        {
+            FavBody.Height = double.NaN;
+            return;
+        }
+        FavBody.Height = h0;
+        FavBody.UpdateLayout();
+
+        _favTweening = true;
+        _favAnimGen++;
+        _favCollapsing = false;
+        _favHeightOnly = true;
+        _favH0 = h0;
+        _favH1 = h1;
+        _favO0 = FavBody.Opacity;
+        _favG0 = FavGroups.Opacity;
+        _favA0 = FavChevronRotate.Angle;
+        _favS0 = FavChevronShift.Y;
+        _favTweenStart = Environment.TickCount64;
+        // 高度差很小（约 12px），沿用展开分支的轻快 quadratic 曲线
+        _favTweenMs = 200;
     }
 
     // ==================== 右键菜单 / 收藏增删 ====================
@@ -1064,6 +1143,7 @@ public sealed partial class MainWindow : Window
     {
         _favTweening = false;
         _favAnimGen++;
+        _favHeightOnly = false;
         var gen = _favAnimGen;
 
         if (!animate || LocalState.Ui.ReduceMotion)
@@ -1132,11 +1212,15 @@ public sealed partial class MainWindow : Window
         FavGroups.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
         FavAddGroup.Opacity = _favG0 + ((_favCollapsing ? 0 : 1) - _favG0) * k;
         // 布局型属性（间距/分组列宽/按钮宽）只在前半程收放，后半程保持终值——
-        // 避免尾部多布局属性叠加（ScrollViewer 裁剪 + 列宽重排）导致单帧超时、动画"直接跳到底"
-        var p = _favCollapsing ? 1 - Math.Min(1, (1 - k) * 2) : Math.Min(1, k * 2);
-        FavRoot.Spacing = 8 * p;
-        FavGroupsCol.Width = new GridLength(_favGroupsW0 * p);
-        FavAddGroup.Width = 22 * p;
+        // 避免尾部多布局属性叠加（ScrollViewer 裁剪 + 列宽重排）导致单帧超时、动画"直接跳到底"；
+        // 纯主体高度过渡（内容空↔有项）不涉及这些属性，跳过以免首帧把它们压成 0
+        if (!_favHeightOnly)
+        {
+            var p = _favCollapsing ? 1 - Math.Min(1, (1 - k) * 2) : Math.Min(1, k * 2);
+            FavRoot.Spacing = 8 * p;
+            FavGroupsCol.Width = new GridLength(_favGroupsW0 * p);
+            FavAddGroup.Width = 22 * p;
+        }
 
         if (done)
         {
