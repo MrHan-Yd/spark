@@ -11,6 +11,22 @@ pub use lnk::resolve_lnk;
 pub use memory::MemoryIndex;
 
 use spark_core::{rank_candidates, Candidate, Query, Source};
+use std::path::Path;
+
+/// 目标是否为"应用"：文档类文件（txt/word/pdf 等）不是应用，默认页与搜索都不展示。
+/// 无扩展名目标（命令/协议/插件）一律视为应用保留。按扩展名判断——不做磁盘 IO，
+/// 历史里指向已删除文件的条目也能正确过滤。
+pub(crate) fn is_app_target(target: &str) -> bool {
+    let ext = Path::new(target)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(
+        ext.as_str(),
+        "" | "exe" | "com" | "bat" | "cmd" | "msc" | "cpl" | "scr" | "lnk"
+    )
+}
 
 pub trait SearchIndex: Send + Sync {
     fn search(&self, query: &Query) -> Vec<Candidate>;
@@ -19,6 +35,9 @@ pub trait SearchIndex: Send + Sync {
         self.len() == 0
     }
 }
+
+/// 默认页（空查询）最多展示的最近使用条数：一屏扫完不滚屏（信息密度高≠好）。
+const EMPTY_QUERY_RECENT_LIMIT: usize = 6;
 
 /// App index + history fused search (P0).
 #[derive(Debug, Default)]
@@ -83,23 +102,9 @@ impl AppIndex {
     pub fn search_with_history(&self, query: &Query) -> Vec<Candidate> {
         let q = query.normalized();
         if q.is_empty() {
-            let mut items = self.history.as_candidates(query.limit as usize);
-            if items.len() < query.limit as usize {
-                // Pad with top apps not already in history
-                let have: std::collections::HashSet<_> =
-                    items.iter().map(|c| c.id.clone()).collect();
-                for c in self.memory.iter() {
-                    if items.len() >= query.limit as usize {
-                        break;
-                    }
-                    if !have.contains(&c.id) {
-                        let mut clone = c.clone();
-                        clone.score *= 0.9;
-                        items.push(clone);
-                    }
-                }
-            }
-            return rank_candidates(items);
+            // 默认页只展示"打开过的"：纯最近使用（recency 序），最多 6 条一屏扫完。
+            // 没有历史就空着——不拿没打开过的应用凑数，空页比无关信息好。
+            return self.history.as_candidates(EMPTY_QUERY_RECENT_LIMIT);
         }
 
         let mut hits = self.memory.search(query);
@@ -150,4 +155,85 @@ pub fn is_launchable(c: &Candidate) -> bool {
         c.source,
         Source::App | Source::History | Source::Favorite | Source::File | Source::Builtin
     ) && c.target.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spark_core::{Action, Candidate, Query, Source};
+
+    fn app(id: &str, title: &str, score: f32) -> Candidate {
+        Candidate {
+            id: id.into(),
+            title: title.into(),
+            subtitle: Some("应用程序".into()),
+            target: Some("C:\\apps\\x.exe".into()),
+            icon: None,
+            score,
+            source: Source::App,
+            actions: vec![Action::open_default()],
+            plugin_id: None,
+        }
+    }
+
+    fn empty_query(idx: &AppIndex, limit: u32) -> Vec<Candidate> {
+        idx.search_with_history(&Query {
+            text: String::new(),
+            limit,
+        })
+    }
+
+    #[test]
+    fn empty_query_shows_only_history() {
+        let mut idx = AppIndex::new();
+        idx.memory.upsert(app("app.pad", "Pad App", 0.95));
+        // 没有打开记录 → 空查询不展示任何兜底应用
+        assert!(empty_query(&idx, 10).is_empty());
+        // 有记录 → 只展示历史项，不混入没打开过的
+        idx.record_usage(&app("app.used", "Used App", 0.0));
+        let items = empty_query(&idx, 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "app.used");
+    }
+
+    #[test]
+    fn empty_query_history_orders_by_recency() {
+        let mut idx = AppIndex::new();
+        idx.memory.upsert(app("app.pad", "Pad App", 0.95));
+        // 直接构造历史（record 会用同一时刻，无法区分先后）
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        idx.history_mut()
+            .seed_for_test("app.old", 20, now - 86_400, None);
+        idx.history_mut()
+            .seed_for_test("app.new", 1, now - 60, None);
+        let items = empty_query(&idx, 10);
+        assert_eq!(items.len(), 2);
+        // 纯 recency 序：刚用过的在最前（哪怕 app.old 用了 20 次），不被分数重排
+        assert_eq!(items[0].id, "app.new");
+        assert_eq!(items[1].id, "app.old");
+    }
+
+    #[test]
+    fn empty_query_recents_capped_at_six() {
+        let mut idx = AppIndex::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for i in 0..10 {
+            idx.history_mut()
+                .seed_for_test(&format!("app.{i}"), 1, now - i * 60, None);
+        }
+        let items = empty_query(&idx, 50);
+        assert_eq!(
+            items.len(),
+            EMPTY_QUERY_RECENT_LIMIT,
+            "默认页最多 6 条最近使用"
+        );
+        assert_eq!(items[0].id, "app.0", "最新的排最前");
+        assert_eq!(items[5].id, "app.5");
+    }
 }

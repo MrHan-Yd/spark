@@ -21,8 +21,11 @@ public sealed class HostIpcClient : IAsyncDisposable
     private Task? _loopTask;
     private int _nextId = 1;
     private int _connectGate;
+    /// <summary>读循环已退出（连接假死/对端消失）。IsConnected 判假 → 下一次调用强制重连，
+    /// 否则 _pipe.IsConnected 可能长期保持 true（管道句柄状态未刷新），请求写进死连接全部超时。</summary>
+    private volatile bool _loopDead;
 
-    public bool IsConnected => _pipe?.IsConnected == true;
+    public bool IsConnected => _pipe?.IsConnected == true && !_loopDead;
 
     public event Action<string>? HostNotification;
 
@@ -59,6 +62,7 @@ public sealed class HostIpcClient : IAsyncDisposable
                         NewLine = "\n"
                     };
                     _loopCts = new CancellationTokenSource();
+                    _loopDead = false;
                     _loopTask = Task.Run(() => ReadLoopAsync(_loopCts.Token));
                     last = null;
                     return;
@@ -83,42 +87,45 @@ public sealed class HostIpcClient : IAsyncDisposable
     {
         if (_pipe is null) return;
         var reader = new StreamReader(_pipe, Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
+        // 单飞行读：同一时刻只挂一个 ReadLineAsync。空闲超时（Host 无保活）时绝不能
+        // 放弃当前读另起新读——旧读仍挂在管道上成为"幽灵读"，后续到达的响应会被它
+        // 消费掉而 UI 永远收不到（表现为连接"活着"但所有请求 8s 超时、回退 DemoData）。
+        // 超时后继续等同一个 task，直到它完成或出错。
+        var readTask = reader.ReadLineAsync(ct).AsTask();
+        _ = readTask.ContinueWith(t => _ = t.Exception,
+            TaskContinuationOptions.OnlyOnFaulted);
         try
         {
-            while (!ct.IsCancellationRequested && _pipe.IsConnected)
+            while (!ct.IsCancellationRequested && _pipe is not null && _pipe.IsConnected)
             {
                 string? line;
                 try
                 {
-                    // 读超时自愈：pipe 可能半死（Host 端 WriteFile 卡住、连接静默失效）。
-                    // Host 每 3s 有保活空行，健康连接不会触发超时；这里只兜底真死连接。
-                    // 超时后主动断开，让 MaintainHostConnectionAsync 重连拿一条新连接。
-                    var readTask = reader.ReadLineAsync(ct).AsTask();
-                    _ = readTask.ContinueWith(t => _ = t.Exception,
-                        TaskContinuationOptions.OnlyOnFaulted);
                     line = await readTask.WaitAsync(TimeSpan.FromSeconds(15));
                 }
                 catch (TimeoutException)
                 {
-                    // 读超时：Host 空闲不推送是常态，不代表连接死——写一个探针请求确认。
-                    // 探针写失败（管道已死/半死）才主动断开，让 MaintainHostConnectionAsync 重连自愈；
-                    // 写成功则继续读（探针的响应/错误会被本循环正常消费，健康空闲连接不再被误杀）。
+                    // 空闲探活：写探针确认写方向还通（探针是 notification id=-1，
+                    // Host 会回 method-not-found 错误行，由同一个读消费，无副作用）。
                     try
                     {
                         _writer?.WriteLine("{\"jsonrpc\":\"2.0\",\"id\":-1,\"method\":\"host.ping\"}");
-                        continue;
                     }
                     catch
                     {
-                        await TearDownAsync();
                         break;
                     }
+                    continue;
                 }
                 catch
                 {
                     break;
                 }
                 if (line is null) break;
+                // 当前读已完成：消费这一行后，才允许挂下一个读（保持单飞行不变式）
+                readTask = reader.ReadLineAsync(ct).AsTask();
+                _ = readTask.ContinueWith(t => _ = t.Exception,
+                    TaskContinuationOptions.OnlyOnFaulted);
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 try
                 {
@@ -172,6 +179,7 @@ public sealed class HostIpcClient : IAsyncDisposable
         }
         finally
         {
+            _loopDead = true;
             foreach (var kv in _pending)
                 kv.Value.TrySetCanceled();
             _pending.Clear();
@@ -259,7 +267,17 @@ public sealed class HostIpcClient : IAsyncDisposable
                 p.TrySetException(new TimeoutException("host ipc timeout"));
         });
 
-        return await tcs.Task;
+        try
+        {
+            return await tcs.Task;
+        }
+        catch (TimeoutException)
+        {
+            // 请求写出去但没有响应 = 连接假死（对端消失/半死）。主动断开，
+            // 让下一次 EnsureConnected 拿一条全新连接，而不是反复超时回退 DemoData。
+            await TearDownAsync();
+            throw;
+        }
     }
 
     private async Task TearDownAsync()

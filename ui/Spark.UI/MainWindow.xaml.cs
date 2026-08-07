@@ -722,6 +722,9 @@ public sealed partial class MainWindow : Window
             await Task.Delay(120);
             if (!_visible || _hwnd == IntPtr.Zero)
                 return;
+            // 每次重试都补一次输入框聚焦：窗口刚弹出时首次 Focus 可能被动画/抢前台
+            // 吃掉，TextBox 拿不到焦点时输入法上下文不会挂上（中文模式直接打出英文）。
+            QueryBox.Focus(FocusState.Programmatic);
             if (GetForegroundWindow() == _hwnd)
                 return;
             ForceForeground();
@@ -759,6 +762,23 @@ public sealed partial class MainWindow : Window
     }
     private void HideNow()
     {
+        // 取消未结束的 IME 组词：隐藏时残留的组合状态会让下次显示时输入法失灵
+        // （中文模式直接打出英文），同时复位 _composing 避免箭头键逻辑误判。
+        try
+        {
+            if (_hwnd != IntPtr.Zero)
+            {
+                var himc = ImmGetContext(_hwnd);
+                if (himc != IntPtr.Zero)
+                {
+                    ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                    ImmReleaseContext(_hwnd, himc);
+                }
+            }
+        }
+        catch { /* ignore */ }
+        _composing = false;
+
         // 拖拽后的位置在隐藏时落盘（拖动过程不逐帧写盘；仅窗口真正显示过才会走到这里）
         if (_appWindow is not null)
         {
@@ -843,7 +863,19 @@ public sealed partial class MainWindow : Window
 
         var hostTag = _host.IsConnected ? "Host · 极速" : "演示 · 本地";
         SearchMeta.Text = _items.Count > 0 ? $"{_items.Count} 项" : "";
-        Footer.Text = _items.Count > 0 ? hostTag : "未找到相关结果";
+        Footer.Text = hostTag;
+        // 空状态提示：搜索无结果 / 无最近使用时居中展示，避免页面空洞
+        if (_items.Count > 0)
+        {
+            EmptyState.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            EmptyState.Visibility = Visibility.Visible;
+            EmptyState.Text = string.IsNullOrWhiteSpace(q)
+                ? "还没有最近使用记录"
+                : $"未找到「{q.Trim()}」相关结果";
+        }
         // 搜索时收藏区变淡（对齐原型 dimmed）
         FavRoot.Opacity = string.IsNullOrWhiteSpace(q) ? 1.0 : 0.45;
 
@@ -1774,6 +1806,10 @@ public sealed partial class MainWindow : Window
 
     // ==================== P/Invoke ====================
 
+    // ImmNotifyIME：取消当前输入法组合
+    private const uint NI_COMPOSITIONSTR = 0x0010;
+    private const uint CPS_CANCEL = 0x0004;
+
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
@@ -1782,6 +1818,15 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+    [DllImport("imm32.dll")]
+    private static extern IntPtr ImmGetContext(IntPtr hWnd);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
+
+    [DllImport("imm32.dll")]
+    private static extern bool ImmNotifyIME(IntPtr hIMC, uint dwAction, uint dwIndex, uint dwValue);
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);

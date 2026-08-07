@@ -392,6 +392,13 @@
         </GridView.ItemTemplate>
       </GridView>
 
+      <!-- 空状态提示：搜索无结果 / 无最近使用时居中展示，避免页面空洞 -->
+      <TextBlock x:Name="EmptyState" Grid.Row="2" Text="" FontSize="14"
+                 Foreground="{StaticResource TextTertiaryBrush}"
+                 HorizontalAlignment="Center" VerticalAlignment="Center"
+                 TextTrimming="CharacterEllipsis" MaxLines="1"
+                 IsHitTestVisible="False"/>
+
       <!-- 收藏坞（对齐原型 .favorites：折叠 + 分组 tab + 72px 卡片） -->
       <Border Grid.Row="3" Background="{StaticResource FavBgBrush}"
               BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,1,0,0"

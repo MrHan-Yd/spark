@@ -8,6 +8,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
+use crate::is_app_target;
+
 const MAX_HISTORY: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -95,6 +97,30 @@ impl HistoryStore {
         self.save();
     }
 
+    /// 测试专用：直接写入一条历史（绕过 record 的 now 时间戳，便于构造时间顺序），
+    /// 供 crate 内集成测试（lib.rs tests）使用。
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(
+        &mut self,
+        id: &str,
+        use_count: u32,
+        last_used_at: u64,
+        target: Option<&str>,
+    ) {
+        self.entries.insert(
+            id.to_string(),
+            HistoryEntry {
+                item_id: id.to_string(),
+                title: id.to_string(),
+                subtitle: None,
+                target: target.map(|t| t.to_string()),
+                icon: None,
+                use_count,
+                last_used_at,
+            },
+        );
+    }
+
     /// Re-point stale history entries at the current index.
     ///
     /// Shortcut-merging changed the id space (per-shortcut id → per-exe id), so
@@ -149,8 +175,14 @@ impl HistoryStore {
                 }
                 // Stale shortcut history with no live row → drop
                 None if is_lnk_legacy => {}
-                // Non-shortcut entries (files, plugins) don't match the app
-                // index; keep them untouched.
+                // 文档类文件历史（txt/word 等）：不匹配应用索引，也不在 as_candidates
+                // 里展示——直接清理，避免 history.json 留死数据
+                None if e
+                    .target
+                    .as_deref()
+                    .map(|t| !is_app_target(t))
+                    .unwrap_or(false) => {}
+                // 其余非应用索引条目（命令/插件等）保留
                 None => {
                     next.insert(key, e);
                 }
@@ -162,9 +194,16 @@ impl HistoryStore {
         self.save();
     }
 
-    /// Empty-query suggestions from history, newest/most-used first.
+    /// Empty-query suggestions from history: 最近使用优先（last_used_at 降序，
+    /// use_count 仅作同秒平局判断）。不做频率加权——默认页语义是"最近使用"，
+    /// 不是"最常用"；频率信号只用在搜索路径的 apply_boost 里。
+    /// 只输出应用：文档类文件历史（txt/word 等）不展示、不参与搜索。
     pub fn as_candidates(&self, limit: usize) -> Vec<Candidate> {
-        let mut list: Vec<&HistoryEntry> = self.entries.values().collect();
+        let mut list: Vec<&HistoryEntry> = self
+            .entries
+            .values()
+            .filter(|e| e.target.as_deref().map(is_app_target).unwrap_or(true))
+            .collect();
         list.sort_by(|a, b| {
             b.last_used_at
                 .cmp(&a.last_used_at)
@@ -265,6 +304,42 @@ mod tests {
     }
 
     #[test]
+    fn as_candidates_orders_by_recency() {
+        let mut h = HistoryStore::default();
+        let now = now_secs();
+        // 昨天碰巧开过一次（更近）必须排在"高频但 5 天前"前面——默认页是最近使用，
+        // 频率不参与排序
+        h.entries.insert(
+            "app:once".into(),
+            HistoryEntry {
+                item_id: "app:once".into(),
+                title: "Once App".into(),
+                subtitle: None,
+                target: Some(r"C:\once.exe".into()),
+                icon: None,
+                use_count: 1,
+                last_used_at: now - 86_400,
+            },
+        );
+        h.entries.insert(
+            "app:freq".into(),
+            HistoryEntry {
+                item_id: "app:freq".into(),
+                title: "Freq App".into(),
+                subtitle: None,
+                target: Some(r"C:\freq.exe".into()),
+                icon: None,
+                use_count: 20,
+                last_used_at: now - 5 * 86_400,
+            },
+        );
+        let items = h.as_candidates(10);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "app:once", "最近使用的排最前，不管用了多少次");
+        assert_eq!(items[1].id, "app:freq");
+    }
+
+    #[test]
     fn reconcile_repairs_stale_shortcut_entries() {
         let mut h = HistoryStore::default();
         h.entries.insert(
@@ -316,15 +391,16 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_keeps_non_shortcut_entries() {
+    fn reconcile_keeps_command_entries() {
         let mut h = HistoryStore::default();
+        // 命令/协议类目标（非文档文件）不属于应用索引，但保留（插件等）
         h.entries.insert(
-            "file:readme".into(),
+            "cmd:echo".into(),
             HistoryEntry {
-                item_id: "file:readme".into(),
-                title: "README.md".into(),
-                subtitle: Some("文件".into()),
-                target: Some(r"C:\docs\README.md".into()),
+                item_id: "cmd:echo".into(),
+                title: "Echo".into(),
+                subtitle: Some("插件".into()),
+                target: Some("echo:hello".into()),
                 icon: None,
                 use_count: 2,
                 last_used_at: 1000,
@@ -332,6 +408,39 @@ mod tests {
         );
         let idx = MemoryIndex::new();
         h.reconcile(&idx);
-        assert_eq!(h.entries.len(), 1, "file history kept");
+        assert_eq!(h.entries.len(), 1, "命令类历史保留");
+    }
+
+    #[test]
+    fn reconcile_drops_document_file_entries() {
+        let mut h = HistoryStore::default();
+        h.entries.insert(
+            "app:doc".into(),
+            HistoryEntry {
+                item_id: "app:doc".into(),
+                title: "说明文档".into(),
+                subtitle: None,
+                target: Some(r"D:\x\readme.txt".into()),
+                icon: None,
+                use_count: 1,
+                last_used_at: 1000,
+            },
+        );
+        let idx = MemoryIndex::new();
+        h.reconcile(&idx);
+        assert!(h.entries.is_empty(), "文档类历史在 reconcile 时清理");
+    }
+
+    #[test]
+    fn as_candidates_filters_document_files() {
+        let mut h = HistoryStore::default();
+        let now = now_secs();
+        h.seed_for_test("app.doc", 1, now, Some(r"D:\WinRAR\WhatsNew.txt"));
+        h.seed_for_test("app.exe", 1, now - 60, Some(r"D:\WinRAR\WinRAR.exe"));
+        h.seed_for_test("app.noext", 1, now - 120, None);
+        let items = h.as_candidates(10);
+        assert_eq!(items.len(), 2, "文档类历史不展示");
+        assert_eq!(items[0].id, "app.exe", "应用保留且按 recency 排序");
+        assert_eq!(items[1].id, "app.noext");
     }
 }

@@ -5,6 +5,7 @@
 //! the real exe as target/icon, and argument-carrying shortcuts ("Chrome 无痕
 //! 模式") become secondary actions on that row instead of separate rows.
 
+use crate::is_app_target;
 use crate::lnk::{resolve_lnk, LnkInfo};
 use spark_core::{Action, Candidate, Source};
 use std::collections::{HashMap, HashSet};
@@ -53,7 +54,7 @@ struct Collected {
     title: String,
     /// Folder relative to the scan root (for the subtitle).
     folder: Option<String>,
-    /// Modified-time ranking boost.
+    /// Freshness boost from shortcut mtime (newer installs rank higher).
     mtime_boost: f32,
     /// Canonical target exe when the shortcut resolved successfully.
     exe: Option<String>,
@@ -109,8 +110,7 @@ fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<Collected>) {
             .metadata()
             .ok()
             .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| (d.as_secs() % 10_000) as f32 * 0.00001)
+            .map(mtime_recency_boost)
             .unwrap_or(0.0);
 
         let mut exe = None;
@@ -150,6 +150,26 @@ fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<Collected>) {
     }
 }
 
+/// Freshness boost from shortcut mtime: recently installed apps rank higher in
+/// the empty-query "top apps" pool. ~60-day half-life, decays toward 0.
+fn mtime_recency_boost(mtime: SystemTime) -> f32 {
+    let age_days = SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or_default()
+        .as_secs_f32()
+        / 86_400.0;
+    (0.08 * (-age_days / 60.0).exp()).clamp(0.0, 0.08)
+}
+
+/// Apps sitting directly in the Start Menu root (folder = None / "开始菜单")
+/// are more "primary" than ones buried in nested folders; small score lift.
+fn root_level_boost(folder: &Option<String>) -> f32 {
+    match folder.as_deref() {
+        None | Some("开始菜单") => 0.02,
+        _ => 0.0,
+    }
+}
+
 /// What to do with a successfully parsed shortcut.
 enum LnkOutcome {
     /// Target is a live file: merge rows by this canonical exe path.
@@ -183,6 +203,10 @@ fn classify_lnk(info: &LnkInfo) -> LnkOutcome {
     };
     let canon_str = normalize_path(&canon.to_string_lossy());
     if is_noise_target(&canon_str) {
+        return LnkOutcome::Drop;
+    }
+    if !is_app_target(&canon_str) {
+        // 文档类文件快捷方式（txt/word/pdf…）不是应用，不索引不展示
         return LnkOutcome::Drop;
     }
     LnkOutcome::Merge {
@@ -247,13 +271,14 @@ fn merge_apps(collected: Vec<Collected>, seen: &mut HashSet<String>) -> Vec<Cand
         }));
         actions.push(Action::reveal());
 
+        let root_boost = root_level_boost(&primary.folder);
         items.push(Candidate {
             id,
             title: primary.title,
             subtitle: Some(primary.folder.unwrap_or_else(|| "应用程序".into())),
             target: Some(exe.clone()),
             icon: Some(exe),
-            score: 0.85 + primary.mtime_boost,
+            score: 0.85 + primary.mtime_boost + root_boost,
             source: Source::App,
             actions,
             plugin_id: None,
@@ -269,13 +294,14 @@ fn push_raw_row(c: Collected, seen: &mut HashSet<String>, out: &mut Vec<Candidat
     if !seen.insert(id.clone()) {
         return;
     }
+    let root_boost = root_level_boost(&c.folder);
     out.push(Candidate {
         id,
         title: c.title,
         subtitle: Some(c.folder.unwrap_or_else(|| "应用程序".into())),
         target: Some(target.clone()),
         icon: Some(target),
-        score: 0.85 + c.mtime_boost,
+        score: 0.85 + c.mtime_boost + root_boost,
         source: Source::App,
         actions: vec![Action::open_default(), Action::reveal()],
         plugin_id: None,
@@ -489,6 +515,22 @@ mod tests {
             }),
             LnkOutcome::Drop
         ));
+        // 文档类文件（txt/word…）不是应用，直接丢弃
+        assert!(matches!(
+            classify_lnk(&LnkInfo {
+                target: Some(r"D:\WinRAR\WhatsNew.txt".into()),
+                ..Default::default()
+            }),
+            LnkOutcome::Drop
+        ));
+        // 可执行文件是应用
+        assert!(matches!(
+            classify_lnk(&LnkInfo {
+                target: Some(r"D:\WinRAR\WinRAR.exe".into()),
+                ..Default::default()
+            }),
+            LnkOutcome::Merge { .. }
+        ));
         // Uninstaller exe is dropped
         assert!(matches!(
             classify_lnk(&LnkInfo {
@@ -503,6 +545,27 @@ mod tests {
     fn hash_stable() {
         assert_eq!(simple_hash("a"), simple_hash("a"));
         assert_ne!(simple_hash("a"), simple_hash("b"));
+    }
+
+    #[test]
+    fn root_level_boost_lifts_root() {
+        assert_eq!(root_level_boost(&None), 0.02);
+        assert_eq!(root_level_boost(&Some("开始菜单".into())), 0.02);
+        assert_eq!(root_level_boost(&Some("Accessories".into())), 0.0);
+    }
+
+    #[test]
+    fn mtime_freshness_decays() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::now();
+        let recent = now - Duration::from_secs(30 * 86_400);
+        let old = now - Duration::from_secs(300 * 86_400);
+        // 刚装的接近峰值，300 天前几乎无加成
+        assert!(mtime_recency_boost(now) > 0.07);
+        assert!(mtime_recency_boost(old) < 0.002);
+        // 单调衰减
+        assert!(mtime_recency_boost(now) > mtime_recency_boost(recent));
+        assert!(mtime_recency_boost(recent) > mtime_recency_boost(old));
     }
 
     #[test]
