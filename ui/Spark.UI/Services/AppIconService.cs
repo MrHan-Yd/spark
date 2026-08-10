@@ -1,15 +1,87 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Threading;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Storage.Streams;
 
 namespace Spark.UI.Services;
 
-/// <summary>从 exe / lnk 提取系统图标，缓存为 ImageSource。</summary>
+/// <summary>从 exe / lnk 提取系统图标。GDI 提取（PNG 字节）可在后台线程执行，
+/// 解码成 BitmapImage 必须在 UI 线程；缓存分两级：字节缓存线程安全，图像缓存仅 UI 线程访问。</summary>
 public static class AppIconService
 {
-    private static readonly Dictionary<string, ImageSource?> Cache = new(StringComparer.OrdinalIgnoreCase);
+    // 提取后的 PNG 字节缓存：Lazy 保证同一 key 并发只提取一次（失败也缓存 null，避免反复重试）
+    private static readonly ConcurrentDictionary<string, Lazy<byte[]?>> Bytes =
+        new(StringComparer.OrdinalIgnoreCase);
+    // 解码后的 ImageSource 缓存：BitmapImage 只能在 UI 线程创建，此字典仅 UI 线程读写
+    private static readonly Dictionary<string, ImageSource?> Images = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>取图标（UI 线程调用）：图像缓存命中立即返回；未命中先在后台线程做
+    /// GDI 提取，回到 UI 线程解码。全部完成前返回 null，调用方先用字母色块占位。</summary>
+    public static async Task<ImageSource?> GetIconAsync(string itemId, string? pathHint)
+    {
+        var key = string.IsNullOrEmpty(pathHint) ? itemId : itemId + "|" + pathHint;
+        if (Images.TryGetValue(key, out var cached))
+            return cached;
+
+        var png = await Task.Run(() => GetIconPng(key, itemId, pathHint));
+        if (png is null) return null;
+
+        var img = DecodePng(png);
+        if (img is not null)
+            Images[key] = img;
+        return img;
+    }
+
+    /// <summary>后台线程提取：缓存未命中时做 GDI/文件系统操作，返回 PNG 字节。</summary>
+    private static byte[]? GetIconPng(string key, string itemId, string? pathHint)
+        => Bytes.GetOrAdd(key, _ => new Lazy<byte[]?>(() => ExtractIcon(itemId, pathHint),
+            LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+
+    private static byte[]? ExtractIcon(string itemId, string? pathHint)
+    {
+        byte[]? src = null;
+        try
+        {
+            // Prefer explicit target / icon path from Host
+            if (!string.IsNullOrWhiteSpace(pathHint))
+            {
+                var p = pathHint.Trim();
+                if (File.Exists(p) || p.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+                    src = ExtractFromFile(p, 0);
+            }
+
+            if (src is null && ShellIndex.TryGetValue(itemId, out var shell))
+            {
+                src = ExtractFromFile(shell.path, shell.index);
+            }
+
+            if (src is null && PathCandidates.TryGetValue(itemId, out var paths))
+            {
+                foreach (var p in paths)
+                {
+                    if (!File.Exists(p) && !p.Contains("WindowsApps", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    src = ExtractFromFile(p, 0);
+                    if (src is not null) break;
+                }
+            }
+
+            if (src is null)
+            {
+                var resolved = ResolveFromStartMenu(itemId);
+                if (resolved is not null)
+                    src = ExtractFromFile(resolved, 0);
+            }
+        }
+        catch
+        {
+            src = null;
+        }
+        return src;
+    }
 
     // 演示项 → 本机常见路径（找不到则回退字母色块）
     private static readonly Dictionary<string, string[]> PathCandidates = new(StringComparer.OrdinalIgnoreCase)
@@ -78,55 +150,6 @@ public static class AppIconService
         ["web.g"] = (Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "shell32.dll"), 13),
     };
 
-    public static ImageSource? GetIcon(string itemId, string? pathHint = null)
-    {
-        var cacheKey = string.IsNullOrEmpty(pathHint) ? itemId : itemId + "|" + pathHint;
-        if (Cache.TryGetValue(cacheKey, out var cached))
-            return cached;
-
-        ImageSource? src = null;
-        try
-        {
-            // Prefer explicit target / icon path from Host
-            if (!string.IsNullOrWhiteSpace(pathHint))
-            {
-                var p = pathHint.Trim();
-                if (File.Exists(p) || p.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
-                    src = ExtractFromFile(p, 0);
-            }
-
-            if (src is null && ShellIndex.TryGetValue(itemId, out var shell))
-            {
-                src = ExtractFromFile(shell.path, shell.index);
-            }
-
-            if (src is null && PathCandidates.TryGetValue(itemId, out var paths))
-            {
-                foreach (var p in paths)
-                {
-                    if (!File.Exists(p) && !p.Contains("WindowsApps", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    src = ExtractFromFile(p, 0);
-                    if (src is not null) break;
-                }
-            }
-
-            if (src is null)
-            {
-                var resolved = ResolveFromStartMenu(itemId);
-                if (resolved is not null)
-                    src = ExtractFromFile(resolved, 0);
-            }
-        }
-        catch
-        {
-            src = null;
-        }
-
-        Cache[cacheKey] = src;
-        return src;
-    }
-
     private static string? ResolveFromStartMenu(string itemId)
     {
         var keywords = itemId switch
@@ -163,7 +186,7 @@ public static class AppIconService
         return null;
     }
 
-    private static ImageSource? ExtractFromFile(string path, int index)
+    private static byte[]? ExtractFromFile(string path, int index)
     {
         try
         {
@@ -198,7 +221,7 @@ public static class AppIconService
 
             try
             {
-                return HiconToImageSource(large, 48);
+                return HiconToPng(large);
             }
             finally
             {
@@ -211,7 +234,7 @@ public static class AppIconService
         }
     }
 
-    private static ImageSource? FromShellFileInfo(string path)
+    private static byte[]? FromShellFileInfo(string path)
     {
         var shfi = new SHFILEINFO();
         var hr = SHGetFileInfo(path, 0, ref shfi, (uint)Marshal.SizeOf<SHFILEINFO>(),
@@ -219,7 +242,7 @@ public static class AppIconService
         if (hr == IntPtr.Zero || shfi.hIcon == IntPtr.Zero) return null;
         try
         {
-            return HiconToImageSource(shfi.hIcon, 48);
+            return HiconToPng(shfi.hIcon);
         }
         finally
         {
@@ -227,7 +250,7 @@ public static class AppIconService
         }
     }
 
-    private static ImageSource? HiconToImageSource(IntPtr hIcon, int size)
+    private static byte[]? HiconToPng(IntPtr hIcon)
     {
         // 通过 GDI GetIconInfo + GetDIBits 转 PNG 字节，再 BitmapImage
         if (!GetIconInfo(hIcon, out var ii)) return null;
@@ -280,7 +303,7 @@ public static class AppIconService
                     buf[i + 3] = a;
                 }
 
-                return BgraToBitmapImage(buf, w, h);
+                return BgraToPng(buf, w, h);
             }
             finally
             {
@@ -294,17 +317,29 @@ public static class AppIconService
         }
     }
 
-    private static ImageSource? BgraToBitmapImage(byte[] bgra, int width, int height)
+    /// <summary>BGRA 像素 → PNG 字节（后台线程执行）。</summary>
+    private static byte[]? BgraToPng(byte[] bgra, int width, int height)
     {
         try
         {
-            // 同步写 PNG 到内存，避免 async 死锁
             using var ms = new MemoryStream();
             WritePng(ms, bgra, width, height);
-            ms.Position = 0;
+            return ms.ToArray();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>PNG 字节 → BitmapImage（必须在 UI 线程）。</summary>
+    private static ImageSource? DecodePng(byte[] png)
+    {
+        try
+        {
             using var ras = new InMemoryRandomAccessStream();
             var writer = ras.AsStreamForWrite();
-            ms.CopyTo(writer);
+            writer.Write(png, 0, png.Length);
             writer.Flush();
             ras.Seek(0);
             var bmp = new BitmapImage();

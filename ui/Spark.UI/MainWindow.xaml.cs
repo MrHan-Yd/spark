@@ -1,5 +1,8 @@
 using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using Microsoft.UI;
 using Microsoft.UI.Text;
 using Microsoft.UI.Windowing;
@@ -18,13 +21,14 @@ using Windows.Foundation;
 using Windows.Graphics;
 using Windows.System;
 using Windows.UI;
+using WinRT;
 using WinRT.Interop;
 
 namespace Spark.UI;
 
 public sealed partial class MainWindow : Window
 {
-    private readonly ObservableCollection<CandidateDto> _items = new();
+    private readonly BulkObservableCollection<CandidateDto> _items = new();
     private readonly HostIpcClient _host = new();
     private AppWindow? _appWindow;
     private TrayService? _tray;
@@ -38,6 +42,13 @@ public sealed partial class MainWindow : Window
     private bool _gridView;
     private IntPtr _hwnd;
     private int _queryGen;
+    /// <summary>搜索防抖：快速连续输入只发最后一轮查询（配合 _queryGen 丢弃过期结果）。</summary>
+    private const int QueryDebounceMs = 120;
+    private CancellationTokenSource? _debounceCts;
+    /// <summary>自定义亚克力 backdrop（可调 tint，macOS vibrancy 参数）；系统禁用透明效果时不用。</summary>
+    private readonly AcrylicSystemBackdrop _acrylicBackdrop = new();
+    /// <summary>Acrylic 不可用（系统禁用透明效果/环境不支持）时的纯色背景，颜色随主题。</summary>
+    private readonly SolidColorBrush _windowBg = new();
     /// <summary>前台变化钩子句柄（失焦隐藏用，不依赖 Activated 事件）。</summary>
     private IntPtr _fgHook;
     /// <summary>钩子回调委托必须持有引用，否则被 GC 回收后回调悬空导致崩溃。</summary>
@@ -107,9 +118,13 @@ public sealed partial class MainWindow : Window
 
         // pane 切换过渡用的位移变换映射（XAML 字段须在 InitializeComponent 之后才能引用）
         _paneShifts[PaneGeneral] = PaneGeneralShift;
-        _paneShifts[PaneHotkey] = PaneHotkeyShift;
         _paneShifts[PaneAppearance] = PaneAppearanceShift;
         _paneShifts[PanePlugins] = PanePluginsShift;
+        _paneShifts[PaneAbout] = PaneAboutShift;
+
+        // 关于页：版本号（csproj Version，与 Cargo 工作区一致）与初始更新状态
+        AboutVersionText.Text = $"版本 {AppVersionText}";
+        AboutUpdateStatus.Text = $"当前版本 {AppVersionText}";
 
         ExtendsContentIntoTitleBar = true;
         ResultList.ItemsSource = _items;
@@ -124,18 +139,22 @@ public sealed partial class MainWindow : Window
         ResultGrid.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
         // IME 组词期间不拦截箭头（组词光标移动由输入法管），否则会破坏中文输入
         QueryBox.TextCompositionStarted += (_, _) => _composing = true;
-        QueryBox.TextCompositionEnded += (_, _) => _composing = false;
+        // 组词结束（上屏/取消）补一次查询：组词期间 TextChanged 也在触发，已被 ScheduleRefresh 挂起
+        QueryBox.TextCompositionEnded += (_, _) =>
+        {
+            _composing = false;
+            ScheduleRefresh(QueryBox.Text ?? "");
+        };
 
         Root.RenderTransform = null;
-        // 动画只作用于 ContentClip：Root 固定铺壁纸基底（不透明），弹出动画期间窗口底层始终是壁纸色，
-        // 不会先露出窗口底层（黑色）；ContentClip 从 0.96 缩放 + 透明度淡入展开。
+        // 动画只作用于 ContentClip：背景是系统 Acrylic 真玻璃（DWM 模糊 + 半透明 tint），
+        // 弹出动画期间窗口底层是模糊玻璃，不会露出黑色。
         ContentClip.RenderTransform = _pop;
         // 拖拽 caption 区域跟随窗口尺寸（宽度滑杆/布局变化）
         Root.SizeChanged += (_, _) => UpdateDragRegions();
         // 钩子回调委托持有引用防 GC（字段初始化器不能引用实例方法，放构造函数）
-        _fgHookProc = OnForegroundChanged;        // 背景：自绘壁纸渐变 + 玻璃叠加（对齐 ui-prototype .desktop-wallpaper / .launcher-glass）。
-        // 不用 SystemBackdrop/Acrylic：实测部分环境 DesktopAcrylicBackdrop 静默回退成纯色（#202020），
-        // 自绘渐变在任何机器上效果一致，且窗口后面的内容不会干扰视觉。
+        _fgHookProc = OnForegroundChanged;        // 背景：系统 Acrylic 真玻璃（macOS vibrancy 同构），深浅主题共用；
+        // 系统禁用透明效果时回退纯色面板（ApplyTheme 里赋 _windowBg），任何机器效果一致。
 
         _hideOnDeactivate = LocalState.Ui.HideOnFocusLost;
         ApplyTheme();
@@ -165,16 +184,18 @@ public sealed partial class MainWindow : Window
                     HideLauncher();
                 return;
             }
-            QueryBox.Focus(FocusState.Programmatic);
+            QueryBox.Focus(FocusState.Pointer);
         };
 
         Closed += async (_, _) =>
         {
+            SystemBackdrop = null;   // 触发 AcrylicSystemBackdrop.OnTargetDisconnected 清理
             if (_fgHook != IntPtr.Zero)
             {
                 try { UnhookWinEvent(_fgHook); } catch { /* ignore */ }
                 _fgHook = IntPtr.Zero;
             }
+            try { RemoveWindowSubclass(_hwnd, _noMaximizeProc, new UIntPtr(CaptionSubclassId)); } catch { /* ignore */ }
             _toggleWatcher?.Dispose();
             _toggleWatcher = null;
             await _host.DisposeAsync();
@@ -185,6 +206,8 @@ public sealed partial class MainWindow : Window
         {
             if (_loaded) return;
             _loaded = true;
+            // 构造时窗口句柄可能未就绪（Acrylic 挂 target 需要），Loaded 后重放一次主题
+            try { ApplyTheme(); } catch (Exception ex) { App.Log("Theme", ex); }
             try { await _host.EnsureConnectedAsync(); } catch (Exception ex) { App.Log("HostConnect", ex); }
             try { SetupTray(); } catch (Exception ex) { App.Log("SetupTray", ex); }
             HideLauncher();
@@ -218,43 +241,46 @@ public sealed partial class MainWindow : Window
             _ => SystemUsesDark(),
         };
 
-        // key → ARGB；深/浅各一套，值对齐 styles.css 变量
+        // key → ARGB；深/浅各一套，值对齐 styles.css 变量。
+        // 浅色文字比原型略深：浅色真玻璃背景会透出桌面明暗，太淡的小字看不清
         var pal = new Dictionary<string, uint>
         {
-            // 玻璃叠加：38% 底（比原型 55% 更透，壁纸色斑透过玻璃仍可见）
-            ["GlassOverlayBrush"] = dark ? 0x611C1C1Eu : 0x61FFFFFFu,
             ["GlassBorderBrush"] = dark ? 0x24FFFFFFu : 0xA6FFFFFFu,
-            ["TextPrimaryBrush"] = dark ? 0xFFEBEBEBu : 0xE0000000u,
-            ["TextSecondaryBrush"] = dark ? 0x8CFFFFFFu : 0x80000000u,
-            ["TextTertiaryBrush"] = dark ? 0x61FFFFFFu : 0x59000000u,
+            ["TextPrimaryBrush"] = dark ? 0xFFEBEBEBu : 0xF5000000u,
+            ["TextSecondaryBrush"] = dark ? 0x8CFFFFFFu : 0x99000000u,
+            ["TextTertiaryBrush"] = dark ? 0x61FFFFFFu : 0x80000000u,
             ["AccentBrush"] = dark ? 0xFF0A84FFu : 0xFF007AFFu,
             ["AccentSoftBrush"] = dark ? 0x380A84FFu : 0x26007AFFu,
             ["RowHoverBrush"] = dark ? 0x14FFFFFFu : 0x0D000000u,
-            ["RowActiveBrush"] = dark ? 0x470A84FFu : 0x29007AFFu,
-            ["RowActiveStrongBrush"] = dark ? 0x5C0A84FFu : 0x38007AFFu,
+            ["RowActiveBrush"] = dark ? 0x470A84FFu : 0x33007AFFu,
+            ["RowActiveStrongBrush"] = dark ? 0x5C0A84FFu : 0x40007AFFu,
             ["DividerBrush"] = dark ? 0x1AFFFFFFu : 0x14000000u,
             ["ChipBgBrush"] = dark ? 0x14FFFFFFu : 0x0D000000u,
-            ["FavBgBrush"] = dark ? 0x24000000u : 0x38FFFFFFu,
-            ["FooterBgBrush"] = dark ? 0x1F000000u : 0x40FFFFFFu,
-            ["GridTileBgBrush"] = dark ? 0x08FFFFFFu : 0x59FFFFFFu,
-            ["GridTileSelBgBrush"] = dark ? 0x1EFFFFFFu : 0x12000000u,
-            ["GridTileSelBorderBrush"] = dark ? 0x40FFFFFFu : 0x33000000u,
+            ["FavBgBrush"] = dark ? 0x24000000u : 0x0D000000u,
+            ["FooterBgBrush"] = dark ? 0x1F000000u : 0x0F000000u,
+            ["GridTileBgBrush"] = dark ? 0x08FFFFFFu : 0x0A000000u,
+            ["GridTileSelBgBrush"] = dark ? 0x1EFFFFFFu : 0x16000000u,
+            ["GridTileSelBorderBrush"] = dark ? 0x40FFFFFFu : 0x40000000u,
             ["SwitchTrackOffBrush"] = dark ? 0x52303038u : 0x33000000u,
             ["StarBrush"] = 0xFFFFD60Au,
+            // 下拉弹出层：半透明玻璃（深色 75% #1C1C1E / 浅色 75% 白，透出壁纸色斑）
+            ["ComboPopupBgBrush"] = dark ? 0xC01C1C1Eu : 0xC0FFFFFFu,
+            // 模态卡片底（新建分组/删除确认）：深色近黑、浅色近白
+            ["ModalCardBrush"] = dark ? 0xF21C1C1Eu : 0xF2FFFFFFu,
             // 列表 / 平铺 选中态
             ["ListViewItemBackgroundPointerOver"] = dark ? 0x14FFFFFFu : 0x0D000000u,
             ["ListViewItemBackgroundPressed"] = dark ? 0x14FFFFFFu : 0x0D000000u,
-            ["ListViewItemBackgroundSelected"] = dark ? 0x470A84FFu : 0x29007AFFu,
-            ["ListViewItemBackgroundSelectedPointerOver"] = dark ? 0x5C0A84FFu : 0x38007AFFu,
-            ["ListViewItemBackgroundSelectedPressed"] = dark ? 0x5C0A84FFu : 0x38007AFFu,
+            ["ListViewItemBackgroundSelected"] = dark ? 0x470A84FFu : 0x33007AFFu,
+            ["ListViewItemBackgroundSelectedPointerOver"] = dark ? 0x5C0A84FFu : 0x40007AFFu,
+            ["ListViewItemBackgroundSelectedPressed"] = dark ? 0x5C0A84FFu : 0x40007AFFu,
             ["ListViewItemBorderBrushPointerOver"] = dark ? 0x14FFFFFFu : 0x0D000000u,
             ["ListViewItemBorderBrushPressed"] = dark ? 0x14FFFFFFu : 0x0D000000u,
-            ["ListViewItemBorderBrushSelected"] = dark ? 0x470A84FFu : 0x29007AFFu,
+            ["ListViewItemBorderBrushSelected"] = dark ? 0x470A84FFu : 0x33007AFFu,
             ["GridViewItemBackgroundPointerOver"] = dark ? 0x14FFFFFFu : 0x0D000000u,
             ["GridViewItemBackgroundPressed"] = dark ? 0x14FFFFFFu : 0x0D000000u,
-            ["GridViewItemBackgroundSelected"] = dark ? 0x470A84FFu : 0x29007AFFu,
-            ["GridViewItemBackgroundSelectedPointerOver"] = dark ? 0x5C0A84FFu : 0x38007AFFu,
-            ["GridViewItemBackgroundSelectedPressed"] = dark ? 0x5C0A84FFu : 0x38007AFFu,
+            ["GridViewItemBackgroundSelected"] = dark ? 0x470A84FFu : 0x33007AFFu,
+            ["GridViewItemBackgroundSelectedPointerOver"] = dark ? 0x5C0A84FFu : 0x40007AFFu,
+            ["GridViewItemBackgroundSelectedPressed"] = dark ? 0x5C0A84FFu : 0x40007AFFu,
             ["GridViewItemBorderBrushPointerOver"] = dark ? 0x1AFFFFFFu : 0x14000000u,
             ["GridViewItemBorderBrushSelected"] = dark ? 0x590A84FFu : 0x40007AFFu,
             ["GridViewItemBorderBrushSelectedPointerOver"] = dark ? 0x590A84FFu : 0x40007AFFu,
@@ -266,41 +292,44 @@ public sealed partial class MainWindow : Window
         }
 
         if (Root.Resources.TryGetValue("GlassHighlightBrush", out var g) && g is LinearGradientBrush hl)
-            hl.GradientStops[0].Color = Color.FromArgb(dark ? (byte)0x14 : (byte)0x80, 0xFF, 0xFF, 0xFF);
+            hl.GradientStops[0].Color = Color.FromArgb(dark ? (byte)0x14 : (byte)0x66, 0xFF, 0xFF, 0xFF);
 
-        // 壁纸基底渐变（对齐 .desktop-wallpaper 深/浅两套）
-        if (Root.Resources.TryGetValue("WpBaseBrush", out var wb) && wb is LinearGradientBrush wpBase)
+        // 真玻璃（深浅通用，macOS vibrancy 同构）：自定义 SystemBackdrop（AcrylicSystemBackdrop）
+        // 由框架渲染在 XAML 内容层之后——DWM 模糊窗口后面的内容 + 半透明 tint。
+        // 系统禁用透明效果时回退纯色面板（_windowBg，颜色随主题）。
+        _windowBg.Color = Color.FromArgb(0xFF,
+            dark ? (byte)0x1C : (byte)0xF2,
+            dark ? (byte)0x1C : (byte)0xF5,
+            dark ? (byte)0x1E : (byte)0xFA);
+        var useAcrylic = TransparencyEnabled();
+        if (useAcrylic)
         {
-            wpBase.GradientStops[0].Color = dark ? Color.FromArgb(0xFF, 0x0D, 0x12, 0x20) : Color.FromArgb(0xFF, 0xD4, 0xDC, 0xEC);
-            wpBase.GradientStops[1].Color = dark ? Color.FromArgb(0xFF, 0x16, 0x20, 0x33) : Color.FromArgb(0xFF, 0xE8, 0xEE, 0xF8);
-            wpBase.GradientStops[2].Color = dark ? Color.FromArgb(0xFF, 0x0F, 0x1A, 0x28) : Color.FromArgb(0xFF, 0xCF, 0xD8, 0xE8);
-            // Root 铺同实例（不透明壁纸底）：弹出动画期间窗口底层是壁纸色，不会先露黑；
-            // 与 ContentClip 内色斑/玻璃叠加后即完整壁纸，主题切换时此实例同步变色。
-            Root.Background = wpBase;
+            // 防重复 connect：SystemBackdrop 赋值相同实例可能触发 disconnect/connect 循环
+            if (!ReferenceEquals(SystemBackdrop, _acrylicBackdrop))
+                SystemBackdrop = _acrylicBackdrop;
+            _acrylicBackdrop.ApplyTheme(dark);
         }
-        // 4 个 radial 色斑（深/浅两套；浅色无 BL 色斑 → 透明）
-        (string key, uint darkC, uint lightC)[] spots =
+        else if (SystemBackdrop is not null)
         {
-            ("WpSpotTL", 0xFF2E5AA6u, 0xFFA8C8FFu),
-            ("WpSpotTR", 0xFF7C2F98u, 0xFFF5C6E8u),
-            ("WpSpotBR", 0xFF1A7050u, 0xFFB8F0D8u),
-            ("WpSpotBL", 0xFF5F3696u, 0x003A2060u),
-        };
-        foreach (var (key, darkC, lightC) in spots)
-        {
-            if (Root.Resources.TryGetValue(key, out var s) && s is RadialGradientBrush rb && rb.GradientStops.Count > 0)
-            {
-                var c = dark ? darkC : lightC;
-                rb.GradientStops[0].Color = Color.FromArgb((byte)(c >> 24), (byte)(c >> 16), (byte)(c >> 8), (byte)c);
-                // 末端透明 stop 保留原 alpha=0，仅换 RGB
-                if (rb.GradientStops.Count > 1)
-                    rb.GradientStops[1].Color = Color.FromArgb(0, (byte)(c >> 16), (byte)(c >> 8), (byte)c);
-            }
+            SystemBackdrop = null;
         }
+        Root.Background = useAcrylic ? null : _windowBg;
 
         // 内容/系统控件主题跟随玻璃主题（浅色系统下 TextBox 光标、滚动条、弹窗默认是浅色的）
         Root.RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light;
         ApplyDwmDarkMode();
+    }
+
+    /// <summary>系统是否开启透明效果。关闭时 Acrylic 会静默回退成纯色，此时回退纯色背景。</summary>
+    private static bool TransparencyEnabled()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            return k?.GetValue("EnableTransparency") is int v && v == 1;
+        }
+        catch { return true; }
     }
 
     /// <summary>DWM 圆角外框颜色跟随主题；WinUI 启动时按 App 主题重设过该属性，主题切换时再压一次。</summary>
@@ -454,7 +483,7 @@ public sealed partial class MainWindow : Window
                     // 从"未连接"变为"已连接"：首启的 DemoData 兜底已过期，
                     // 自动补一次刷新拿到完整列表（否则要等用户按热键唤醒才看得到）
                     if (_host.IsConnected && !wasConnected)
-                        DispatcherQueue.TryEnqueue(() => _ = RefreshResultsAsync(QueryBox.Text));
+                        DispatcherQueue.TryEnqueue(() => ScheduleRefresh(QueryBox.Text ?? ""));
                 }
             }
             catch { /* ignore */ }
@@ -518,7 +547,8 @@ public sealed partial class MainWindow : Window
             _visible = true;
             ForceForeground();
             Activate();
-            QueryBox.Focus(FocusState.Programmatic);
+            QueryBox.Focus(FocusState.Pointer);
+            ResetIme();
             return;
         }
 
@@ -598,6 +628,9 @@ public sealed partial class MainWindow : Window
         catch { /* ignore */ }
 
         MakeFrameless();
+        // 双击 caption 拖拽区会最大化（全屏）：挂子类吞掉该消息（见 NoMaximizeWndProc）
+        try { SetWindowSubclass(_hwnd, _noMaximizeProc, new UIntPtr(CaptionSubclassId), IntPtr.Zero); }
+        catch (Exception ex) { App.Log("WindowSubclass", ex); }
         PlaceWindow(LocalState.Ui.WindowWidth, 590);
 
         // 前台变化钩子：点击外面/Alt+Tab 的本质是前台从本窗口切走。
@@ -730,6 +763,23 @@ public sealed partial class MainWindow : Window
             .SetRegionRects(Microsoft.UI.Input.NonClientRegionKind.Caption, rects.ToArray());
     }
 
+    // ==================== 标题栏双击防最大化 ====================
+
+    /// <summary>窗口子类钩子：双击伪标题栏（caption 区）会被系统当作"最大化"（全屏）。
+    /// Presenter.IsMaximizable=false 挡不住全部路径（WinUI 显示时会重写窗口样式，最大化样式位可能被加回来），
+    /// 直接在子类里吞掉 WM_NCLBUTTONDBLCLK(HTCAPTION)：消息不进 DefWindowProc 就不会发 SC_MAXIMIZE。
+    /// 子类用 SetWindowSubclass 链式挂接，不覆盖 WinUI 自己的窗口过程。</summary>
+    private readonly SUBCLASSPROC _noMaximizeProc = NoMaximizeWndProc;
+
+    private static IntPtr NoMaximizeWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam,
+        IntPtr uIdSubclass, IntPtr dwRefData)
+    {
+        // wParam = 命中测试码；HTCAPTION=2（caption 拖拽区双击）
+        if (msg == WM_NCLBUTTONDBLCLK && wParam.ToInt32() == HTCAPTION)
+            return IntPtr.Zero;  // 吞掉：不转默认处理
+        return DefSubclassProc(hWnd, msg, wParam, lParam, uIdSubclass, dwRefData);
+    }
+
     // ==================== 显示 / 隐藏 ====================
 
     public void ShowLauncher()
@@ -759,7 +809,10 @@ public sealed partial class MainWindow : Window
             ApplyModeSwitch(open: false, animate: false);
             QueryBox.Text = "";
             _ = RefreshResultsAsync("");
-            QueryBox.Focus(FocusState.Programmatic);
+            // 用 Pointer 状态聚焦 + IME 重建：修复 Show/Hide 循环后中文输入法
+            // 候选窗不弹、只能打英文的问题（详见 ResetIme）
+            QueryBox.Focus(FocusState.Pointer);
+            ResetIme();
             // 唤起时收藏选中态复位（上一轮导航状态不残留）
             _favActive = -1;
             UpdateFavCardStates();
@@ -771,17 +824,10 @@ public sealed partial class MainWindow : Window
             _hideGen++;  // 使已排队的隐藏动画 Completed→HideNow 失配，防止刚显示的窗口被延迟关掉
             _hideAnimating = false;
             _animOut.Stop();
-            if (LocalState.Ui.ReduceMotion)
-            {
-                ResetPop();
-            }
-            else
-            {
-                ContentClip.Opacity = 0;
-                _pop.ScaleX = _pop.ScaleY = 0.96;
-                _pop.TranslateY = 6;
-                _animIn.Begin();
-            }
+            ContentClip.Opacity = 0;
+            _pop.ScaleX = _pop.ScaleY = 0.96;
+            _pop.TranslateY = 6;
+            _animIn.Begin();
 
             // 焦点落稳后再延长一点保护。注意不能太长：用户可能马上点击外面
             // 触发失焦隐藏，保护期过长会把这真实的点击也拦掉（表现为点击外面
@@ -794,6 +840,38 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>强制重建输入法上下文：窗口 Show/Hide 循环后，XAML 的输入法（TSF）
+    /// 上下文可能没重新挂到搜索框上——中文输入法候选窗不弹、只能打英文。
+    /// 摘除再挂回 IMM32 上下文 + 确保 IME 打开 + 取消残留组词，触发输入服务重建桥接。
+    /// 必须在窗口显示且搜索框聚焦后调用（UI 线程）。</summary>
+    private void ResetIme()
+    {
+        try
+        {
+            if (_hwnd == IntPtr.Zero) return;
+
+            // 摘除再挂回：强制 IMM32 上下文重建（对 TSF 输入法走兼容层同样生效）
+            var prev = ImmAssociateContext(_hwnd, IntPtr.Zero);
+            if (prev != IntPtr.Zero)
+                ImmAssociateContext(_hwnd, prev);
+
+            var himc = ImmGetContext(_hwnd);
+            if (himc != IntPtr.Zero)
+            {
+                try
+                {
+                    ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                    ImmSetOpenStatus(himc, true);
+                }
+                finally
+                {
+                    ImmReleaseContext(_hwnd, himc);
+                }
+            }
+        }
+        catch { /* ignore */ }
+    }
+
     /// <summary>显示后延迟重试抢前台，直到窗口确实处于前台或状态变化。</summary>
     private async Task RetryFocusAsync()
     {
@@ -804,7 +882,10 @@ public sealed partial class MainWindow : Window
                 return;
             // 每次重试都补一次输入框聚焦：窗口刚弹出时首次 Focus 可能被动画/抢前台
             // 吃掉，TextBox 拿不到焦点时输入法上下文不会挂上（中文模式直接打出英文）。
-            QueryBox.Focus(FocusState.Programmatic);
+            // 用 Pointer 状态 + IME 重建：程序化聚焦在 Show/Hide 循环后不重建
+            // TSF 输入上下文，Pointer 路径会触发，中文输入法候选窗才能弹出。
+            QueryBox.Focus(FocusState.Pointer);
+            ResetIme();
             if (GetForegroundWindow() == _hwnd)
                 return;
             ForceForeground();
@@ -830,11 +911,6 @@ public sealed partial class MainWindow : Window
             return;
 
         // pop-out（对齐原型 .launcher.closing），完成后才真正隐藏
-        if (LocalState.Ui.ReduceMotion)
-        {
-            HideNow();
-            return;
-        }
         _hideAnimating = true;
         _animHideGen = ++_hideGen;
         _animIn.Stop();
@@ -927,23 +1003,68 @@ public sealed partial class MainWindow : Window
         }
         if (gen != _queryGen) return;
 
-        _items.Clear();
-        var i = 0;
-        foreach (var item in result.Items)
+        ApplyResults(result, gen, q);
+    }
+
+    /// <summary>结果落地：id 序列没变就不动集合（退格/微调零闪烁），变了才一次性
+    /// 批量替换（单次 Reset，避免逐项 Add 触发 N 次布局）；旧对象按 id 复用保留
+    /// 已加载的图标，新项先字母占位渲染，图标后台提取完成后补上。</summary>
+    private void ApplyResults(QueryResultDto result, int gen, string q)
+    {
+        var sameIds = result.Items.Count == _items.Count;
+        if (sameIds)
         {
-            item.Shortcut = i < 9 ? $"{i + 1}" : "";
-            var hint = item.Target ?? item.IconPath;
-            var id = item.Id;
-            // GetIcon 内部会创建 BitmapImage（必须 UI 线程），且演示数据量小，直接在 UI 线程跑
-            item.IconImage = AppIconService.GetIcon(id, hint);
-            if (gen != _queryGen) return;
-            _items.Add(item);
-            i++;
+            for (var i = 0; i < result.Items.Count; i++)
+            {
+                if (!result.Items[i].Id.Equals(_items[i].Id, StringComparison.OrdinalIgnoreCase))
+                {
+                    sameIds = false;
+                    break;
+                }
+            }
         }
 
-        var hostTag = _host.IsConnected ? "Host · 极速" : "演示 · 本地";
+        var existing = new Dictionary<string, CandidateDto>(StringComparer.OrdinalIgnoreCase);
+        foreach (var x in _items) existing[x.Id] = x;
+
+        var newItems = new List<CandidateDto>(result.Items.Count);
+        for (var i = 0; i < result.Items.Count; i++)
+        {
+            var item = result.Items[i];
+            if (existing.TryGetValue(item.Id, out var old))
+            {
+                // 复用旧对象：保留 IconImage（不重复解码/不闪），只同步可能变化的展示字段
+                if (old.Title != item.Title) old.Title = item.Title;
+                if (old.Subtitle != item.Subtitle) old.Subtitle = item.Subtitle;
+                if (old.Source != item.Source) old.Source = item.Source;
+                if (old.Target != item.Target) old.Target = item.Target;
+                if (old.IconPath != item.IconPath) old.IconPath = item.IconPath;
+                old.Shortcut = i < 9 ? $"{i + 1}" : "";
+                newItems.Add(old);
+            }
+            else
+            {
+                item.Shortcut = i < 9 ? $"{i + 1}" : "";
+                newItems.Add(item);
+            }
+            // 图标未加载（新项 / 之前失败）→ 字母占位 + 后台补齐
+            if (newItems[^1].IconImage is null)
+                _ = LoadIconAsync(newItems[^1], gen);
+        }
+
+        if (!sameIds)
+        {
+            _items.ReplaceAll(newItems);
+            _active = 0;
+            ResultList.SelectedIndex = 0;
+            ResultGrid.SelectedIndex = 0;
+            // 输入搜索后焦点回到结果区，收藏选中态复位
+            _favActive = -1;
+            UpdateFavCardStates();
+        }
+
         SearchMeta.Text = _items.Count > 0 ? $"{_items.Count} 项" : "";
-        Footer.Text = hostTag;
+        Footer.Text = _host.IsConnected ? "Host · 极速" : "演示 · 本地";
         // 空状态提示：搜索无结果 / 无最近使用时居中展示，避免页面空洞
         if (_items.Count > 0)
         {
@@ -958,16 +1079,25 @@ public sealed partial class MainWindow : Window
         }
         // 搜索时收藏区变淡（对齐原型 dimmed）
         FavRoot.Opacity = string.IsNullOrWhiteSpace(q) ? 1.0 : 0.45;
+    }
 
-        if (_items.Count > 0)
-        {
-            _active = 0;
-            ResultList.SelectedIndex = 0;
-            ResultGrid.SelectedIndex = 0;
-            // 输入搜索后焦点回到结果区，收藏选中态复位
-            _favActive = -1;
-            UpdateFavCardStates();
-        }
+    /// <summary>后台取图标补到行上：gen 过期（新一轮查询已开始）则丢弃。</summary>
+    private async Task LoadIconAsync(CandidateDto item, int gen)
+    {
+        var src = await AppIconService.GetIconAsync(item.Id, item.Target ?? item.IconPath);
+        if (src is null || gen != _queryGen) return;
+        item.IconImage = src;
+    }
+
+    /// <summary>收藏卡图标异步补齐：后台提取完成后替换字母占位。
+    /// 卡片可能已被重建（切组/重绘），对孤立元素赋值无害。</summary>
+    private async Task LoadFavIconAsync(Image img, Border letter, string id, string? hint)
+    {
+        var src = await AppIconService.GetIconAsync(id, hint);
+        if (src is null) return;
+        img.Source = src;
+        img.Visibility = Visibility.Visible;
+        letter.Visibility = Visibility.Collapsed;
     }
 
     // ==================== 收藏坞 ====================
@@ -1036,36 +1166,35 @@ public sealed partial class MainWindow : Window
             if (c is null) continue;
             var title = entry?.Title ?? c.Title;
 
-            var imgSrc = AppIconService.GetIcon(id, c.Target ?? c.IconPath);
-            UIElement iconEl;
-            if (imgSrc is not null)
+            // 图标：字母占位立即渲染，真实图标后台提取完成后替换（避免 GDI 阻塞 UI 线程）
+            var iconEl = new Grid
             {
-                iconEl = new Image
+                Width = 36, Height = 36,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var letterTile = new Border
+            {
+                CornerRadius = new CornerRadius(10),
+                Background = c.IconBrush,
+                Child = new TextBlock
                 {
-                    Source = imgSrc, Width = 36, Height = 36, Stretch = Stretch.Uniform,
+                    Text = c.IconGlyph, FontSize = 12, FontWeight = FontWeights.SemiBold,
+                    Foreground = new SolidColorBrush(Colors.White),
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center
-                };
-            }
-            else
+                }
+            };
+            var iconImg = new Image
             {
-                // 与 Image 分支一致：显式居中（StackPanel 里默认 Stretch + 显式 Width
-                // 会左对齐，导致字形兜底图标偏左、与居中标题错位——收藏夹图标对齐问题）
-                iconEl = new Border
-                {
-                    Width = 36, Height = 36, CornerRadius = new CornerRadius(10),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Background = c.IconBrush,
-                    Child = new TextBlock
-                    {
-                        Text = c.IconGlyph, FontSize = 12, FontWeight = FontWeights.SemiBold,
-                        Foreground = new SolidColorBrush(Colors.White),
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        VerticalAlignment = VerticalAlignment.Center
-                    }
-                };
-            }
+                Width = 36, Height = 36, Stretch = Stretch.Uniform,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                Visibility = Visibility.Collapsed
+            };
+            iconEl.Children.Add(letterTile);
+            iconEl.Children.Add(iconImg);
+            _ = LoadFavIconAsync(iconImg, letterTile, c.Id, c.Target ?? c.IconPath);
 
             var panel = new StackPanel
             {
@@ -1136,8 +1265,8 @@ public sealed partial class MainWindow : Window
     /// </summary>
     private void AnimateFavBodyHeight(double h0)
     {
-        // 窗口未上屏（启动首帧）或减少动画：直接落定自然高度，不播过渡
-        if (!_visible || LocalState.Ui.ReduceMotion) return;
+        // 窗口未上屏（启动首帧）：直接落定自然高度，不播过渡
+        if (!_visible) return;
         if (FavBodyClip.Visibility != Visibility.Visible) return;
         // 抽屉动画进行中交给它；仅当正在跑"纯高度过渡"时可中途续动（连续快速切分组）
         if (_favTweening && !_favHeightOnly) return;
@@ -1177,13 +1306,13 @@ public sealed partial class MainWindow : Window
     // ==================== 分组切换过渡 ====================
 
     /// <summary>切换到指定分组。带过渡：旧内容淡出 → 重建 → 新内容淡入 + 卡片逐项 pop；
-    /// 减少动画 / 窗口未上屏时直接重建（与折叠/高度过渡同一策略）。</summary>
+    /// 窗口未上屏时直接重建（与折叠/高度过渡同一策略）。</summary>
     private void SwitchFavGroup(string gid)
     {
         if (LocalState.Fav.ActiveGroup == gid) return;
         LocalState.Fav.ActiveGroup = gid;
         LocalState.SaveFav();
-        if (!_visible || LocalState.Ui.ReduceMotion)
+        if (!_visible)
         {
             RenderFavorites();
             return;
@@ -1470,7 +1599,7 @@ public sealed partial class MainWindow : Window
         _favHeightOnly = false;
         var gen = _favAnimGen;
 
-        if (!animate || LocalState.Ui.ReduceMotion)
+        if (!animate)
         {
             FavSettle(collapsed, gen);
             return;
@@ -1601,10 +1730,9 @@ public sealed partial class MainWindow : Window
         AnimateModalIn(FavGroupCard, FavGroupCardScale, FavGroupCardShift);
     }
 
-    /// <summary>模态卡片入场：淡入 + 上浮放大（与窗口 pop-in 同款曲线；减少动画时跳过）。</summary>
+    /// <summary>模态卡片入场：淡入 + 上浮放大（与窗口 pop-in 同款曲线）。</summary>
     private void AnimateModalIn(Border card, ScaleTransform scale, TranslateTransform shift)
     {
-        if (LocalState.Ui.ReduceMotion) return;
         // 起点即终值中间态，可被下次打开续动
         card.Opacity = 0;
         scale.ScaleX = scale.ScaleY = 0.96;
@@ -1779,15 +1907,6 @@ public sealed partial class MainWindow : Window
         _viewAnimGen++;
         var gen = _viewAnimGen;
 
-        if (LocalState.Ui.ReduceMotion)
-        {
-            ResultList.Opacity = 1;
-            ResultGrid.Opacity = 1;
-            outgoing.Visibility = Visibility.Collapsed;
-            incoming.Visibility = Visibility.Visible;
-            return;
-        }
-
         // 上次动画可能中断在半途：两个面板同格叠放，先复位到可见不透明再播动画（Begin 立即套用 From 值，无闪烁）
         ResultList.Visibility = Visibility.Visible;
         ResultGrid.Visibility = Visibility.Visible;
@@ -1902,13 +2021,13 @@ public sealed partial class MainWindow : Window
         SyncSettingsUi();
         ShowPane("general");
         // SettingsPanel 无背景（玻璃下透壁纸），主页必须隐藏，否则内容从透明区透出来叠在一起
-        ApplyModeSwitch(open: true, animate: _visible && !LocalState.Ui.ReduceMotion);
+        ApplyModeSwitch(open: true, animate: _visible);
         UpdateDragRegions();
     }
 
     private void OnCloseSettings(object sender, RoutedEventArgs e)
     {
-        ApplyModeSwitch(open: false, animate: _visible && !LocalState.Ui.ReduceMotion);
+        ApplyModeSwitch(open: false, animate: _visible);
         QueryBox.Focus(FocusState.Programmatic);
         UpdateDragRegions();
     }
@@ -1937,8 +2056,9 @@ public sealed partial class MainWindow : Window
         var res = Root.Resources;
         foreach (var (b, icon) in new (Button, FontIcon?)[]
         {
-            (NavGeneral, NavIconGeneral), (NavHotkey, NavIconHotkey),
+            (NavGeneral, NavIconGeneral),
             (NavAppearance, NavIconAppearance), (NavPlugins, NavIconPlugins),
+            (NavAbout, NavIconAbout),
         })
         {
             var on = (string)b.Tag == pane;
@@ -1951,14 +2071,14 @@ public sealed partial class MainWindow : Window
 
         var target = pane switch
         {
-            "hotkey" => PaneHotkey,
             "appearance" => PaneAppearance,
             "plugins" => PanePlugins,
+            "about" => PaneAbout,
             _ => PaneGeneral,
         };
         if (target.Visibility == Visibility.Visible) return;  // 重复点当前项
 
-        if (!_visible || LocalState.Ui.ReduceMotion || _paneAnimating)
+        if (!_visible || _paneAnimating)
         {
             ApplyPaneInstant(target);
             return;
@@ -2048,8 +2168,7 @@ public sealed partial class MainWindow : Window
             ViewCombo.SelectedIndex = LocalState.Ui.DefaultView == "grid" ? 1 : 0;
             WidthSlider.Value = LocalState.Ui.WindowWidth;
             WidthValue.Text = $"{LocalState.Ui.WindowWidth}px";
-            ReduceMotionSwitch.IsChecked = LocalState.Ui.ReduceMotion;
-            UpdateHotkeyPresets();
+            UpdateHotkeyPresets(animate: false);
         }
         finally { _syncing = false; }
     }
@@ -2159,29 +2278,6 @@ public sealed partial class MainWindow : Window
         LocalState.SaveUi();
     }
 
-    private void OnToggleReduceMotion(object sender, RoutedEventArgs e)
-    {
-        var on = ReduceMotionSwitch.IsChecked == true;
-        AnimateSwitchToggle(ReduceMotionSwitch, on, animate: !_syncing);
-        if (_syncing) return;
-        LocalState.Ui.ReduceMotion = on;
-        LocalState.SaveUi();
-        _hideGen++;
-        _hideAnimating = false;
-        _animIn.Stop();
-        _animOut.Stop();
-        ResetPop();
-        // 停掉列表/平铺切换动画，按当前视图直接落定（防止中断在半透明/半缩放状态）
-        _viewAnim?.Stop();
-        _viewAnimGen++;
-        ResultList.Visibility = _gridView ? Visibility.Collapsed : Visibility.Visible;
-        ResultGrid.Visibility = _gridView ? Visibility.Visible : Visibility.Collapsed;
-        ResultList.Opacity = 1;
-        ResultGrid.Opacity = 1;
-        // 收藏坞同理直接落定
-        ApplyFavCollapse(!LocalState.Fav.Expanded, animate: false);
-    }
-
     private void OnThemeChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_syncing) return;
@@ -2216,28 +2312,159 @@ public sealed partial class MainWindow : Window
     {
         LocalState.Ui.Hotkey = (string)((Button)sender).Tag;
         LocalState.SaveUi();
-        UpdateHotkeyPresets();
+        UpdateHotkeyPresets(animate: true);
     }
 
-    private void UpdateHotkeyPresets()
+    /// <summary>预设按钮选中态：背景/边框颜色 200ms 渐变切换（对齐开关动画）。
+    /// 文字颜色两态一致——纯白在深底上观感像加粗，选中只靠底色 + 描边表达。</summary>
+    private void UpdateHotkeyPresets(bool animate)
     {
         var res = Root.Resources;
         foreach (var b in new[] { BtnHotkeyAlt, BtnHotkeyCtrl })
         {
             var on = (string)b.Tag == LocalState.Ui.Hotkey;
-            b.Background = on ? (Brush)res["AccentSoftBrush"] : (Brush)res["ChipBgBrush"];
-            b.BorderBrush = on ? (Brush)res["AccentBrush"] : (Brush)res["GlassBorderBrush"];
-            b.Foreground = on ? (Brush)res["TextPrimaryBrush"] : (Brush)res["TextSecondaryBrush"];
+            AnimateBrush(b, Control.BackgroundProperty, b.Background,
+                on ? (Brush)res["AccentSoftBrush"] : (Brush)res["ChipBgBrush"], animate);
+            AnimateBrush(b, Control.BorderBrushProperty, b.BorderBrush,
+                on ? (Brush)res["AccentBrush"] : (Brush)res["GlassBorderBrush"], animate);
         }
     }
 
+    /// <summary>把按钮画刷替换为当前色的独立副本（共享资源画刷不能直接动画），再渐变到目标色；animate=false 直接落定。</summary>
+    private static void AnimateBrush(Button b, DependencyProperty dp, Brush current, Brush target, bool animate)
+    {
+        if (!animate || current is not SolidColorBrush from || target is not SolidColorBrush to)
+        {
+            b.SetValue(dp, target);
+            return;
+        }
+        var clone = new SolidColorBrush(from.Color);
+        b.SetValue(dp, clone);
+        var a = new ColorAnimation
+        {
+            From = from.Color,
+            To = to.Color,
+            Duration = new Duration(TimeSpan.FromMilliseconds(200)),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        Storyboard.SetTarget(a, clone);
+        Storyboard.SetTargetProperty(a, "Color");
+        var sb = new Storyboard();
+        sb.Children.Add(a);
+        sb.Begin();
+    }
+
     private void OnInstallPlugin(object sender, RoutedEventArgs e)
-        => PluginStatus.Text = "安装本地插件：暂未实现（原型占位）。";
+        => PluginStatus.Text = "安装本地插件：功能开发中，敬请期待。";
+
+    // ==================== 关于 ====================
+
+    private const string GithubRepo = "https://github.com/MrHan-Yd/spark";
+    private const string UpdateApiUrl = "https://api.github.com/repos/MrHan-Yd/spark/releases/latest";
+    private bool _checkingUpdate;
+
+    /// <summary>当前应用版本（csproj Version，与 Cargo 工作区版本保持一致）。</summary>
+    private static Version AppVersion
+        => Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 1, 0);
+
+    private static string AppVersionText => AppVersion.ToString(3);
+
+    private void OnOpenGithub(object sender, RoutedEventArgs e) => OpenUrl(GithubRepo);
+
+    private void OnOpenRelease(object sender, RoutedEventArgs e) => OpenUrl(GithubRepo + "/releases");
+
+    private static void OpenUrl(string url)
+    {
+        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+        catch (Exception ex) { App.Log("OpenUrl", ex); }
+    }
+
+    /// <summary>检查更新：请求 GitHub 最新 Release 并与本地版本比较。
+    /// 未发布过 Release（404）或网络失败都只更新状态文字，不弹窗打断。</summary>
+    private async void OnCheckUpdate(object sender, RoutedEventArgs e)
+    {
+        if (_checkingUpdate) return;
+        _checkingUpdate = true;
+        BtnCheckUpdate.IsEnabled = false;
+        CheckUpdateLabel.Text = "检查中…";
+        BtnOpenRelease.Visibility = Visibility.Collapsed;
+        AboutUpdateStatus.Text = "正在检查更新…";
+        try
+        {
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
+            var json = await client.GetStringAsync(UpdateApiUrl);
+            using var doc = JsonDocument.Parse(json);
+            var tag = doc.RootElement.TryGetProperty("tag_name", out var t) ? t.GetString() : null;
+            var remote = ParseVersion(tag ?? "");
+            var local = ParseVersion(AppVersionText);
+            var cmp = remote.CompareTo(local);
+            if (cmp > 0)
+            {
+                AboutUpdateStatus.Text = $"发现新版本 {tag}";
+                BtnOpenRelease.Visibility = Visibility.Visible;
+            }
+            else if (cmp == 0)
+            {
+                AboutUpdateStatus.Text = "已是最新版本";
+            }
+            else
+            {
+                AboutUpdateStatus.Text = $"本地版本更新于远端（{tag}）";
+            }
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            AboutUpdateStatus.Text = "暂无发布版本";
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden)
+        {
+            AboutUpdateStatus.Text = "检查失败：请求过于频繁，请稍后再试";
+        }
+        catch (Exception ex)
+        {
+            AboutUpdateStatus.Text = "检查失败，请稍后重试";
+            App.Log("CheckUpdate", ex);
+        }
+        finally
+        {
+            _checkingUpdate = false;
+            BtnCheckUpdate.IsEnabled = true;
+            CheckUpdateLabel.Text = "检查更新";
+        }
+    }
+
+    /// <summary>解析 "v0.2.0" 这类版本串为可比较三元组（缺段按 0）。</summary>
+    private static (int, int, int) ParseVersion(string s)
+    {
+        var p = s.TrimStart('v', 'V').Split('.');
+        int Get(int i) => i < p.Length && int.TryParse(p[i], out var n) ? n : 0;
+        return (Get(0), Get(1), Get(2));
+    }
 
     // ==================== 键盘 / 执行 ====================
 
-    private async void OnQueryChanged(object sender, TextChangedEventArgs e)
-        => await RefreshResultsAsync(QueryBox.Text ?? "");
+    private void OnQueryChanged(object sender, TextChangedEventArgs e)
+        => ScheduleRefresh(QueryBox.Text ?? "");
+
+    /// <summary>查询调度：防抖 120ms 合并快速连续输入；IME 组词期间挂起，
+    /// 组词结束（TextCompositionEnded）再补查，避免中间态拼音反复查询。</summary>
+    private void ScheduleRefresh(string q)
+    {
+        _debounceCts?.Cancel();
+        if (_composing) return;
+        _debounceCts = new CancellationTokenSource();
+        var ct = _debounceCts.Token;
+        _ = RefreshAfterDebounceAsync(q, ct);
+    }
+
+    private async Task RefreshAfterDebounceAsync(string q, CancellationToken ct)
+    {
+        try { await Task.Delay(QueryDebounceMs, ct); }
+        catch (TaskCanceledException) { return; }
+        if (ct.IsCancellationRequested) return;
+        await RefreshResultsAsync(q);
+    }
 
     private async void OnQueryKeyDown(object sender, KeyRoutedEventArgs e)
     {
@@ -2310,8 +2537,8 @@ public sealed partial class MainWindow : Window
             }
             if (!string.IsNullOrEmpty(QueryBox.Text))
             {
+                // 清空会触发 OnQueryChanged → ScheduleRefresh，不需要再手动刷
                 QueryBox.Text = "";
-                _ = RefreshResultsAsync("");
                 return;
             }
             HideLauncher();
@@ -2581,6 +2808,12 @@ public sealed partial class MainWindow : Window
     [DllImport("imm32.dll")]
     private static extern bool ImmNotifyIME(IntPtr hIMC, uint dwAction, uint dwIndex, uint dwValue);
 
+    [DllImport("imm32.dll")]
+    private static extern bool ImmSetOpenStatus(IntPtr hIMC, bool fOpen);
+
+    [DllImport("imm32.dll")]
+    private static extern IntPtr ImmAssociateContext(IntPtr hWnd, IntPtr hIMC);
+
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
@@ -2610,6 +2843,26 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    // 窗口子类（标题栏双击防最大化，见 NoMaximizeWndProc）
+    private const uint WM_NCLBUTTONDBLCLK = 0x00A3;
+    private const int HTCAPTION = 2;
+    private const uint CaptionSubclassId = 101;
+
+    private delegate IntPtr SUBCLASSPROC(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam,
+        IntPtr uIdSubclass, IntPtr dwRefData);
+
+    [DllImport("comctl32.dll")]
+    private static extern bool SetWindowSubclass(IntPtr hWnd, SUBCLASSPROC pfnSubclass,
+        UIntPtr uIdSubclass, IntPtr dwRefData);
+
+    [DllImport("comctl32.dll")]
+    private static extern bool RemoveWindowSubclass(IntPtr hWnd, SUBCLASSPROC pfnSubclass,
+        UIntPtr uIdSubclass);
+
+    [DllImport("comctl32.dll")]
+    private static extern IntPtr DefSubclassProc(IntPtr hWnd, uint uMsg, IntPtr wParam,
+        IntPtr lParam, IntPtr uIdSubclass, IntPtr dwRefData);
 
     private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
         int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);

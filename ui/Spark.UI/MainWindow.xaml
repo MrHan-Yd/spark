@@ -9,9 +9,9 @@
   <!-- 对齐 ui-prototype 主弹窗：颜色收成 Root.Resources 画刷，主题切换由代码改 Color（深/浅/跟随系统） -->
   <!-- 圆角：DWM 按系统设置裁窗口圆角（默认 ~8px，实测本机约 5px，不能按窗口单独调大；DeviceCornerRadius=On 时更大）。
        WinCornerRadius 必须与 DWM 弧线重合：XAML 圆角比 DWM 大（或小）时，两弧之间的楔形区会露出
-       Root 的壁纸基底（近黑 #0D1220）——这就是四角的"黑贴片"。圆角外的楔形区属于窗口外、显示桌面背景 -->
-  <!-- 背景：Root 铺壁纸基底渐变（不透明，铺满整个矩形，DWM 负责裁圆角；ApplyTheme 里赋 WpBaseBrush 实例）→
-       弹出动画期间窗口底层是壁纸色，不会先露出黑色；壁纸色斑/玻璃在 ContentClip 内叠加 -->
+       Root 底色——这就是四角的"贴片"。圆角外的楔形区属于窗口外、显示桌面背景 -->
+  <!-- 背景：系统 Acrylic 真玻璃（DWM 模糊 + 半透明 tint，透出桌面壁纸，macOS vibrancy 同构）。
+       Root 背景透明；系统禁用透明效果/环境不支持时回退纯色（ApplyTheme 里赋 _windowBg）。 -->
   <Grid x:Name="Root">
     <Grid.Resources>
       <!-- 主题画刷（值取自 ui-prototype/styles.css 变量，alpha 已转 ARGB） -->
@@ -54,30 +54,8 @@
       </ControlTemplate>
       <!-- 窗口圆角：与 DWM 实际裁剪半径一致（见文件头注释），ContentClip/高光/描边三处共用 -->
       <CornerRadius x:Key="WinCornerRadius">5</CornerRadius>
-      <RadialGradientBrush x:Key="WpSpotTL" GradientOrigin="0.2,0.3" Center="0.2,0.3" RadiusX="0.95" RadiusY="0.75">
-        <GradientStop Offset="0" Color="#2E5AA6"/>
-        <GradientStop Offset="0.65" Color="#002E5AA6"/>
-      </RadialGradientBrush>
-      <!-- 壁纸基底渐变（对齐 .desktop-wallpaper 深色基底；浅色由代码切） -->
-      <LinearGradientBrush x:Key="WpBaseBrush" StartPoint="0,0" EndPoint="1,1">
-        <GradientStop Offset="0" Color="#0D1220"/>
-        <GradientStop Offset="0.4" Color="#162033"/>
-        <GradientStop Offset="1" Color="#0F1A28"/>
-      </LinearGradientBrush>
-      <RadialGradientBrush x:Key="WpSpotTR" GradientOrigin="0.8,0.2" Center="0.8,0.2" RadiusX="0.85" RadiusY="0.65">
-        <GradientStop Offset="0" Color="#7C2F98"/>
-        <GradientStop Offset="0.6" Color="#007C2F98"/>
-      </RadialGradientBrush>
-      <RadialGradientBrush x:Key="WpSpotBR" GradientOrigin="0.6,0.8" Center="0.6,0.8" RadiusX="0.75" RadiusY="0.55">
-        <GradientStop Offset="0" Color="#1A7050"/>
-        <GradientStop Offset="0.55" Color="#001A7050"/>
-      </RadialGradientBrush>
-      <RadialGradientBrush x:Key="WpSpotBL" GradientOrigin="0.1,0.9" Center="0.1,0.9" RadiusX="0.7" RadiusY="0.7">
-        <GradientStop Offset="0" Color="#5F3696"/>
-        <GradientStop Offset="0.55" Color="#005F3696"/>
-      </RadialGradientBrush>
-      <!-- 玻璃叠加：38% 底（比原型 55% 更透，壁纸色斑透过玻璃仍可见，观感对齐 glass-bg + 壁纸的层次） -->
-      <SolidColorBrush x:Key="GlassOverlayBrush" Color="#611C1C1E"/>
+      <!-- 模态卡片底（新建分组/删除确认）：深色近黑、浅色近白，由 ApplyTheme 切换 -->
+      <SolidColorBrush x:Key="ModalCardBrush" Color="#F21C1C1E"/>
 
       <!-- 列表/平铺选中态：对齐 .result-item.active（accent-soft 圆角蓝） -->
       <SolidColorBrush x:Key="ListViewItemBackgroundPointerOver" Color="#14FFFFFF"/>
@@ -114,7 +92,16 @@
         <Setter Property="FontSize" Value="13"/>
       </Style>
 
-      <!-- 设置页下拉框：对齐 chip 玻璃风（默认模板的系统灰底/方角与整体不搭） -->
+      <!-- 下拉弹出层基底：半透明玻璃（透出壁纸色斑，别太黑）；深/浅色由 ApplyTheme 切换 -->
+      <SolidColorBrush x:Key="ComboPopupBgBrush" Color="#C01C1C1E"/>
+
+      <!-- 设置页下拉框：整模板自绘对齐 chip 玻璃风。
+           只设属性不够——默认模板的悬停/按下会用系统灰底覆盖样式、弹出层是不透明系统列表
+           （方角、灰色 hover、白色选中、字号不继承），与整体不搭。
+           命名部件与默认模板保持一致（LayoutRoot/Background/ContentPresenter/DropDownGlyph/
+           Popup/PopupBorder/ScrollViewer/ItemsPresenter）：ComboBox 代码按名取部件，
+           弹出层子结构必须是 Popup > Border(PopupBorder) > ScrollViewer > ItemsPresenter，
+           PopupBorder.Margin.Top 会被并入弹出位置偏移（0,4 = 闭合框下方留 4px 缝） -->
       <Style x:Key="ComboStyle" TargetType="ComboBox">
         <Setter Property="Background" Value="{StaticResource ChipBgBrush}"/>
         <Setter Property="BorderBrush" Value="{StaticResource GlassBorderBrush}"/>
@@ -123,6 +110,234 @@
         <Setter Property="Padding" Value="10,5"/>
         <Setter Property="FontSize" Value="12"/>
         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+        <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="MaxDropDownHeight" Value="280"/>
+        <Setter Property="ItemContainerStyle" Value="{StaticResource ComboItemStyle}"/>
+        <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+        <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto"/>
+        <Setter Property="ScrollViewer.HorizontalScrollMode" Value="Disabled"/>
+        <Setter Property="ScrollViewer.VerticalScrollMode" Value="Auto"/>
+        <Setter Property="ScrollViewer.IsVerticalRailEnabled" Value="True"/>
+        <Setter Property="ScrollViewer.BringIntoViewOnFocusChange" Value="True"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ComboBox">
+              <Grid x:Name="LayoutRoot">
+                <Grid.Resources>
+                  <!-- 代码按 key 从 LayoutRoot.Resources 取这两个 Storyboard 做遮罩淡入/淡出（缺了只是无过渡）；
+                       硬编码时长避免依赖主题资源 -->
+                  <Storyboard x:Key="OverlayOpeningAnimation">
+                    <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="Opacity">
+                      <DiscreteDoubleKeyFrame KeyTime="0:0:0" Value="0"/>
+                      <SplineDoubleKeyFrame KeyTime="0:0:0.167" KeySpline="0.33,0,0.67,1" Value="1"/>
+                    </DoubleAnimationUsingKeyFrames>
+                  </Storyboard>
+                  <Storyboard x:Key="OverlayClosingAnimation">
+                    <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="Opacity">
+                      <DiscreteDoubleKeyFrame KeyTime="0:0:0" Value="1"/>
+                      <SplineDoubleKeyFrame KeyTime="0:0:0.083" KeySpline="0.33,0,0.67,1" Value="0"/>
+                    </DoubleAnimationUsingKeyFrames>
+                  </Storyboard>
+                </Grid.Resources>
+                <VisualStateManager.VisualStateGroups>
+                  <!-- 悬停/按下对齐 chip 交互（RowHover 提亮、AccentSoft 按压），不画系统灰底 -->
+                  <VisualStateGroup x:Name="CommonStates">
+                    <VisualState x:Name="Normal"/>
+                    <VisualState x:Name="PointerOver">
+                      <VisualState.Setters>
+                        <Setter Target="Background.Background" Value="{StaticResource RowHoverBrush}"/>
+                        <Setter Target="Background.BorderBrush" Value="{StaticResource GridTileSelBorderBrush}"/>
+                        <Setter Target="DropDownGlyph.Stroke" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Pressed">
+                      <VisualState.Setters>
+                        <Setter Target="Background.Background" Value="{StaticResource AccentSoftBrush}"/>
+                        <Setter Target="DropDownGlyph.Stroke" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Disabled">
+                      <VisualState.Setters>
+                        <Setter Target="Background.Opacity" Value="0.5"/>
+                        <Setter Target="DropDownGlyph.Opacity" Value="0.5"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                  </VisualStateGroup>
+                  <!-- 聚焦不画系统高亮胶囊（默认 Focused 会叠 HighlightBackground/Pill），保持 chip 原样；
+                       键盘焦点圈由 Background 上 Control.IsTemplateFocusTarget 的系统焦点视觉提供 -->
+                  <VisualStateGroup x:Name="FocusStates">
+                    <VisualState x:Name="Focused"/>
+                    <VisualState x:Name="FocusedPressed"/>
+                    <VisualState x:Name="Unfocused"/>
+                    <VisualState x:Name="PointerFocused"/>
+                    <VisualState x:Name="FocusedDropDown">
+                      <VisualState.Setters>
+                        <Setter Target="PopupBorder.Visibility" Value="Visible"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                  </VisualStateGroup>
+                  <VisualStateGroup x:Name="DropDownStates">
+                    <VisualState x:Name="Opened">
+                      <Storyboard>
+                        <SplitOpenThemeAnimation OpenedTargetName="PopupBorder"
+                            ClosedTargetName="ContentPresenter"
+                            OffsetFromCenter="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TemplateSettings.DropDownOffset}"
+                            OpenedLength="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TemplateSettings.DropDownOpenedHeight}"/>
+                      </Storyboard>
+                    </VisualState>
+                    <VisualState x:Name="Closed">
+                      <Storyboard>
+                        <SplitCloseThemeAnimation OpenedTargetName="PopupBorder"
+                            ClosedTargetName="ContentPresenter"
+                            OffsetFromCenter="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TemplateSettings.DropDownOffset}"
+                            OpenedLength="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TemplateSettings.DropDownOpenedHeight}"/>
+                      </Storyboard>
+                    </VisualState>
+                  </VisualStateGroup>
+                </VisualStateManager.VisualStateGroups>
+
+                <Border x:Name="Background" Control.IsTemplateFocusTarget="True"
+                        Background="{TemplateBinding Background}"
+                        BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="{TemplateBinding BorderThickness}"
+                        CornerRadius="{TemplateBinding CornerRadius}">
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="36"/>
+                    </Grid.ColumnDefinitions>
+                    <!-- 选中项由 ComboBox 代码直接塞进 ContentPresenter.Content（SelectionBoxItem），模板不绑 Content -->
+                    <ContentPresenter x:Name="ContentPresenter"
+                                      Foreground="{TemplateBinding Foreground}"
+                                      Margin="{TemplateBinding Padding}"
+                                      HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}">
+                      <TextBlock x:Name="PlaceholderTextBlock" Text="{TemplateBinding PlaceholderText}"
+                                 Foreground="{StaticResource TextTertiaryBrush}"/>
+                    </ContentPresenter>
+                    <!-- 描边箭头（对齐设置页其他图标风格） -->
+                    <Path x:Name="DropDownGlyph" Grid.Column="1"
+                          Data="M 3 5.5 L 8 10.5 L 13 5.5"
+                          Stroke="{StaticResource TextSecondaryBrush}" StrokeThickness="1.6"
+                          StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                          Width="16" Height="16" VerticalAlignment="Center" HorizontalAlignment="Right"
+                          Margin="0,0,11,0" IsHitTestVisible="False"
+                          AutomationProperties.AccessibilityView="Raw"/>
+                  </Grid>
+                </Border>
+
+                <Popup x:Name="Popup">
+                  <!-- Margin.Top 会被控件代码并入弹出层垂直偏移（ArrangePopup 里 verticalOffset = popupTop + borderMargin.Top）。
+                       保持小值：弹出层维持默认"选中项对齐选择框中心"的布局 -->
+                  <Border x:Name="PopupBorder"
+                          Background="{StaticResource ComboPopupBgBrush}" BackgroundSizing="InnerBorderEdge"
+                          BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"
+                          CornerRadius="8" Margin="0,4,0,0" Padding="4"
+                          HorizontalAlignment="Stretch">
+                    <ScrollViewer x:Name="ScrollViewer"
+                                  MinWidth="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TemplateSettings.DropDownContentMinWidth}"
+                                  VerticalSnapPointsType="OptionalSingle" VerticalSnapPointsAlignment="Near"
+                                  HorizontalScrollMode="{TemplateBinding ScrollViewer.HorizontalScrollMode}"
+                                  HorizontalScrollBarVisibility="{TemplateBinding ScrollViewer.HorizontalScrollBarVisibility}"
+                                  VerticalScrollMode="{TemplateBinding ScrollViewer.VerticalScrollMode}"
+                                  VerticalScrollBarVisibility="{TemplateBinding ScrollViewer.VerticalScrollBarVisibility}"
+                                  IsHorizontalRailEnabled="{TemplateBinding ScrollViewer.IsHorizontalRailEnabled}"
+                                  IsVerticalRailEnabled="{TemplateBinding ScrollViewer.IsVerticalRailEnabled}"
+                                  IsDeferredScrollingEnabled="{TemplateBinding ScrollViewer.IsDeferredScrollingEnabled}"
+                                  BringIntoViewOnFocusChange="{TemplateBinding ScrollViewer.BringIntoViewOnFocusChange}"
+                                  ZoomMode="Disabled"
+                                  AutomationProperties.AccessibilityView="Raw">
+                      <ItemsPresenter x:Name="ItemsPresenter"/>
+                    </ScrollViewer>
+                  </Border>
+                </Popup>
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
+
+      <!-- 下拉项：悬停/选中对齐结果列表（RowHover 提亮、RowActive accent-soft 圆角底）。
+           Popup 是独立窗口根，字号/前景不继承 ComboBox，需显式定 -->
+      <Style x:Key="ComboItemStyle" TargetType="ComboBoxItem">
+        <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Padding" Value="10,6"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="CornerRadius" Value="6"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ComboBoxItem">
+              <Grid x:Name="LayoutRoot" Margin="0,1" CornerRadius="{TemplateBinding CornerRadius}"
+                    Background="{TemplateBinding Background}" Control.IsTemplateFocusTarget="True">
+                <VisualStateManager.VisualStateGroups>
+                  <VisualStateGroup x:Name="CommonStates">
+                    <VisualState x:Name="Normal"/>
+                    <VisualState x:Name="PointerOver">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Background" Value="{StaticResource RowHoverBrush}"/>
+                        <Setter Target="ContentPresenter.Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Pressed">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Background" Value="{StaticResource RowActiveBrush}"/>
+                        <Setter Target="ContentPresenter.Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Disabled">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Opacity" Value="0.5"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Selected">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Background" Value="{StaticResource RowActiveBrush}"/>
+                        <Setter Target="ContentPresenter.Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="SelectedUnfocused">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Background" Value="{StaticResource RowActiveBrush}"/>
+                        <Setter Target="ContentPresenter.Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="SelectedDisabled">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Opacity" Value="0.5"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="SelectedPointerOver">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Background" Value="{StaticResource RowActiveStrongBrush}"/>
+                        <Setter Target="ContentPresenter.Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="SelectedPressed">
+                      <VisualState.Setters>
+                        <Setter Target="LayoutRoot.Background" Value="{StaticResource RowActiveStrongBrush}"/>
+                        <Setter Target="ContentPresenter.Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+                      </VisualState.Setters>
+                    </VisualState>
+                  </VisualStateGroup>
+                  <VisualStateGroup x:Name="InputModeStates">
+                    <VisualState x:Name="InputModeDefault"/>
+                    <VisualState x:Name="TouchInputMode"/>
+                    <VisualState x:Name="GameControllerInputMode"/>
+                  </VisualStateGroup>
+                </VisualStateManager.VisualStateGroups>
+                <ContentPresenter x:Name="ContentPresenter"
+                                  Content="{TemplateBinding Content}"
+                                  ContentTemplate="{TemplateBinding ContentTemplate}"
+                                  Foreground="{TemplateBinding Foreground}"
+                                  HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                  VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                  Margin="{TemplateBinding Padding}"/>
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
       </Style>
 
       <Style x:Key="PresetStyle" TargetType="Button">
@@ -184,17 +399,10 @@
       </Style>
     </Grid.Resources>
 
-    <!-- ========== 内容层（含壁纸色斑/玻璃）：CornerRadius = WinCornerRadius，与 DWM 弧线重合 ==========
-         壁纸基底由 Root 提供（不透明，动画期间不露黑）；这里只叠色斑 + 玻璃，
-         圆角外的楔形区没有任何内容，属于窗口外、显示桌面背景（白底=白、黑底=黑） -->
+    <!-- ========== 内容层：CornerRadius = WinCornerRadius，与 DWM 弧线重合 ==========
+         背景由系统 Acrylic 提供（DWM 裁圆角），这里不再画任何壁纸/色斑；
+         圆角外的楔形区没有任何内容，属于窗口外、显示桌面背景 -->
     <Grid x:Name="ContentClip" CornerRadius="{StaticResource WinCornerRadius}">
-      <Grid x:Name="Wallpaper" IsHitTestVisible="False">
-        <Border Background="{StaticResource WpSpotTL}"/>
-        <Border Background="{StaticResource WpSpotTR}"/>
-        <Border Background="{StaticResource WpSpotBR}"/>
-        <Border Background="{StaticResource WpSpotBL}"/>
-      </Grid>
-      <Border x:Name="GlassOverlay" IsHitTestVisible="False" Background="{StaticResource GlassOverlayBrush}"/>
 
     <!-- ========== 搜索模式 ========== -->
     <Grid x:Name="MainPanel" RenderTransformOrigin="0.5,0.5">
@@ -577,12 +785,6 @@
                   <TextBlock Text="通用"/>
                 </StackPanel>
               </Button>
-              <Button x:Name="NavHotkey" Tag="hotkey" Style="{StaticResource NavItemStyle}" Click="OnSettingsNav">
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                  <FontIcon x:Name="NavIconHotkey" Glyph="&#xE765;" FontSize="14"/>
-                  <TextBlock Text="热键"/>
-                </StackPanel>
-              </Button>
               <Button x:Name="NavAppearance" Tag="appearance" Style="{StaticResource NavItemStyle}" Click="OnSettingsNav">
                 <StackPanel Orientation="Horizontal" Spacing="8">
                   <FontIcon x:Name="NavIconAppearance" Glyph="&#xE790;" FontSize="14"/>
@@ -593,6 +795,12 @@
                 <StackPanel Orientation="Horizontal" Spacing="8">
                   <FontIcon x:Name="NavIconPlugins" Glyph="&#xE712;" FontSize="14"/>
                   <TextBlock Text="插件"/>
+                </StackPanel>
+              </Button>
+              <Button x:Name="NavAbout" Tag="about" Style="{StaticResource NavItemStyle}" Click="OnSettingsNav">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                  <FontIcon x:Name="NavIconAbout" Glyph="&#xE946;" FontSize="14"/>
+                  <TextBlock Text="关于"/>
                 </StackPanel>
               </Button>
             </StackPanel>
@@ -647,29 +855,24 @@
                   <ToggleButton x:Name="HideInvokeSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Checked="OnToggleHideInvoke" Unchecked="OnToggleHideInvoke"/>
                 </Grid>
               </Border>
-              <TextBlock Text="系统托盘图标在任务栏通知区域（正式版），不在本窗口内。" FontSize="12"
-                         Foreground="{StaticResource TextSecondaryBrush}" Margin="0,14,0,0"
-                         TextWrapping="Wrap" LineHeight="18"/>
-            </StackPanel>
-
-            <!-- 热键 -->
-            <StackPanel x:Name="PaneHotkey" Visibility="Collapsed" RenderTransformOrigin="0.5,0.5">
-              <StackPanel.RenderTransform>
-                <TranslateTransform x:Name="PaneHotkeyShift"/>
-              </StackPanel.RenderTransform>
-              <TextBlock Text="唤起热键" FontSize="13" FontWeight="SemiBold"
-                         Foreground="{StaticResource TextPrimaryBrush}"/>
-              <TextBlock Text="触发主窗口显示/隐藏的组合键" FontSize="12"
-                         Foreground="{StaticResource TextTertiaryBrush}" Margin="0,4,0,0"/>
-              <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,14,0,0">
-                <Button x:Name="BtnHotkeyAlt" Content="Alt + Space" Tag="Alt+Space"
-                        Click="OnHotkeyPreset" Style="{StaticResource PresetStyle}"/>
-                <Button x:Name="BtnHotkeyCtrl" Content="Ctrl + Space" Tag="Ctrl+Space"
-                        Click="OnHotkeyPreset" Style="{StaticResource PresetStyle}"/>
-              </StackPanel>
-              <TextBlock Text="默认 Alt+Space；冲突时可改 Ctrl+Space。" FontSize="12"
-                         Foreground="{StaticResource TextSecondaryBrush}" Margin="0,12,0,0"
-                         TextWrapping="Wrap" LineHeight="18"/>
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Spacing="3">
+                    <TextBlock Text="唤起热键" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
+                    <TextBlock Text="触发主窗口显示/隐藏的组合键（默认 Alt+Space）" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"/>
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                    <Button x:Name="BtnHotkeyAlt" Content="Alt + Space" Tag="Alt+Space"
+                            Click="OnHotkeyPreset" Style="{StaticResource PresetStyle}"/>
+                    <Button x:Name="BtnHotkeyCtrl" Content="Ctrl + Space" Tag="Ctrl+Space"
+                            Click="OnHotkeyPreset" Style="{StaticResource PresetStyle}"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
             </StackPanel>
 
             <!-- 外观 -->
@@ -719,19 +922,6 @@
                 <Slider x:Name="WidthSlider" Minimum="560" Maximum="840" StepFrequency="10"
                         ValueChanged="OnWidthChanged" Margin="0,6,0,0"/>
               </StackPanel>
-              <Border Style="{StaticResource PaneRowBorder}">
-                <Grid ColumnSpacing="16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                  </Grid.ColumnDefinitions>
-                  <StackPanel Spacing="3">
-                    <TextBlock Text="减少动画" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <TextBlock Text="关闭窗口过渡与列表动画" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"/>
-                  </StackPanel>
-                  <ToggleButton x:Name="ReduceMotionSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Checked="OnToggleReduceMotion" Unchecked="OnToggleReduceMotion"/>
-                </Grid>
-              </Border>
             </StackPanel>
 
             <!-- 插件 -->
@@ -739,38 +929,82 @@
               <StackPanel.RenderTransform>
                 <TranslateTransform x:Name="PanePluginsShift"/>
               </StackPanel.RenderTransform>
-              <Border Style="{StaticResource PaneRowBorder}">
-                <Grid ColumnSpacing="16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                  </Grid.ColumnDefinitions>
-                  <StackPanel>
-                    <TextBlock Text="Echo" FontSize="13" FontWeight="Medium" Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <TextBlock Text="com.example.echo" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,2,0,0"/>
-                  </StackPanel>
-                  <ToggleButton x:Name="EchoSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" IsChecked="True"/>
-                </Grid>
-              </Border>
-              <Border Style="{StaticResource PaneRowBorder}">
-                <Grid ColumnSpacing="16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                  </Grid.ColumnDefinitions>
-                  <StackPanel>
-                    <TextBlock Text="JSON 格式化" FontSize="13" FontWeight="Medium" Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <TextBlock Text="需剪贴板权限" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,2,0,0"/>
-                  </StackPanel>
-                  <ToggleButton x:Name="JsonSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" IsChecked="True"/>
-                </Grid>
-              </Border>
-              <Button Content="安装本地插件…" Click="OnInstallPlugin" Margin="0,16,0,0" Padding="12,7"
-                      Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
-                      BorderThickness="1" CornerRadius="8" FontSize="13"
-                      Foreground="{StaticResource TextPrimaryBrush}"/>
-              <TextBlock x:Name="PluginStatus" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
-                         Margin="0,12,0,0" TextWrapping="Wrap" LineHeight="18"/>
+              <!-- 插件功能尚未实现：空态整体垂直居中（对齐关于页），只保留安装入口占位 -->
+              <Grid MinHeight="480">
+                <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="6">
+                  <FontIcon Glyph="&#xE712;" FontSize="26"
+                            Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+                  <TextBlock Text="暂无插件" FontSize="14" Foreground="{StaticResource TextSecondaryBrush}"
+                             HorizontalAlignment="Center"/>
+                  <TextBlock Text="插件功能开发中，敬请期待" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"
+                             HorizontalAlignment="Center"/>
+                  <Button Content="安装本地插件…" Click="OnInstallPlugin" Margin="0,12,0,0" Padding="12,7"
+                          Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                          BorderThickness="1" CornerRadius="8" FontSize="13"
+                          Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center"/>
+                  <TextBlock x:Name="PluginStatus" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                             Margin="0,10,0,0" TextWrapping="Wrap" LineHeight="18"
+                             HorizontalAlignment="Center" TextAlignment="Center"/>
+                </StackPanel>
+              </Grid>
+            </StackPanel>
+
+            <!-- 关于 -->
+            <StackPanel x:Name="PaneAbout" Visibility="Collapsed" RenderTransformOrigin="0.5,0.5">
+              <StackPanel.RenderTransform>
+                <TranslateTransform x:Name="PaneAboutShift"/>
+              </StackPanel.RenderTransform>
+              <!-- 内容整体垂直居中：MinHeight 撑满可视区，避免头重脚轻 -->
+              <Grid MinHeight="480">
+                <StackPanel VerticalAlignment="Center">
+
+              <!-- 应用信息（紧凑 hero） -->
+              <StackPanel HorizontalAlignment="Center" Spacing="0" Margin="0,6,0,0">
+                <Border Width="60" Height="60" CornerRadius="15" Padding="6"
+                        Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                        BorderThickness="1" HorizontalAlignment="Center">
+                  <Image Source="Assets/spark.png" Stretch="Uniform"/>
+                </Border>
+                <TextBlock Text="Spark" FontSize="22" FontWeight="SemiBold"
+                           Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center" Margin="0,10,0,0"/>
+                <TextBlock x:Name="AboutVersionText" FontSize="12"
+                           Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center" Margin="0,2,0,0"/>
+              </StackPanel>
+
+              <!-- 简介 -->
+              <TextBlock Text="本地优先的极速启动器：搜索应用、文件与命令，支持插件扩展。"
+                         FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                         TextWrapping="Wrap" TextAlignment="Center" LineHeight="18"
+                         MaxWidth="340" HorizontalAlignment="Center" Margin="0,18,0,0"/>
+
+              <!-- 检查更新 + 仓库地址（一行两个轻量链接） -->
+              <StackPanel HorizontalAlignment="Center" Spacing="8" Margin="0,22,0,0">
+                <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Center">
+                  <Button x:Name="BtnCheckUpdate" Click="OnCheckUpdate" Background="Transparent" BorderThickness="0"
+                          Padding="6,3" CornerRadius="6" FontSize="12" Foreground="{StaticResource AccentBrush}">
+                    <StackPanel Orientation="Horizontal" Spacing="5">
+                      <FontIcon Glyph="&#xE72C;" FontSize="12" Foreground="{StaticResource AccentBrush}"/>
+                      <TextBlock x:Name="CheckUpdateLabel" Text="检查更新" Foreground="{StaticResource AccentBrush}"/>
+                    </StackPanel>
+                  </Button>
+                  <Button x:Name="BtnOpenRelease" Content="打开下载页" Click="OnOpenRelease"
+                          Background="Transparent" BorderThickness="0" Padding="6,3" CornerRadius="6"
+                          FontSize="12" Foreground="{StaticResource AccentBrush}" Visibility="Collapsed"/>
+                  <TextBlock Text="·" FontSize="12" Foreground="{StaticResource TextTertiaryBrush}"
+                             VerticalAlignment="Center"/>
+                  <Button Content="GitHub 仓库" Click="OnOpenGithub" Background="Transparent" BorderThickness="0"
+                          Padding="6,3" CornerRadius="6" FontSize="12" Foreground="{StaticResource AccentBrush}"/>
+                </StackPanel>
+                <TextBlock x:Name="AboutUpdateStatus" FontSize="12" Foreground="{StaticResource TextTertiaryBrush}"
+                           HorizontalAlignment="Center"/>
+              </StackPanel>
+
+              <!-- 技术栈 -->
+              <TextBlock Text="Rust + WinUI 3 · MIT License" FontSize="12"
+                         Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center" Margin="0,14,0,0"/>
+
+                </StackPanel>
+              </Grid>
             </StackPanel>
 
           </StackPanel>
@@ -782,7 +1016,7 @@
     <Grid x:Name="FavGroupPanel" Visibility="Collapsed" Background="#66000000"
           Tapped="OnFavGroupScrimTapped">
       <Border x:Name="FavGroupCard" Width="300" HorizontalAlignment="Center" VerticalAlignment="Center"
-              Background="#F21C1C1E" BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"
+              Background="{StaticResource ModalCardBrush}" BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"
               CornerRadius="14" Padding="18,16" Tapped="OnFavGroupCardTapped">
         <Border.RenderTransform>
           <!-- 入场动画：淡入 + 上浮放大（与窗口 pop-in 同款曲线，减少动画时跳过） -->
@@ -820,7 +1054,7 @@
     <Grid x:Name="FavConfirmPanel" Visibility="Collapsed" Background="#66000000"
           KeyDown="OnFavConfirmKeyDown" Tapped="OnFavConfirmScrimTapped">
       <Border x:Name="FavConfirmCard" Width="300" HorizontalAlignment="Center" VerticalAlignment="Center"
-              Background="#F21C1C1E" BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"
+              Background="{StaticResource ModalCardBrush}" BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"
               CornerRadius="14" Padding="18,16" Tapped="OnFavConfirmCardTapped">
         <Border.RenderTransform>
           <TransformGroup>

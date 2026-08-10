@@ -66,4 +66,17 @@ public partial class App : Application
         }
         catch { }
     }
+
+    internal static void Log(string tag, string msg)
+    {
+        try
+        {
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Spark", "ui-crash.log");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.AppendAllText(path, $"[{DateTime.Now:O}] {tag}\n{msg}\n\n");
+        }
+        catch { }
+    }
 }
