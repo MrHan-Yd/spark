@@ -1020,12 +1020,12 @@ public sealed partial class MainWindow : Window
                 Template = (ControlTemplate)Root.Resources["FavCardTemplate"],
                 Tag = c.Id
             };
-            // 无默认边框/底色；悬停与键盘选中（光标）复用结果列表的 hover/active 样式
+            // 无默认边框/底色；悬停与键盘选中（光标）复用上方平铺卡片的白色选中样式
             btn.PointerEntered += (_, _) =>
             {
-                var hover = (Brush)Root.Resources["RowHoverBrush"];
-                btn.Background = hover;
-                btn.BorderBrush = hover;
+                var res = Root.Resources;
+                btn.Background = (Brush)res["GridTileSelBgBrush"];
+                btn.BorderBrush = (Brush)res["GridTileSelBorderBrush"];
             };
             btn.PointerExited += (_, _) => UpdateFavCardStates();
             ToolTipService.SetToolTip(btn, title);
@@ -1847,14 +1847,17 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>收藏卡片选中态：与结果列表一致——选中用 RowActiveBrush（底+边框），
+    /// <summary>收藏卡片选中态：与上方平铺卡片一致——中性白底 + 白边（不用蓝色），
     /// 未选中全透明（默认无边框，光标移上去才有）。</summary>
     private void SetFavCardState(Button b, bool selected)
     {
         var res = Root.Resources;
-        var brush = selected ? (Brush)res["RowActiveBrush"] : new SolidColorBrush(Colors.Transparent);
-        b.Background = brush;
-        b.BorderBrush = brush;
+        b.Background = selected
+            ? (Brush)res["GridTileSelBgBrush"]
+            : new SolidColorBrush(Colors.Transparent);
+        b.BorderBrush = selected
+            ? (Brush)res["GridTileSelBorderBrush"]
+            : new SolidColorBrush(Colors.Transparent);
     }
 
     /// <summary>焦点是否落在收藏坞（或其按钮）内；是则箭头键交给原生方向键导航。</summary>
