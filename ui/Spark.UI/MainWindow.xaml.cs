@@ -181,7 +181,14 @@ public sealed partial class MainWindow : Window
                 if (Environment.TickCount64 < _ignoreDeactivateUntilTicks)
                     return;
                 if (_hideOnDeactivate && _visible && SettingsPanel.Visibility != Visibility.Visible)
+                {
                     HideLauncher();
+                    App.Log("Focus", "deactivated -> hide");
+                }
+                else
+                {
+                    App.Log("Focus", $"deactivated skipped: hideOnDeactivate={_hideOnDeactivate} visible={_visible}");
+                }
                 return;
             }
             QueryBox.Focus(FocusState.Pointer);
@@ -655,6 +662,7 @@ public sealed partial class MainWindow : Window
             if (Environment.TickCount64 < _ignoreDeactivateUntilTicks) return;
             if (!_hideOnDeactivate || SettingsPanel.Visibility == Visibility.Visible) return;
             HideLauncher();
+            App.Log("Focus", $"fg hook -> hide (fg=0x{hwnd.ToInt64():X})");
         });
     }
 
@@ -872,14 +880,21 @@ public sealed partial class MainWindow : Window
         catch { /* ignore */ }
     }
 
-    /// <summary>显示后延迟重试抢前台，直到窗口确实处于前台或状态变化。</summary>
+    /// <summary>显示后延迟重试抢前台，直到窗口确实处于前台或状态变化。
+    /// 必须拿到前台：未激活的窗口点击外面时前台无变化，FgHook/Deactivated 都不触发，
+    /// "点击外面隐藏"会失效（用户实测：唤起未抢到前台时点外面关不掉）。</summary>
     private async Task RetryFocusAsync()
     {
-        for (var i = 0; i < 3; i++)
+        for (var i = 0; i < 5; i++)
         {
             await Task.Delay(120);
             if (!_visible || _hwnd == IntPtr.Zero)
                 return;
+            if (GetForegroundWindow() != _hwnd)
+            {
+                ForceForeground();
+                Activate();
+            }
             // 每次重试都补一次输入框聚焦：窗口刚弹出时首次 Focus 可能被动画/抢前台
             // 吃掉，TextBox 拿不到焦点时输入法上下文不会挂上（中文模式直接打出英文）。
             // 用 Pointer 状态 + IME 重建：程序化聚焦在 Show/Hide 循环后不重建
@@ -888,7 +903,6 @@ public sealed partial class MainWindow : Window
             ResetIme();
             if (GetForegroundWindow() == _hwnd)
                 return;
-            ForceForeground();
         }
     }
 
@@ -906,9 +920,15 @@ public sealed partial class MainWindow : Window
     {
         // 保护期内禁止隐藏（防闪关）
         if (!byToggle && Environment.TickCount64 < _ignoreDeactivateUntilTicks && _visible)
+        {
+            App.Log("Focus", $"hide blocked by guard ({_ignoreDeactivateUntilTicks - Environment.TickCount64}ms left)");
             return;
+        }
         if (!_visible)
+        {
+            App.Log("Focus", "hide skipped: !_visible");
             return;
+        }
 
         // pop-out（对齐原型 .launcher.closing），完成后才真正隐藏
         _hideAnimating = true;
@@ -982,6 +1002,15 @@ public sealed partial class MainWindow : Window
             SetWindowPos(_hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002); // HWND_TOPMOST
             SetWindowPos(_hwnd, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002); // HWND_NOTOPMOST
             // 保持 AlwaysOnTop 由 OverlappedPresenter 管；这里只是抢焦点
+
+            // 验证是否真的拿到前台；失败快速重试（AttachThreadInput 生效后通常一次成功，
+            // 偶发被前台锁拒绝时补几次。拿不到前台 = 窗口未激活：点击外面时前台无变化，
+            // FgHook/Deactivated 都不触发，窗口无法靠"点击外面"隐藏）
+            for (var i = 0; i < 3 && GetForegroundWindow() != _hwnd; i++)
+            {
+                Thread.Sleep(10);
+                SetForegroundWindow(_hwnd);
+            }
 
             if (fgTid != curTid)
                 AttachThreadInput(fgTid, curTid, false);
