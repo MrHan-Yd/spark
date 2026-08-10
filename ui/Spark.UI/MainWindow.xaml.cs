@@ -5,6 +5,7 @@ using Microsoft.UI.Text;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Data;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
@@ -68,6 +69,11 @@ public sealed partial class MainWindow : Window
     /// <summary>列表/平铺切换动画；_viewAnimGen 让旧动画的 Completed 回调失配（快速连续切换不误折叠面板）。</summary>
     private Storyboard? _viewAnim;
     private int _viewAnimGen;
+    /// <summary>主界面 ↔ 设置页切换动画（对齐原型 mode-leave-left/right + mode-enter-from-left/right）：
+    /// 打开 = 主页左滑淡出 + 设置页从右滑入；关闭 = 反向。交叉过渡（两个面板同时动）。
+    /// _modeAnimating 防动画中重复触发（220ms 内连点/连按 Esc 忽略）。</summary>
+    private Storyboard _modeOutMain = new(), _modeInMain = new(), _modeOutSet = new(), _modeInSet = new();
+    private bool _modeAnimating;
     /// <summary>收藏坞抽屉动画：布局高度在每渲染帧（CompositionTarget.Rendering）手动驱动——
     /// WinUI 3 的 Storyboard DoubleAnimation 对 Height 这类布局属性不渲染中间帧（实测零中间态），
     /// 普通属性赋值才能保证每帧触发布局重排；用渲染帧同步驱动（而非 DispatcherTimer）让动画值
@@ -82,11 +88,28 @@ public sealed partial class MainWindow : Window
     private bool _favHeightOnly;
     private long _favTweenStart;
     private int _favTweenMs;
+    /// <summary>分组切换过渡：旧内容淡出 → 重建 → 容器淡入上移 + 卡片逐项 pop（对齐原型 is-leaving/is-entering）。
+    /// 独立于 _favTweening 的状态机，两段动画可同时跑（高度过渡只管 Height，这里只管透明度/位移）。</summary>
+    private bool _favSwitching;
+    /// <summary>当前切换阶段：true = 旧内容淡出，false = 新内容入场。</summary>
+    private bool _favSwitchOut;
+    /// <summary>阶段起点容器透明度/位移（从中途续动，快速连续切组不跳变）。</summary>
+    private double _favSwitchO0, _favSwitchY0;
+    private long _favSwitchPhaseStart;
+    private int _favSwitchPhaseMs;
+    /// <summary>入场阶段要逐项 pop 的卡片及其变换（重建后捕获，结束时清空还原）。</summary>
+    private readonly List<(Button Btn, TranslateTransform Shift, ScaleTransform Scale)> _favSwitchItems = new();
 
     public MainWindow()
     {
         try { InitializeComponent(); }
         catch (Exception ex) { App.Log("InitializeComponent", ex); throw; }
+
+        // pane 切换过渡用的位移变换映射（XAML 字段须在 InitializeComponent 之后才能引用）
+        _paneShifts[PaneGeneral] = PaneGeneralShift;
+        _paneShifts[PaneHotkey] = PaneHotkeyShift;
+        _paneShifts[PaneAppearance] = PaneAppearanceShift;
+        _paneShifts[PanePlugins] = PanePluginsShift;
 
         ExtendsContentIntoTitleBar = true;
         ResultList.ItemsSource = _items;
@@ -164,9 +187,6 @@ public sealed partial class MainWindow : Window
             _loaded = true;
             try { await _host.EnsureConnectedAsync(); } catch (Exception ex) { App.Log("HostConnect", ex); }
             try { SetupTray(); } catch (Exception ex) { App.Log("SetupTray", ex); }
-            AboutText.Text = _host.IsConnected
-                ? "Spark UI · 已连接 Host · Alt+Space 唤起"
-                : "Spark UI · 未连接 Host（演示）· 仍可收热键事件";
             HideLauncher();
             await RefreshResultsAsync("");
             RenderFavorites();
@@ -339,6 +359,59 @@ public sealed partial class MainWindow : Window
             if (_animHideGen == _hideGen)
                 HideNow();
         };
+
+        // 模式切换（主界面 ↔ 设置页）：时长/位移/缩放对齐原型 mode-leave / mode-enter
+        var modeOutDur = new Duration(TimeSpan.FromMilliseconds(220));
+        var modeInDur = new Duration(TimeSpan.FromMilliseconds(320));
+        _modeOutMain = ModeAnim(MainPanel, MainShift, MainScale, 1, 0, 0, -18, 1, 0.98, modeOutDur, ease);
+        _modeOutMain.Completed += (_, _) =>
+        {
+            // 打开设置流程：主页淡出完成 → 隐藏主页，视觉属性复位（此时设置页在上层淡入中）
+            MainPanel.Visibility = Visibility.Collapsed;
+            ResetModeTransform(MainPanel, MainShift, MainScale);
+            _modeAnimating = false;
+            // 模式切换完成，拖拽 caption 区域随之切到设置页布局
+            UpdateDragRegions();
+        };
+        _modeInSet = ModeAnim(SettingsPanel, SetShift, SetScale, 0, 1, 22, 0, 0.98, 1, modeInDur, ease);
+        _modeOutSet = ModeAnim(SettingsPanel, SetShift, SetScale, 1, 0, 0, 18, 1, 0.98, modeOutDur, ease);
+        _modeOutSet.Completed += (_, _) =>
+        {
+            // 关闭设置流程：设置页淡出完成 → 隐藏设置页，复位（主页在下方淡入中）
+            SettingsPanel.Visibility = Visibility.Collapsed;
+            ResetModeTransform(SettingsPanel, SetShift, SetScale);
+            _modeAnimating = false;
+            UpdateDragRegions();
+        };
+        _modeInMain = ModeAnim(MainPanel, MainShift, MainScale, 0, 1, -22, 0, 0.98, 1, modeInDur, ease);
+    }
+
+    /// <summary>构建单个模式切换动画：面板透明度 + 位移 + 缩放（blur 省略：WinUI 无 UIElement 模糊滤镜）。</summary>
+    private Storyboard ModeAnim(UIElement target, TranslateTransform shift, ScaleTransform scale,
+        double op0, double op1, double x0, double x1, double sc0, double sc1,
+        Duration d, EasingFunctionBase ease)
+    {
+        var sb = new Storyboard();
+        void Add(DependencyObject t, string prop, double from, double to)
+        {
+            var a = new DoubleAnimation { From = from, To = to, Duration = d, EasingFunction = ease };
+            Storyboard.SetTarget(a, t);
+            Storyboard.SetTargetProperty(a, prop);
+            sb.Children.Add(a);
+        }
+        Add(target, "Opacity", op0, op1);
+        Add(shift, "X", x0, x1);
+        Add(scale, "ScaleX", sc0, sc1);
+        Add(scale, "ScaleY", sc0, sc1);
+        return sb;
+    }
+
+    /// <summary>复位单个面板的切换视觉状态（隐藏后属性留在动画终值/中间值，恢复显示前必须还原）。</summary>
+    private void ResetModeTransform(UIElement panel, TranslateTransform shift, ScaleTransform scale)
+    {
+        panel.Opacity = 1;
+        shift.X = 0;
+        scale.ScaleX = scale.ScaleY = 1;
     }
 
     private Storyboard BuildAnim(double op0, double op1, double sc0, double sc1, double ty0, double ty1,
@@ -681,7 +754,9 @@ public sealed partial class MainWindow : Window
 
             ForceForeground();
             Activate();
-            SettingsPanel.Visibility = Visibility.Collapsed;
+            // 唤起总是回到主页：设置页可能在上次关闭前处于打开状态；
+            // 瞬时切换同时复位模式动画可能停在中间值的透明度/位移
+            ApplyModeSwitch(open: false, animate: false);
             QueryBox.Text = "";
             _ = RefreshResultsAsync("");
             QueryBox.Focus(FocusState.Programmatic);
@@ -900,7 +975,7 @@ public sealed partial class MainWindow : Window
     private void RenderFavorites()
     {
         // 记录当前主体实际高度：换内容后自然高度会变化（空↔有项约 12px），平滑过渡而非跳变
-        var oldBodyH = FavBody.Visibility == Visibility.Visible ? FavBody.ActualHeight : 0;
+        var oldBodyH = FavBodyClip.Visibility == Visibility.Visible ? FavBodyClip.ActualHeight : 0;
         FavGroups.Children.Clear();
         FavItems.Children.Clear();
         _favActive = -1;  // 收藏内容重建后选中态复位
@@ -927,15 +1002,10 @@ public sealed partial class MainWindow : Window
                 Foreground = active ? (Brush)res["TextPrimaryBrush"] : (Brush)res["TextTertiaryBrush"],
             };
             var gid = g.Id;
-            btn.Click += (_, _) =>
-            {
-                if (LocalState.Fav.ActiveGroup != gid)
-                {
-                    LocalState.Fav.ActiveGroup = gid;
-                    LocalState.SaveFav();
-                    RenderFavorites();
-                }
-            };
+            btn.Click += (_, _) => SwitchFavGroup(gid);
+            // 右键分组 tab：删除分组（「全部」不可删，它是兜底容器）
+            if (gid != "all")
+                btn.RightTapped += (_, e) => ShowFavGroupMenu(btn, e, gid, g.Name);
             FavGroups.Children.Add(btn);
         }
 
@@ -1049,6 +1119,15 @@ public sealed partial class MainWindow : Window
         ToolTipService.SetToolTip(FavToggle, fav.Expanded ? "收起收藏" : "展开收藏");
         UpdateFavCardStates();
         AnimateFavBodyHeight(oldBodyH);
+        SyncFavClip();
+    }
+
+    /// <summary>同步裁剪框到当前外层高度（静止态：外层为自然高度）。
+    /// 不设的话 RectangleGeometry 默认空矩形，内容会被裁掉看不见。</summary>
+    private void SyncFavClip()
+    {
+        var h = double.IsNaN(FavBodyClip.Height) ? FavBody.ActualHeight : FavBodyClip.Height;
+        FavBodyClipRect.Rect = new Rect(0, 0, FavBodyClip.ActualWidth, h > 0 ? h : 0);
     }
 
     /// <summary>
@@ -1059,22 +1138,26 @@ public sealed partial class MainWindow : Window
     {
         // 窗口未上屏（启动首帧）或减少动画：直接落定自然高度，不播过渡
         if (!_visible || LocalState.Ui.ReduceMotion) return;
-        if (FavBody.Visibility != Visibility.Visible) return;
+        if (FavBodyClip.Visibility != Visibility.Visible) return;
         // 抽屉动画进行中交给它；仅当正在跑"纯高度过渡"时可中途续动（连续快速切分组）
         if (_favTweening && !_favHeightOnly) return;
         if (h0 <= 0) return;
 
         // 内容已换好：先量出新自然高度（此刻尚未渲染，量完压回旧高度起动画，不闪一帧新高度）
         FavBody.Height = double.NaN;
-        FavBody.UpdateLayout();
+        FavBodyClip.Height = double.NaN;
+        FavBodyClip.UpdateLayout();
         var h1 = FavBody.ActualHeight;
         if (h1 <= 0 || Math.Abs(h1 - h0) < 0.5)
         {
             FavBody.Height = double.NaN;
+            FavBodyClip.Height = double.NaN;
             return;
         }
-        FavBody.Height = h0;
-        FavBody.UpdateLayout();
+        // 内容层固定到新自然高度：动画期间外层 Border 高度变化不会触发内容重测
+        FavBody.Height = h1;
+        FavBodyClip.Height = h0;
+        FavBodyClip.UpdateLayout();
 
         _favTweening = true;
         _favAnimGen++;
@@ -1082,13 +1165,136 @@ public sealed partial class MainWindow : Window
         _favHeightOnly = true;
         _favH0 = h0;
         _favH1 = h1;
-        _favO0 = FavBody.Opacity;
+        _favO0 = FavBodyClip.Opacity;
         _favG0 = FavGroups.Opacity;
         _favA0 = FavChevronRotate.Angle;
         _favS0 = FavChevronShift.Y;
         _favTweenStart = Environment.TickCount64;
-        // 高度差很小（约 12px），沿用展开分支的轻快 quadratic 曲线
-        _favTweenMs = 200;
+        // 高度差很小（约 12px）：120ms + 1.5 次方曲线（与收起同款），干脆不拖尾
+        _favTweenMs = 120;
+    }
+
+    // ==================== 分组切换过渡 ====================
+
+    /// <summary>切换到指定分组。带过渡：旧内容淡出 → 重建 → 新内容淡入 + 卡片逐项 pop；
+    /// 减少动画 / 窗口未上屏时直接重建（与折叠/高度过渡同一策略）。</summary>
+    private void SwitchFavGroup(string gid)
+    {
+        if (LocalState.Fav.ActiveGroup == gid) return;
+        LocalState.Fav.ActiveGroup = gid;
+        LocalState.SaveFav();
+        if (!_visible || LocalState.Ui.ReduceMotion)
+        {
+            RenderFavorites();
+            return;
+        }
+        FavSwitchStart();
+    }
+
+    /// <summary>启动淡出阶段：从当前视觉状态续动（若上一段过渡未完成，快速连续切组不跳变）。</summary>
+    private void FavSwitchStart()
+    {
+        _favSwitching = true;
+        _favSwitchOut = true;
+        _favSwitchO0 = FavItems.Opacity;
+        _favSwitchY0 = FavItemsShift.Y;
+        _favSwitchPhaseStart = Environment.TickCount64;
+        // 淡出 150ms（对齐原型 is-leaving 的 160ms），ease-in 收尾自然
+        _favSwitchPhaseMs = 150;
+        // 过渡期间旧卡片不可点，避免 hover 选中态闪动
+        FavItems.IsHitTestVisible = false;
+    }
+
+    /// <summary>每渲染帧驱动切换：淡出阶段结束原地换内容；入场阶段容器 + 逐项 pop，全部完成落定。</summary>
+    private void UpdateFavSwitch()
+    {
+        var now = Environment.TickCount64;
+        var t = (now - _favSwitchPhaseStart) / (double)_favSwitchPhaseMs;
+        var done = t >= 1;
+        if (done) t = 1;
+
+        if (_favSwitchOut)
+        {
+            // 旧内容淡出并下移 6px（ease-in）
+            var k = t * t;
+            FavItems.Opacity = _favSwitchO0 + (0 - _favSwitchO0) * k;
+            FavItemsShift.Y = _favSwitchY0 + (6 - _favSwitchY0) * k;
+            if (!done) return;
+
+            // 淡出完成：原地换内容（重建会同步 tab 选中态与主体高度过渡），随后开入场阶段
+            _favSwitchOut = false;
+            RenderFavorites();
+            _favSwitchItems.Clear();
+            foreach (var b in FavItems.Children.OfType<Button>().ToList())
+            {
+                b.RenderTransformOrigin = new Point(0.5, 0.5);
+                var shift = new TranslateTransform();
+                var scale = new ScaleTransform();
+                b.RenderTransform = new TransformGroup { Children = { shift, scale } };
+                b.Opacity = 0;
+                _favSwitchItems.Add((b, shift, scale));
+            }
+            _favSwitchPhaseStart = now;
+            _favSwitchPhaseMs = 280;
+            _favSwitchO0 = 0;
+            _favSwitchY0 = 8;
+            FavItems.Opacity = 0;
+            FavItemsShift.Y = 8;
+            FavItems.IsHitTestVisible = true;
+            return;
+        }
+
+        // 入场：容器淡入上移 8px（二次缓出，对齐原型 fav-enter）；卡片逐项 pop
+        // （每项延迟 30ms、300ms 二次缓出：透明度 + 下移 8px + 0.96→1 缩放）
+        var ck = 1 - (1 - t) * (1 - t);
+        FavItems.Opacity = _favSwitchO0 + (1 - _favSwitchO0) * ck;
+        FavItemsShift.Y = _favSwitchY0 + (0 - _favSwitchY0) * ck;
+        var allDone = done;
+        for (var i = 0; i < _favSwitchItems.Count; i++)
+        {
+            var ti = (now - _favSwitchPhaseStart - i * 30.0) / 300.0;
+            var (b, shift, scale) = _favSwitchItems[i];
+            if (ti <= 0) { allDone = false; continue; }
+            if (ti >= 1) { ti = 1; } else { allDone = false; }
+            var ik = 1 - (1 - ti) * (1 - ti);
+            b.Opacity = ik;
+            shift.Y = (1 - ik) * 8;
+            scale.ScaleX = scale.ScaleY = 0.96 + 0.04 * ik;
+        }
+        if (allDone) FavSwitchSettle();
+    }
+
+    /// <summary>落定切换：容器与卡片还原，清空捕获的变换（下次切换重新挂）。</summary>
+    private void FavSwitchSettle()
+    {
+        _favSwitching = false;
+        FavItems.IsHitTestVisible = true;
+        FavItems.Opacity = 1;
+        FavItemsShift.Y = 0;
+        foreach (var (b, _, _) in _favSwitchItems)
+        {
+            b.Opacity = 1;
+            b.RenderTransform = null;
+        }
+        _favSwitchItems.Clear();
+    }
+
+    /// <summary>中断切换（折叠/增删收藏等外部重建）：还原视觉状态；
+    /// 淡出阶段内容还是旧分组且 rebuild=true 时先重建落定，避免重新展开后显示旧内容。</summary>
+    private void FavSwitchCancel(bool rebuild)
+    {
+        if (!_favSwitching) return;
+        _favSwitching = false;
+        if (rebuild && _favSwitchOut) RenderFavorites();
+        FavItems.IsHitTestVisible = true;
+        FavItems.Opacity = 1;
+        FavItemsShift.Y = 0;
+        foreach (var (b, _, _) in _favSwitchItems)
+        {
+            b.Opacity = 1;
+            b.RenderTransform = null;
+        }
+        _favSwitchItems.Clear();
     }
 
     // ==================== 右键菜单 / 收藏增删 ====================
@@ -1156,14 +1362,24 @@ public sealed partial class MainWindow : Window
         }
         else
         {
+            // 「全部」是各分组的汇总视图，不是可收藏的分组：只列真实分组；
+            // 没有分组时（新装默认只有「全部」）也有「新建分组…」兜底，建完自动收藏
             var sub = new MenuFlyoutSubItem { Text = "收藏到", Icon = new FontIcon { Glyph = "\uE734" } };
-            foreach (var g in fav.Groups)
+            foreach (var g in fav.Groups.Where(g => g.Id != "all"))
             {
                 var gid = g.Id;
                 var gi = new MenuFlyoutItem { Text = g.Name };
                 gi.Click += (_, _) => AddFavorite(c, gid);
                 sub.Items.Add(gi);
             }
+            if (sub.Items.Count > 0) sub.Items.Add(new MenuFlyoutSeparator());
+            var create = new MenuFlyoutItem { Text = "新建分组…", Icon = new FontIcon { Glyph = "\uE710" } };
+            create.Click += (_, _) =>
+            {
+                _pendingFavItem = c;
+                ShowFavGroupPanel();
+            };
+            sub.Items.Add(create);
             menu.Items.Add(sub);
         }
         return menu;
@@ -1201,6 +1417,8 @@ public sealed partial class MainWindow : Window
     private void AddFavorite(CandidateDto c, string groupId)
     {
         var fav = LocalState.Fav;
+        // 打断进行中的分组切换（下面直接重建，内容即时落定）
+        FavSwitchCancel(rebuild: false);
         var existing = fav.Items.FirstOrDefault(x => x.ItemId == c.Id);
         if (existing is not null)
         {
@@ -1232,6 +1450,8 @@ public sealed partial class MainWindow : Window
     {
         var fav = LocalState.Fav;
         if (fav.Items.RemoveAll(x => x.ItemId == itemId) == 0) return;
+        // 打断进行中的分组切换（下面直接重建，内容即时落定）
+        FavSwitchCancel(rebuild: false);
         LocalState.SaveFav();
         RenderFavorites();
         Footer.Text = "已取消收藏";
@@ -1243,6 +1463,8 @@ public sealed partial class MainWindow : Window
     /// </summary>
     private void ApplyFavCollapse(bool collapsed, bool animate)
     {
+        // 打断进行中的分组切换：淡出阶段内容仍是旧分组，先重建落定（折叠后重新展开显示正确分组）
+        FavSwitchCancel(rebuild: true);
         _favTweening = false;
         _favAnimGen++;
         _favHeightOnly = false;
@@ -1267,47 +1489,55 @@ public sealed partial class MainWindow : Window
             FavGroupsCol.Width = new GridLength(1, GridUnitType.Star);
             FavAddGroup.Width = 22;
             FavGroups.IsHitTestVisible = FavAddGroup.IsHitTestVisible = true;
-            FavBody.Visibility = Visibility.Visible;
+            FavBodyClip.Visibility = Visibility.Visible;
             FavBody.Height = double.NaN;
-            FavBody.UpdateLayout();
-            h = FavBody.ActualHeight > 0 ? FavBody.ActualHeight : 76;
+            FavBodyClip.Height = double.NaN;
+            FavBodyClip.UpdateLayout();
+            h = FavBodyClip.ActualHeight > 0 ? FavBodyClip.ActualHeight : 76;
             _favGroupsW0 = FavGroupsCol.ActualWidth > 0 ? FavGroupsCol.ActualWidth : 300;
             // 量完立即压回 0 并应用布局：否则 Timer 首帧前会按自然高度闪出一帧完整抽屉
             // （展开时"弹一下"的来源：完整展开一帧 → 瞬间缩回 0 → 再平滑拉出）
-            FavBody.Height = 0;
-            FavBody.UpdateLayout();
+            FavBody.Height = h;
+            FavBodyClip.Height = 0;
+            FavBodyClip.UpdateLayout();
         }
+
+        // 内容层固定自然高度：动画期间外层 Border 高度变化不再重测内容（流畅的关键）
+        FavBody.Height = h;
 
         // 起点取当前实际值，连续快速切换可从中途续动
         _favCollapsing = collapsed;
         _favH0 = collapsed ? h : 0;
         _favH1 = collapsed ? 0 : h;
-        _favO0 = FavBody.Opacity;
+        _favO0 = FavBodyClip.Opacity;
         _favG0 = FavGroups.Opacity;
         _favA0 = FavChevronRotate.Angle;
         _favS0 = FavChevronShift.Y;
         _favTweenStart = Environment.TickCount64;
-        // 展开 240ms 轻快，收起 280ms（1.5 次方曲线下前后更均匀）
-        _favTweenMs = collapsed ? 280 : 240;
-        FavBody.Visibility = Visibility.Visible;
+        // 展开/收起统一 150ms，干脆利落（收起 1.5 次方曲线下前后更均匀）
+        _favTweenMs = 150;
+        FavBodyClip.Visibility = Visibility.Visible;
         _favTweening = true;
     }
 
     /// <summary>每渲染帧：按缓动曲线插值高度/透明度/箭头/分组行，结束后落定。</summary>
     private void OnFavRendering(object? sender, object e)
     {
+        if (_favSwitching) UpdateFavSwitch();
         if (!_favTweening) return;
         var t = (Environment.TickCount64 - _favTweenStart) / (double)_favTweenMs;
         var done = t >= 1;
         if (done) t = 1;
-        // 缓动：收起走 1-(1-t)^1.5——速度从 1.5 线性降到 0，比 quadratic（2→0）前后段更均匀、
+        // 缓动：收起/高度过渡走 1-(1-t)^1.5——速度从 1.5 线性降到 0，比 quadratic（2→0）前后段更均匀、
         // 不拖尾（quadratic 后段明显偏慢，感知"前后不和谐"）；展开保持 quadratic（轻快）
-        var k = _favCollapsing
+        var k = (_favCollapsing || _favHeightOnly)
             ? 1 - Math.Pow(1 - t, 1.5)
             : 1 - Math.Pow(1 - t, 2);
 
-        FavBody.Height = _favH0 + (_favH1 - _favH0) * k;
-        FavBody.Opacity = _favO0 + ((_favCollapsing ? 0 : 1) - _favO0) * k;
+        FavBodyClip.Height = _favH0 + (_favH1 - _favH0) * k;
+        FavBodyClip.Opacity = _favO0 + ((_favCollapsing ? 0 : 1) - _favO0) * k;
+        // 裁剪框跟随外层高度（Clip 是视觉属性，不触发布局；高度动画只此一处布局）
+        FavBodyClipRect.Rect = new Rect(0, 0, FavBodyClip.ActualWidth, FavBodyClip.Height);
         FavChevronRotate.Angle = _favA0 + ((_favCollapsing ? -90 : 0) - _favA0) * k;
         // 收起后箭头旋转成竖长 ">"：视觉重心比星星/文字高约 2px，随动画下移对齐（展开恢复）
         FavChevronShift.Y = _favS0 + ((_favCollapsing ? 2 : 0) - _favS0) * k;
@@ -1335,9 +1565,10 @@ public sealed partial class MainWindow : Window
     private void FavSettle(bool collapsed, int gen)
     {
         if (gen != _favAnimGen) return;
-        FavBody.Visibility = collapsed ? Visibility.Collapsed : Visibility.Visible;
+        FavBodyClip.Visibility = collapsed ? Visibility.Collapsed : Visibility.Visible;
         FavBody.Height = double.NaN;
-        FavBody.Opacity = 1;
+        FavBodyClip.Height = double.NaN;
+        FavBodyClip.Opacity = 1;
         FavRoot.Spacing = collapsed ? 0 : 8;
         FavGroupsCol.Width = collapsed ? new GridLength(0) : new GridLength(1, GridUnitType.Star);
         FavAddGroup.Width = collapsed ? 0 : 22;
@@ -1346,6 +1577,7 @@ public sealed partial class MainWindow : Window
         FavGroups.IsHitTestVisible = FavAddGroup.IsHitTestVisible = !collapsed;
         FavChevronRotate.Angle = collapsed ? -90 : 0;
         FavChevronShift.Y = collapsed ? 2 : 0;
+        SyncFavClip();
     }
 
     private void OnFavToggle(object sender, RoutedEventArgs e)
@@ -1357,31 +1589,171 @@ public sealed partial class MainWindow : Window
         ApplyFavCollapse(!fav.Expanded, animate: true);
     }
 
-    private async void OnFavAddGroup(object sender, RoutedEventArgs e)
+    // ==================== 新建分组（窗口内模态面板） ====================
+
+    private void OnFavAddGroup(object sender, RoutedEventArgs e) => ShowFavGroupPanel();
+
+    private void ShowFavGroupPanel()
     {
-        var box = new TextBox { PlaceholderText = "新分组名称", MaxLength = 8 };
-        var dlg = new ContentDialog
-        {
-            Title = "新建分组",
-            Content = box,
-            PrimaryButtonText = "创建",
-            CloseButtonText = "取消",
-            DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = Root.XamlRoot,
-        };
-        if (await dlg.ShowAsync() == ContentDialogResult.Primary && !string.IsNullOrWhiteSpace(box.Text))
-        {
-            var name = box.Text.Trim();
-            if (name.Length > 8) name = name[..8];
-            var id = "g_" + Convert.ToString(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), 36);
-            LocalState.Fav.Groups.Add(new FavGroupDto { Id = id, Name = name });
-            LocalState.Fav.ActiveGroup = id;
-            LocalState.Fav.Expanded = true;
-            LocalState.SaveFav();
-            RenderFavorites();
-            ApplyFavCollapse(false, animate: false);
-        }
+        FavGroupName.Text = "";
+        FavGroupPanel.Visibility = Visibility.Visible;
+        FavGroupName.Focus(FocusState.Programmatic);
+        AnimateModalIn(FavGroupCard, FavGroupCardScale, FavGroupCardShift);
     }
+
+    /// <summary>模态卡片入场：淡入 + 上浮放大（与窗口 pop-in 同款曲线；减少动画时跳过）。</summary>
+    private void AnimateModalIn(Border card, ScaleTransform scale, TranslateTransform shift)
+    {
+        if (LocalState.Ui.ReduceMotion) return;
+        // 起点即终值中间态，可被下次打开续动
+        card.Opacity = 0;
+        scale.ScaleX = scale.ScaleY = 0.96;
+        shift.Y = 6;
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        var d = new Duration(TimeSpan.FromMilliseconds(180));
+        var sb = new Storyboard();
+        void Add(DependencyObject target, string prop, double from, double to)
+        {
+            var a = new DoubleAnimation { From = from, To = to, Duration = d, EasingFunction = ease };
+            Storyboard.SetTarget(a, target);
+            Storyboard.SetTargetProperty(a, prop);
+            sb.Children.Add(a);
+        }
+        Add(card, "Opacity", 0, 1);
+        Add(scale, "ScaleX", 0.96, 1);
+        Add(scale, "ScaleY", 0.96, 1);
+        Add(shift, "Y", 6, 0);
+        sb.Begin();
+    }
+
+    private void CloseFavGroupPanel()
+    {
+        FavGroupPanel.Visibility = Visibility.Collapsed;
+        _pendingFavItem = null;   // 取消/关闭：丢弃待收藏项
+        // 复位卡片视觉（被中断的入场动画可能停在中间态）
+        FavGroupCard.Opacity = 1;
+        FavGroupCardScale.ScaleX = FavGroupCardScale.ScaleY = 1;
+        FavGroupCardShift.Y = 0;
+        QueryBox.Focus(FocusState.Programmatic);
+    }
+
+    private void OnFavGroupNameKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key != VirtualKey.Enter) return;
+        e.Handled = true;
+        CreateFavGroup();
+    }
+
+    private void OnFavGroupCreate(object sender, RoutedEventArgs e) => CreateFavGroup();
+
+    private void OnFavGroupCancel(object sender, RoutedEventArgs e) => CloseFavGroupPanel();
+
+    /// <summary>点面板外（遮罩）：取消。卡片内点击在 OnFavGroupCardTapped 里置 Handled，不会误关。</summary>
+    private void OnFavGroupScrimTapped(object sender, TappedRoutedEventArgs e) => CloseFavGroupPanel();
+
+    private void OnFavGroupCardTapped(object sender, TappedRoutedEventArgs e) => e.Handled = true;
+
+    /// <summary>毫秒时间戳转 36 进制短 ID（对齐原型 Date.now().toString(36)）。
+    /// 注意 Convert.ToString(long, toBase) 只支持 2/8/10/16，传 36 会抛 Invalid Base。</summary>
+    private static string ToBase36(long v)
+    {
+        const string digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+        var s = "";
+        do { s = digits[(int)(v % 36)] + s; v /= 36; } while (v > 0);
+        return s;
+    }
+
+    private void CreateFavGroup()
+    {
+        var name = FavGroupName.Text.Trim();
+        if (name.Length == 0) return;   // 空名称不创建（面板保持打开）
+        if (name.Length > 8) name = name[..8];
+        var id = "g_" + ToBase36(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        // 「收藏到 → 新建分组…」链路：建完直接把待收藏项收进新组
+        var pending = _pendingFavItem;
+        _pendingFavItem = null;
+        LocalState.Fav.Groups.Add(new FavGroupDto { Id = id, Name = name });
+        LocalState.Fav.ActiveGroup = id;
+        LocalState.Fav.Expanded = true;
+        LocalState.SaveFav();
+        CloseFavGroupPanel();
+        if (pending is not null)
+        {
+            AddFavorite(pending, id);   // 渲染 + 展开动画 + 「已收藏到」提示
+            return;
+        }
+        RenderFavorites();
+        ApplyFavCollapse(false, animate: false);
+    }
+
+    // ==================== 删除分组（右键 tab → 确认弹窗） ====================
+
+    /// <summary>待删除的分组 Id（确认弹窗打开期间持有）。</summary>
+    private string _favDeleteGroupId = "";
+    /// <summary>「收藏到 → 新建分组…」待收藏的项；建组成功后自动收藏，取消则丢弃。</summary>
+    private CandidateDto? _pendingFavItem;
+
+    private void ShowFavGroupMenu(FrameworkElement anchor, RightTappedRoutedEventArgs e, string gid, string gname)
+    {
+        var menu = new MenuFlyout();
+        var del = new MenuFlyoutItem { Text = "删除分组", Icon = new FontIcon { Glyph = "\uE74D" } };
+        del.Click += (_, _) => ShowFavConfirmPanel(gid, gname);
+        menu.Items.Add(del);
+        menu.ShowAt(anchor, new FlyoutShowOptions { Position = e.GetPosition(anchor) });
+    }
+
+    private void ShowFavConfirmPanel(string gid, string gname)
+    {
+        _favDeleteGroupId = gid;
+        var n = LocalState.Fav.Items.Count(x => x.GroupId == gid);
+        FavConfirmMsg.Text = n > 0
+            ? $"删除分组「{gname}」？组内 {n} 个收藏将一并删除。"
+            : $"删除分组「{gname}」？";
+        FavConfirmPanel.Visibility = Visibility.Visible;
+        // 安全默认：焦点落在「取消」
+        FavConfirmCancelBtn.Focus(FocusState.Programmatic);
+        AnimateModalIn(FavConfirmCard, FavConfirmCardScale, FavConfirmCardShift);
+    }
+
+    private void CloseFavConfirmPanel()
+    {
+        FavConfirmPanel.Visibility = Visibility.Collapsed;
+        _favDeleteGroupId = "";
+        // 复位卡片视觉（被中断的入场动画可能停在中间态）
+        FavConfirmCard.Opacity = 1;
+        FavConfirmCardScale.ScaleX = FavConfirmCardScale.ScaleY = 1;
+        FavConfirmCardShift.Y = 0;
+        QueryBox.Focus(FocusState.Programmatic);
+    }
+
+    private void OnFavConfirmKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key != VirtualKey.Enter) return;
+        e.Handled = true;
+        OnFavConfirmDelete(sender, e);
+    }
+
+    private void OnFavConfirmDelete(object sender, RoutedEventArgs e)
+    {
+        var fav = LocalState.Fav;
+        var gid = _favDeleteGroupId;
+        CloseFavConfirmPanel();
+        if (gid == "all" || fav.Groups.RemoveAll(g => g.Id == gid) == 0) return;
+        // 「全部」只是各分组的汇总视图：删分组连带删组内收藏，不留下无归属的孤儿项
+        fav.Items.RemoveAll(x => x.GroupId == gid);
+        // 删的是当前分组：退回「全部」
+        if (fav.ActiveGroup == gid) fav.ActiveGroup = "all";
+        LocalState.SaveFav();
+        FavSwitchCancel(rebuild: false);  // 打断进行中的分组切换，内容即时落定
+        RenderFavorites();
+    }
+
+    private void OnFavConfirmCancel(object sender, RoutedEventArgs e) => CloseFavConfirmPanel();
+
+    /// <summary>点面板外（遮罩）：取消。卡片内点击在 OnFavConfirmCardTapped 里置 Handled，不会误关。</summary>
+    private void OnFavConfirmScrimTapped(object sender, TappedRoutedEventArgs e) => CloseFavConfirmPanel();
+
+    private void OnFavConfirmCardTapped(object sender, TappedRoutedEventArgs e) => e.Handled = true;
 
     // ==================== 视图切换 ====================
 
@@ -1485,20 +1857,58 @@ public sealed partial class MainWindow : Window
 
     // ==================== 设置 ====================
 
+    /// <summary>主界面 ↔ 设置页切换。动画：打开 = 主页左滑淡出 + 设置页从右滑入（交叉），
+    /// 关闭 = 设置页右滑淡出 + 主页从左滑入；减少动画 / 窗口未上屏时瞬时切换（与收藏动画同一策略）。</summary>
+    private void ApplyModeSwitch(bool open, bool animate)
+    {
+        if (!animate)
+        {
+            _modeOutMain.Stop(); _modeInMain.Stop(); _modeOutSet.Stop(); _modeInSet.Stop();
+            MainPanel.Visibility = open ? Visibility.Collapsed : Visibility.Visible;
+            SettingsPanel.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
+            ResetModeTransform(MainPanel, MainShift, MainScale);
+            ResetModeTransform(SettingsPanel, SetShift, SetScale);
+            _modeAnimating = false;
+            return;
+        }
+        if (_modeAnimating) return;  // 220ms 内连点/连按 Esc 忽略，避免状态错乱
+
+        _modeAnimating = true;
+        if (open)
+        {
+            // 主页保持可见并左滑淡出；设置页先就位（透明 + 右侧 22px）再淡入，两段交叉
+            MainPanel.Visibility = Visibility.Visible;
+            SettingsPanel.Visibility = Visibility.Visible;
+            SettingsPanel.Opacity = 0;
+            SetShift.X = 22;
+            SetScale.ScaleX = SetScale.ScaleY = 0.98;
+            _modeOutMain.Begin();
+            _modeInSet.Begin();
+        }
+        else
+        {
+            // 设置页右滑淡出；主页先就位（透明 + 左侧 22px）再淡入，两段交叉
+            MainPanel.Visibility = Visibility.Visible;
+            MainPanel.Opacity = 0;
+            MainShift.X = -22;
+            MainScale.ScaleX = MainScale.ScaleY = 0.98;
+            _modeInMain.Begin();
+            _modeOutSet.Begin();
+        }
+    }
+
     private void OnOpenSettings(object sender, RoutedEventArgs e)
     {
-        SettingsPanel.Visibility = Visibility.Visible;
-        AboutText.Text = _host.IsConnected
-            ? "Spark UI · 已连接 Host"
-            : "Spark UI · 未连接 Host（演示）";
         SyncSettingsUi();
         ShowPane("general");
+        // SettingsPanel 无背景（玻璃下透壁纸），主页必须隐藏，否则内容从透明区透出来叠在一起
+        ApplyModeSwitch(open: true, animate: _visible && !LocalState.Ui.ReduceMotion);
         UpdateDragRegions();
     }
 
     private void OnCloseSettings(object sender, RoutedEventArgs e)
     {
-        SettingsPanel.Visibility = Visibility.Collapsed;
+        ApplyModeSwitch(open: false, animate: _visible && !LocalState.Ui.ReduceMotion);
         QueryBox.Focus(FocusState.Programmatic);
         UpdateDragRegions();
     }
@@ -1515,68 +1925,246 @@ public sealed partial class MainWindow : Window
     private void OnSettingsNav(object sender, RoutedEventArgs e)
         => ShowPane((string)((Button)sender).Tag);
 
+    /// <summary>设置页 pane 切换过渡：旧 pane 淡出上移 → 新 pane 从下方淡入升起（轻量，对齐收藏分组切换思路）。
+    /// 快速连点/动画中再点直接落定；减少动画时瞬时切换。</summary>
+    private bool _paneAnimating;
+    private int _paneAnimGen;
+    private readonly Dictionary<StackPanel, TranslateTransform> _paneShifts = new();
+
     private void ShowPane(string pane)
     {
-        PaneGeneral.Visibility = pane == "general" ? Visibility.Visible : Visibility.Collapsed;
-        PaneHotkey.Visibility = pane == "hotkey" ? Visibility.Visible : Visibility.Collapsed;
-        PaneAppearance.Visibility = pane == "appearance" ? Visibility.Visible : Visibility.Collapsed;
-        PanePlugins.Visibility = pane == "plugins" ? Visibility.Visible : Visibility.Collapsed;
-
+        // 导航项选中态：背景胶囊 + 文字/图标提亮（图标颜色不自动继承 Button.Foreground，需显式同步）
         var res = Root.Resources;
-        foreach (var b in new[] { NavGeneral, NavHotkey, NavAppearance, NavPlugins })
+        foreach (var (b, icon) in new (Button, FontIcon?)[]
+        {
+            (NavGeneral, NavIconGeneral), (NavHotkey, NavIconHotkey),
+            (NavAppearance, NavIconAppearance), (NavPlugins, NavIconPlugins),
+        })
         {
             var on = (string)b.Tag == pane;
             b.Background = on ? (Brush)res["AccentSoftBrush"] : new SolidColorBrush(Colors.Transparent);
             b.Foreground = on ? (Brush)res["TextPrimaryBrush"] : (Brush)res["TextSecondaryBrush"];
-            b.FontWeight = on ? FontWeights.SemiBold : FontWeights.Normal;
+            // 不加粗：SemiBold ↔ Normal 切换会让文字宽度变化，选中时看起来抖动
+            if (icon is not null)
+                icon.Foreground = on ? (Brush)res["TextPrimaryBrush"] : (Brush)res["TextSecondaryBrush"];
+        }
+
+        var target = pane switch
+        {
+            "hotkey" => PaneHotkey,
+            "appearance" => PaneAppearance,
+            "plugins" => PanePlugins,
+            _ => PaneGeneral,
+        };
+        if (target.Visibility == Visibility.Visible) return;  // 重复点当前项
+
+        if (!_visible || LocalState.Ui.ReduceMotion || _paneAnimating)
+        {
+            ApplyPaneInstant(target);
+            return;
+        }
+        var current = _paneShifts.Keys.FirstOrDefault(p => p.Visibility == Visibility.Visible);
+        if (current is null || current == target)
+        {
+            ApplyPaneInstant(target);
+            return;
+        }
+        StartPaneTransition(current, target);
+    }
+
+    /// <summary>瞬时落定到目标 pane（复位所有 pane 的视觉状态）。</summary>
+    private void ApplyPaneInstant(StackPanel target)
+    {
+        _paneAnimGen++;
+        _paneAnimating = false;
+        foreach (var (p, shift) in _paneShifts)
+        {
+            p.Visibility = p == target ? Visibility.Visible : Visibility.Collapsed;
+            p.Opacity = 1;
+            shift.Y = 0;
         }
     }
 
-    /// <summary>打开设置时把 LocalState 同步到控件（期间不触发保存副作用）。</summary>
+    /// <summary>旧 pane 淡出（120ms 上移）→ 新 pane 淡入（160ms 从下方升起）。</summary>
+    private void StartPaneTransition(StackPanel current, StackPanel target)
+    {
+        var gen = ++_paneAnimGen;
+        _paneAnimating = true;
+
+        current.Opacity = 1;
+        _paneShifts[current].Y = 0;
+        var outSb = new Storyboard();
+        PaneFade(outSb, current, _paneShifts[current], 1, 0, 0, -4, 120, new CubicEase { EasingMode = EasingMode.EaseIn });
+        outSb.Completed += (_, _) =>
+        {
+            if (gen != _paneAnimGen) return;  // 已落定/再次切换，跳过
+            current.Visibility = Visibility.Collapsed;
+            _paneShifts[current].Y = 0;
+
+            target.Visibility = Visibility.Visible;
+            target.Opacity = 0;
+            _paneShifts[target].Y = 8;
+            var inSb = new Storyboard();
+            PaneFade(inSb, target, _paneShifts[target], 0, 1, 8, 0, 160, new CubicEase { EasingMode = EasingMode.EaseOut });
+            inSb.Completed += (_, _) =>
+            {
+                if (gen != _paneAnimGen) return;
+                target.Opacity = 1;
+                _paneShifts[target].Y = 0;
+                _paneAnimating = false;
+            };
+            inSb.Begin();
+        };
+        outSb.Begin();
+    }
+
+    /// <summary>为 Storyboard 添加 pane 透明度 + 位移两段动画。</summary>
+    private static void PaneFade(Storyboard sb, DependencyObject panel, DependencyObject shift,
+        double op0, double op1, double y0, double y1, int ms, EasingFunctionBase ease)
+    {
+        var d = new Duration(TimeSpan.FromMilliseconds(ms));
+        void Add(DependencyObject t, string prop, double from, double to)
+        {
+            var a = new DoubleAnimation { From = from, To = to, Duration = d, EasingFunction = ease };
+            Storyboard.SetTarget(a, t);
+            Storyboard.SetTargetProperty(a, prop);
+            sb.Children.Add(a);
+        }
+        Add(panel, "Opacity", op0, op1);
+        Add(shift, "Y", y0, y1);
+    }
+
+    /// <summary>打开设置时把 LocalState 同步到控件（期间不触发保存副作用）。
+    /// 开机启动以注册表实际状态为准（用户可能在任务管理器里手动改过），LocalState 仅作缓存。</summary>
     private void SyncSettingsUi()
     {
         _syncing = true;
         try
         {
-            StartupSwitch.IsOn = LocalState.Ui.LaunchOnStartup;
-            HideFocusSwitch.IsOn = LocalState.Ui.HideOnFocusLost;
-            HideInvokeSwitch.IsOn = LocalState.Ui.HideAfterInvoke;
+            StartupSwitch.IsChecked = GetStartupEntry();
+            HideFocusSwitch.IsChecked = LocalState.Ui.HideOnFocusLost;
+            HideInvokeSwitch.IsChecked = LocalState.Ui.HideAfterInvoke;
             ThemeCombo.SelectedIndex = LocalState.Ui.Theme switch { "light" => 2, "dark" => 1, _ => 0 };
             ViewCombo.SelectedIndex = LocalState.Ui.DefaultView == "grid" ? 1 : 0;
             WidthSlider.Value = LocalState.Ui.WindowWidth;
             WidthValue.Text = $"{LocalState.Ui.WindowWidth}px";
-            ReduceMotionSwitch.IsOn = LocalState.Ui.ReduceMotion;
+            ReduceMotionSwitch.IsChecked = LocalState.Ui.ReduceMotion;
             UpdateHotkeyPresets();
         }
         finally { _syncing = false; }
     }
 
+    // ==================== 开机启动 ====================
+
+    /// <summary>HKCU Run 键：当前用户登录时自动启动（无需管理员权限，卸载/禁用也不影响其他用户）。</summary>
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string RunValueName = "Spark";
+
+    /// <summary>注册表 Run 键里是否存在 Spark 启动项（任务管理器「启动」页可见）。</summary>
+    private static bool GetStartupEntry()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+            return k?.GetValue(RunValueName) is string s && !string.IsNullOrEmpty(s);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>写入/删除开机启动项：true = 注册 exe 路径（带引号，路径含空格时注册表才认得）。</summary>
+    private static void SetStartupEntry(bool enable)
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.CreateSubKey(RunKeyPath);
+            if (k is null) return;
+            if (enable)
+            {
+                var exe = Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "Spark.exe");
+                k.SetValue(RunValueName, $"\"{exe}\"");
+            }
+            else
+            {
+                k.DeleteValue(RunValueName, throwOnMissingValue: false);
+            }
+        }
+        catch (Exception ex) { App.Log("StartupRegistry", ex); }
+    }
+
+    // ==================== 开关视觉（原型 .switch：OFF rgba(120,120,128,.32) / ON #30d158，transition 0.2s） ====================
+
+    private static readonly Color SwitchOnColor = Color.FromArgb(0xFF, 0x30, 0xD1, 0x58);
+    private static readonly Color SwitchOffColor = Color.FromArgb(0x52, 0x78, 0x78, 0x80);
+
+    /// <summary>开关切换过渡：轨道颜色渐变 + 滑块滑动（200ms ease-out，对齐原型 transition 0.2s）。
+    /// 视觉由代码驱动（不用模板内 VSM）：初始化（_syncing）时直接落定终值，用户点击时播动画。
+    /// 模板元素经视觉树根 FindName 获取（模板命名作用域内可解析）。</summary>
+    private void AnimateSwitchToggle(ToggleButton toggle, bool on, bool animate)
+    {
+        if (VisualTreeHelper.GetChildrenCount(toggle) == 0) return;
+        var root = (FrameworkElement)VisualTreeHelper.GetChild(toggle, 0);
+        var thumbT = root.FindName("ThumbTransform") as TranslateTransform;
+        var track = root.FindName("Track") as Border;
+        if (thumbT is null || track?.Background is not SolidColorBrush bg) return;
+
+        var toX = on ? 16.0 : 0.0;
+        var toColor = on ? SwitchOnColor : SwitchOffColor;
+        if (!animate)
+        {
+            thumbT.X = toX;
+            bg.Color = toColor;
+            return;
+        }
+
+        var sb = new Storyboard();
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        var d = new Duration(TimeSpan.FromMilliseconds(200));
+        var x = new DoubleAnimation { From = thumbT.X, To = toX, Duration = d, EasingFunction = ease };
+        Storyboard.SetTarget(x, thumbT);
+        Storyboard.SetTargetProperty(x, "X");
+        sb.Children.Add(x);
+        var c = new ColorAnimation { From = bg.Color, To = toColor, Duration = d, EasingFunction = ease };
+        Storyboard.SetTarget(c, bg);
+        Storyboard.SetTargetProperty(c, "Color");
+        sb.Children.Add(c);
+        sb.Begin();
+    }
+
     private void OnToggleStartup(object sender, RoutedEventArgs e)
     {
+        var on = StartupSwitch.IsChecked == true;
+        AnimateSwitchToggle(StartupSwitch, on, animate: !_syncing);
         if (_syncing) return;
-        LocalState.Ui.LaunchOnStartup = StartupSwitch.IsOn;
+        LocalState.Ui.LaunchOnStartup = on;
         LocalState.SaveUi();
+        SetStartupEntry(on);
     }
 
     private void OnToggleHideFocus(object sender, RoutedEventArgs e)
     {
+        var on = HideFocusSwitch.IsChecked == true;
+        AnimateSwitchToggle(HideFocusSwitch, on, animate: !_syncing);
         if (_syncing) return;
-        LocalState.Ui.HideOnFocusLost = HideFocusSwitch.IsOn;
-        _hideOnDeactivate = HideFocusSwitch.IsOn;
+        LocalState.Ui.HideOnFocusLost = on;
+        _hideOnDeactivate = on;
         LocalState.SaveUi();
     }
 
     private void OnToggleHideInvoke(object sender, RoutedEventArgs e)
     {
+        var on = HideInvokeSwitch.IsChecked == true;
+        AnimateSwitchToggle(HideInvokeSwitch, on, animate: !_syncing);
         if (_syncing) return;
-        LocalState.Ui.HideAfterInvoke = HideInvokeSwitch.IsOn;
+        LocalState.Ui.HideAfterInvoke = on;
         LocalState.SaveUi();
     }
 
     private void OnToggleReduceMotion(object sender, RoutedEventArgs e)
     {
+        var on = ReduceMotionSwitch.IsChecked == true;
+        AnimateSwitchToggle(ReduceMotionSwitch, on, animate: !_syncing);
         if (_syncing) return;
-        LocalState.Ui.ReduceMotion = ReduceMotionSwitch.IsOn;
+        LocalState.Ui.ReduceMotion = on;
         LocalState.SaveUi();
         _hideGen++;
         _hideAnimating = false;
@@ -1683,8 +2271,32 @@ public sealed partial class MainWindow : Window
     /// 因此这里从 _active（按下前的值）计算目标并绝对赋值；若读 SelectedIndex 重算会叠加上原生那一步，造成双重移动。</summary>
     private void OnRootKeyDown(object sender, KeyRoutedEventArgs e)
     {
+        // 模态面板打开时独占按键：Esc 关闭（新建分组/删除确认），其余键交给面板内控件
+        if (FavGroupPanel.Visibility == Visibility.Visible
+            || FavConfirmPanel.Visibility == Visibility.Visible)
+        {
+            if (e.Key == VirtualKey.Escape)
+            {
+                e.Handled = true;
+                if (FavConfirmPanel.Visibility == Visibility.Visible)
+                    CloseFavConfirmPanel();
+                else
+                    CloseFavGroupPanel();
+            }
+            return;
+        }
         if (_composing) return;                       // IME 组词中不拦截
-        if (MainPanel.Visibility != Visibility.Visible) return; // 设置页里不动
+        if (MainPanel.Visibility != Visibility.Visible)
+        {
+            // 主页隐藏时（设置页打开）：只放行 Esc 关闭设置 —— 焦点可能还停在搜索框上，
+            // 设置页自身的 KeyDown（OnSettingsKeyDown）收不到，需要根上兜底
+            if (e.Key == VirtualKey.Escape && SettingsPanel.Visibility == Visibility.Visible)
+            {
+                e.Handled = true;
+                OnCloseSettings(sender, e);
+            }
+            return;
+        }
         if (_itemMenu?.IsOpen == true) return;        // 动作菜单打开中：方向键/回车交给菜单
 
         if (e.Key == VirtualKey.Escape)
@@ -1728,7 +2340,7 @@ public sealed partial class MainWindow : Window
     /// 结果区末尾继续往下进入收藏区，收藏区首位继续往上回到结果区。</summary>
     private void MoveSelection(VirtualKey key)
     {
-        var favCount = FavBody.Visibility == Visibility.Visible ? FavButtons().Count : 0;
+        var favCount = FavBodyClip.Visibility == Visibility.Visible ? FavButtons().Count : 0;
 
         // 收藏区：一行卡片，右/下 = 下一张，左/上 = 上一张，首位再往上是回结果区
         if (_favActive >= 0)
