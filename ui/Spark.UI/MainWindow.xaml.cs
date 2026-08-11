@@ -354,10 +354,105 @@ public sealed partial class MainWindow : Window
         DwmSetWindowAttribute(_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref v, sizeof(int));
 
         // 圆角外框颜色：系统浅色主题下 DWM 会用白色画外框（就是"外面那层白色"），
-        // 深色属性只管标题栏，外框要用 DWMWA_BORDER_COLOR（34，Win11 22H2+）直接指定
+        // 深色属性只管标题栏，外框要用 DWMWA_BORDER_COLOR（34，Win11 22H2+）直接指定。
+        // 这里只做静态兜底（玻璃感知色随背景浮动，静态值只能匹配一种背景），
+        // 每次显示前由 SyncDwmBorderColor 采样背景做精确匹配。
         const int DWMWA_BORDER_COLOR = 34;
-        var border = dark ? (int)0x001E1C1Cu : (int)0x00F2F2F7u; // COLORREF 0x00BBGGRR，取玻璃底色
+        var border = dark ? (int)0x004C4A4Au : (int)0x00F2F2F7u; // COLORREF 0x00BBGGRR，取玻璃边缘感知色
         DwmSetWindowAttribute(_hwnd, DWMWA_BORDER_COLOR, ref border, sizeof(int));
+    }
+
+    /// <summary>
+    /// 把 DWM 圆角外框（1px，Win11 22H2+ 对圆角窗口强制绘制，无 API 可移除）设成
+    /// "当前玻璃感知色"：玻璃 = tint 按 TintOpacity 叠背景模糊，感知色随背景在近黑↔浅灰
+    /// 之间浮动，静态色必然在某种背景上突兀。显示前（窗口仍隐藏）采样窗口矩形区域的
+    /// 屏幕均值，按 AcrylicSystemBackdrop 的 tint 参数算出感知色，任何背景下外框都与
+    /// 玻璃融为一体。窗口可见时采样会把窗口自身算进去，所以只在隐藏时调用（ShowLauncher）。
+    /// </summary>
+    private void SyncDwmBorderColor()
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        try
+        {
+            if (!TransparencyEnabled()) return;   // 纯色回退时 ApplyDwmDarkMode 的静态色已匹配
+            if (!GetWindowRect(_hwnd, out var r) || r.Right <= r.Left || r.Bottom <= r.Top)
+                return;
+
+            // StretchBlt 下采样到 24x18 的 32bpp DIB 再取均值，近似 DWM 模糊后的背景色
+            const int SW = 24, SH = 18;
+            var w = r.Right - r.Left;
+            var h = r.Bottom - r.Top;
+            var src = GetDC(IntPtr.Zero);
+            if (src == IntPtr.Zero) return;
+            long sumR = 0, sumG = 0, sumB = 0;
+            try
+            {
+                var bmi = new BITMAPINFO();
+                bmi.biSize = 40;                 // sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = SW;
+                bmi.biHeight = -SH;              // 负值 = 自顶向下，读取顺序与屏幕一致
+                bmi.biPlanes = 1;
+                bmi.biBitCount = 32;
+                var hbmp = CreateDIBSection(src, ref bmi, 0, out var bits, IntPtr.Zero, 0);
+                if (hbmp == IntPtr.Zero) return;
+                var mem = CreateCompatibleDC(src);
+                if (mem == IntPtr.Zero) { DeleteObject(hbmp); return; }
+                try
+                {
+                    var old = SelectObject(mem, hbmp);
+                    try
+                    {
+                        // HALFTONE：缩小时按像素均值填充（否则是跳采样，噪声大）
+                        SetStretchBltMode(mem, HALFTONE);
+                        StretchBlt(mem, 0, 0, SW, SH, src, r.Left, r.Top, w, h, SRCCOPY);
+                    }
+                    finally { SelectObject(mem, old); }
+
+                    var px = new byte[SW * SH * 4];
+                    Marshal.Copy(bits, px, 0, px.Length);
+                    for (var i = 0; i < px.Length; i += 4)
+                    {
+                        sumB += px[i];      // DIB 32bpp 是 BGRA
+                        sumG += px[i + 1];
+                        sumR += px[i + 2];
+                    }
+                }
+                finally { DeleteDC(mem); DeleteObject(hbmp); }
+            }
+            finally { ReleaseDC(IntPtr.Zero, src); }
+
+            var n = SW * SH;
+
+            // 感知色 = avg * (1 - TintOpacity) + tint * TintOpacity（与 AcrylicSystemBackdrop 参数一致）
+            bool dark = LocalState.Ui.Theme switch
+            {
+                "light" => false,
+                "dark" => true,
+                _ => SystemUsesDark(),
+            };
+            byte fr, fg, fb;
+            if (dark)
+            {
+                fr = (byte)((sumR / n + 0x1C) / 2);
+                fg = (byte)((sumG / n + 0x1C) / 2);
+                fb = (byte)((sumB / n + 0x1E) / 2);
+            }
+            else
+            {
+                fr = (byte)((sumR / n * 55 + 0xF2 * 45) / 100);
+                fg = (byte)((sumG / n * 55 + 0xF5 * 45) / 100);
+                fb = (byte)((sumB / n * 55 + 0xFA * 45) / 100);
+            }
+
+            // COLORREF 0x00BBGGRR
+            var border = (fb << 16) | (fg << 8) | fr;
+            const int DWMWA_BORDER_COLOR = 34;
+            DwmSetWindowAttribute(_hwnd, DWMWA_BORDER_COLOR, ref border, sizeof(int));
+        }
+        catch (Exception ex)
+        {
+            App.Log("BorderColor", ex);
+        }
     }
 
     /// <summary>
@@ -800,6 +895,9 @@ public sealed partial class MainWindow : Window
 
             if (_hwnd == IntPtr.Zero)
                 _hwnd = WindowNative.GetWindowHandle(this);
+
+            // 窗口仍隐藏：采样背景把 DWM 圆角外框设成当前玻璃感知色（详见 SyncDwmBorderColor）
+            try { SyncDwmBorderColor(); } catch { /* ignore */ }
 
             try { _appWindow?.Show(true); } catch { /* ignore */ }
             ShowWindow(_hwnd, 9);  // SW_RESTORE
@@ -2821,6 +2919,57 @@ public sealed partial class MainWindow : Window
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool SetStretchBltMode(IntPtr hdc, int mode);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool StretchBlt(IntPtr hdcDest, int xDest, int yDest, int wDest, int hDest,
+        IntPtr hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc, uint rop);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFO pbmi, uint usage,
+        out IntPtr ppvBits, IntPtr hSection, uint offset);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hObject);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr hObject);
+
+    private const int HALFTONE = 4;
+    private const uint SRCCOPY = 0x00CC0020;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BITMAPINFO
+    {
+        public int biSize;              // sizeof(BITMAPINFOHEADER)=40，必须正确否则 GDI 拒绝
+        public int biWidth;
+        public int biHeight;
+        public short biPlanes;
+        public short biBitCount;
+        public int biCompression;
+        public int biSizeImage;
+        public int biXPelsPerMeter;
+        public int biYPelsPerMeter;
+        public int biClrUsed;
+        public int biClrImportant;
+    }
 
     [DllImport("user32.dll")]
     private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
