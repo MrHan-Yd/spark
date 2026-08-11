@@ -79,6 +79,10 @@ public sealed class CandidateDto : INotifyPropertyChanged
     [JsonIgnore]
     public string Shortcut { get; set; } = "";
 
+    /// <summary>当前查询词（UI 侧高亮标题匹配段用；host 不参与）。</summary>
+    [JsonIgnore]
+    public string HighlightQuery { get; set; } = "";
+
     private ImageSource? _iconImage;
     [JsonIgnore]
     public ImageSource? IconImage

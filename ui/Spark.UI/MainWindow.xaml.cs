@@ -9,6 +9,7 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Data;
+using Microsoft.UI.Xaml.Documents;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
@@ -44,6 +45,8 @@ public sealed partial class MainWindow : Window
     private int _queryGen;
     /// <summary>搜索防抖：快速连续输入只发最后一轮查询（配合 _queryGen 丢弃过期结果）。</summary>
     private const int QueryDebounceMs = 120;
+    /// <summary>窗口固定宽度（设置已移除宽度滑杆，不再读取 LocalState.Ui.WindowWidth）。</summary>
+    private const int LauncherWidth = 800;
     private CancellationTokenSource? _debounceCts;
     /// <summary>自定义亚克力 backdrop（可调 tint，macOS vibrancy 参数）；系统禁用透明效果时不用。</summary>
     private readonly AcrylicSystemBackdrop _acrylicBackdrop = new();
@@ -58,8 +61,6 @@ public sealed partial class MainWindow : Window
     /// <summary>合并 event + pipe 双通道重复 toggle。</summary>
     private long _lastToggleTicks;
 
-    /// <summary>是否已把窗口放上屏幕；已显示过且没保存位置时不再重排（OS 保留拖拽后的位置）。</summary>
-    private bool _everPlaced;
     /// <summary>隐藏 pop-out 动画播放中（_visible 尚未复位，此时收到 toggle 应取消关闭）。</summary>
     private bool _hideAnimating;
     /// <summary>隐藏代数：显示/取消隐藏时 +1，让已排队的 _animOut.Completed→HideNow 失配跳过（防止刚显示的窗口又被延迟的 HideNow 关掉）。</summary>
@@ -191,7 +192,7 @@ public sealed partial class MainWindow : Window
                 }
                 return;
             }
-            QueryBox.Focus(FocusState.Pointer);
+            QueryBox.Focus(FocusState.Keyboard);
         };
 
         Closed += async (_, _) =>
@@ -649,7 +650,7 @@ public sealed partial class MainWindow : Window
             _visible = true;
             ForceForeground();
             Activate();
-            QueryBox.Focus(FocusState.Pointer);
+            QueryBox.Focus(FocusState.Keyboard);
             ResetIme();
             return;
         }
@@ -733,7 +734,7 @@ public sealed partial class MainWindow : Window
         // 双击 caption 拖拽区会最大化（全屏）：挂子类吞掉该消息（见 NoMaximizeWndProc）
         try { SetWindowSubclass(_hwnd, _noMaximizeProc, new UIntPtr(CaptionSubclassId), IntPtr.Zero); }
         catch (Exception ex) { App.Log("WindowSubclass", ex); }
-        PlaceWindow(LocalState.Ui.WindowWidth, 590);
+        PlaceWindow(LauncherWidth, 590);
 
         // 前台变化钩子：点击外面/Alt+Tab 的本质是前台从本窗口切走。
         // 不依赖 WinUI 的 Activated 事件（该事件在部分环境下不可靠/不触发），
@@ -783,51 +784,45 @@ public sealed partial class MainWindow : Window
             }));
     }
 
+    /// <summary>把窗口放到鼠标所在显示器（uTools 式唤起：鼠标在哪块屏，窗口就弹在哪块屏）。</summary>
     private void PlaceWindow(int w, int h)
     {
         if (_appWindow is null) return;
         _appWindow.Resize(new SizeInt32(w, h));
         _appWindow.Title = "Spark";
-        var area = DisplayArea.GetFromWindowId(_appWindow.Id, DisplayAreaFallback.Primary);
-        if (area is null) return;
-        var work = area.WorkArea;
-
-        var hasSaved = LocalState.Ui.WindowX >= 0 && LocalState.Ui.WindowY >= 0;
-        var saved = hasSaved ? SavedWindowPos(w, h) : null;
-        if (saved is PointInt32 p)
-        {
-            _appWindow.Move(p);
-        }
-        else if (!_everPlaced || hasSaved)
-        {
-            // 首次显示，或保存的位置已失效（显示器拔掉等）→ 居中
-            _appWindow.Move(new PointInt32(
-                work.X + (work.Width - w) / 2,
-                work.Y + Math.Max(80, work.Height / 6)));
-        }
-        // 其余情况不重排：窗口已显示过，OS 保留拖拽后的位置
-        _everPlaced = true;
+        _appWindow.Move(CursorPlacement(w, h));
     }
 
-    /// <summary>已保存的窗口位置；其中心点不再落在任何显示器工作区内时视为失效，返回 null。</summary>
-    private PointInt32? SavedWindowPos(int w, int h)
+    /// <summary>
+    /// 计算唤起位置：鼠标所在显示器工作区水平居中、垂直 1/6（对齐原型顶部留白比例）。
+    /// GetCursorPos 在 PerMonitorV2 下返回物理像素，与 GetMonitorInfo/AppWindow.Move 同一坐标系，
+    /// 跨屏 DPI 无换算问题。Win32 取屏失败时回退主屏居中（旧行为）。
+    /// </summary>
+    private PointInt32 CursorPlacement(int w, int h)
     {
-        var x = LocalState.Ui.WindowX;
-        var y = LocalState.Ui.WindowY;
-        if (x < 0 || y < 0) return null;
-        var cx = x + w / 2;
-        var cy = y + h / 2;
-        // 不用 DisplayArea.FindAll()：该 API 在部分 WinAppSDK 版本上枚举会抛 InvalidCastException。
-        // 这里用 Win32 枚举显示器（虚拟屏幕坐标，与窗口位置同坐标系）。
-        var onScreen = false;
-        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
-            (IntPtr hMon, IntPtr hdc, ref RECT r, IntPtr data) =>
+        if (GetCursorPos(out var pt))
+        {
+            var hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+            if (hMon != IntPtr.Zero && GetMonitorInfo(hMon, ref mi))
             {
-                if (cx >= r.Left && cx < r.Right && cy >= r.Top && cy < r.Bottom)
-                    onScreen = true;
-                return true;
-            }, IntPtr.Zero);
-        return onScreen ? new PointInt32(x, y) : null;
+                var work = mi.rcWork;
+                var workW = work.Right - work.Left;
+                var workH = work.Bottom - work.Top;
+                return new PointInt32(
+                    work.Left + (workW - w) / 2,
+                    work.Top + Math.Max(80, workH / 6));
+            }
+        }
+
+        // 兜底：主屏工作区居中（旧行为）
+        var appWindow = _appWindow;
+        if (appWindow is null) return default;
+        var area = DisplayArea.GetFromWindowId(appWindow.Id, DisplayAreaFallback.Primary);
+        if (area is null) return appWindow.Position;
+        return new PointInt32(
+            area.WorkArea.X + (area.WorkArea.Width - w) / 2,
+            area.WorkArea.Y + Math.Max(80, area.WorkArea.Height / 6));
     }
 
     // ==================== 拖拽 ====================
@@ -896,7 +891,17 @@ public sealed partial class MainWindow : Window
             if (_hwnd == IntPtr.Zero)
                 _hwnd = WindowNative.GetWindowHandle(this);
 
-            // 窗口仍隐藏：采样背景把 DWM 圆角外框设成当前玻璃感知色（详见 SyncDwmBorderColor）
+            // 窗口仍隐藏：先移到目标屏（鼠标所在屏），再采样背景色。
+            // SyncDwmBorderColor 按窗口当前矩形采样屏幕均值算 1px 边框感知色，
+            // 跨屏唤起时若在旧位置采样，边框色会按上一块屏算（白屏↔黑屏切换时颜色反了）。
+            // SetWindowPos 对隐藏窗口立即生效（AppWindow.Move 在未显示时行为不定）。
+            if (_appWindow is not null)
+            {
+                var p = CursorPlacement(LauncherWidth, 590);
+                SetWindowPos(_hwnd, IntPtr.Zero, p.X, p.Y, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            // 采样背景把 DWM 圆角外框设成当前玻璃感知色（详见 SyncDwmBorderColor）
             try { SyncDwmBorderColor(); } catch { /* ignore */ }
 
             try { _appWindow?.Show(true); } catch { /* ignore */ }
@@ -904,7 +909,7 @@ public sealed partial class MainWindow : Window
             ShowWindow(_hwnd, 5);  // SW_SHOW
 
             // Show 之后 Resize 才生效（窗口未显示时 Resize 会被忽略）
-            PlaceWindow(LocalState.Ui.WindowWidth, 590);
+            PlaceWindow(LauncherWidth, 590);
             // 防止 WinUI 在显示时把 DLGFRAME 样式加回来（白圈来源）
             try { MakeFrameless(); } catch { /* ignore */ }
 
@@ -915,10 +920,11 @@ public sealed partial class MainWindow : Window
             ApplyModeSwitch(open: false, animate: false);
             QueryBox.Text = "";
             _ = RefreshResultsAsync("");
-            // 用 Pointer 状态聚焦 + IME 重建：修复 Show/Hide 循环后中文输入法
+            // 用 Keyboard 状态聚焦 + IME 重建：修复 Show/Hide 循环后中文输入法
             // 候选窗不弹、只能打英文的问题（详见 ResetIme）
-            QueryBox.Focus(FocusState.Pointer);
+            QueryBox.Focus(FocusState.Keyboard);
             ResetIme();
+            LogFocusState("show");
             // 唤起时收藏选中态复位（上一轮导航状态不残留）
             _favActive = -1;
             UpdateFavCardStates();
@@ -948,20 +954,25 @@ public sealed partial class MainWindow : Window
 
     /// <summary>强制重建输入法上下文：窗口 Show/Hide 循环后，XAML 的输入法（TSF）
     /// 上下文可能没重新挂到搜索框上——中文输入法候选窗不弹、只能打英文。
-    /// 摘除再挂回 IMM32 上下文 + 确保 IME 打开 + 取消残留组词，触发输入服务重建桥接。
-    /// 必须在窗口显示且搜索框聚焦后调用（UI 线程）。</summary>
+    /// 真实鼠标点击能恢复（pointer 交互才会激活 TSF 文档管理器），程序化聚焦不会，
+    /// 所以只能靠重建输入上下文触发输入服务重新桥接。
+    /// 注意：WinUI 3 的 XAML 内容在桥接子窗口里，键盘焦点窗口（GetFocus）才是输入
+    /// 上下文所在窗口，对顶层 _hwnd 操作无效。必须在窗口显示且搜索框聚焦后调用（UI 线程）。</summary>
     private void ResetIme()
     {
         try
         {
-            if (_hwnd == IntPtr.Zero) return;
+            // XAML 桥接子窗口持键盘焦点；GetFocus 失败时回退顶层窗口
+            var focusHwnd = GetFocus();
+            if (focusHwnd == IntPtr.Zero) focusHwnd = _hwnd;
+            if (focusHwnd == IntPtr.Zero) return;
 
             // 摘除再挂回：强制 IMM32 上下文重建（对 TSF 输入法走兼容层同样生效）
-            var prev = ImmAssociateContext(_hwnd, IntPtr.Zero);
+            var prev = ImmAssociateContext(focusHwnd, IntPtr.Zero);
             if (prev != IntPtr.Zero)
-                ImmAssociateContext(_hwnd, prev);
+                ImmAssociateContext(focusHwnd, prev);
 
-            var himc = ImmGetContext(_hwnd);
+            var himc = ImmGetContext(focusHwnd);
             if (himc != IntPtr.Zero)
             {
                 try
@@ -971,16 +982,18 @@ public sealed partial class MainWindow : Window
                 }
                 finally
                 {
-                    ImmReleaseContext(_hwnd, himc);
+                    ImmReleaseContext(focusHwnd, himc);
                 }
             }
         }
         catch { /* ignore */ }
     }
 
-    /// <summary>显示后延迟重试抢前台，直到窗口确实处于前台或状态变化。
+    /// <summary>显示后延迟重试抢前台 + 补聚焦，直到窗口确实处于前台或状态变化。
     /// 必须拿到前台：未激活的窗口点击外面时前台无变化，FgHook/Deactivated 都不触发，
-    /// "点击外面隐藏"会失效（用户实测：唤起未抢到前台时点外面关不掉）。</summary>
+    /// "点击外面隐藏"会失效（用户实测：唤起未抢到前台时点外面关不掉）。
+    /// 每次重试都补一次输入框聚焦 + IME 重建：TSF 文档管理器只在窗口激活稳定后才挂上，
+    /// 且需要多轮（第一轮焦点可能被动画/抢前台吃掉）。已拿到前台也至少跑两轮再停。</summary>
     private async Task RetryFocusAsync()
     {
         for (var i = 0; i < 5; i++)
@@ -993,15 +1006,47 @@ public sealed partial class MainWindow : Window
                 ForceForeground();
                 Activate();
             }
-            // 每次重试都补一次输入框聚焦：窗口刚弹出时首次 Focus 可能被动画/抢前台
-            // 吃掉，TextBox 拿不到焦点时输入法上下文不会挂上（中文模式直接打出英文）。
-            // 用 Pointer 状态 + IME 重建：程序化聚焦在 Show/Hide 循环后不重建
-            // TSF 输入上下文，Pointer 路径会触发，中文输入法候选窗才能弹出。
-            QueryBox.Focus(FocusState.Pointer);
+            // 焦点往返：把焦点先移出输入框再移回，强制触发真正的 LostFocus→GotFocus。
+            // TSF 文档管理器只在 GotFocus 时尝试挂接：唤起瞬间窗口尚未激活，首次
+            // GotFocus 挂接会失败；而焦点已在输入框时重复 Focus() 是 no-op（不触发
+            // GotFocus），所以必须移走焦点再移回，让窗口激活稳定后的这次 GotFocus
+            // 重新走 TSF 挂接（中文输入法候选窗才能弹出）。
+            ResultList.Focus(FocusState.Programmatic);
+            QueryBox.Focus(FocusState.Keyboard);
             ResetIme();
-            if (GetForegroundWindow() == _hwnd)
+            LogFocusState($"retry{i}");
+            // 已拿到前台且至少补了两轮（TSF 需要窗口激活稳定后才会挂上文档管理器）
+            if (GetForegroundWindow() == _hwnd && i >= 1)
                 return;
         }
+    }
+
+    /// <summary>记录唤起后焦点/输入法状态（排查"中文输入法不弹候选窗"用）：
+    /// 窗口是否前台、Win32 键盘焦点窗口、XAML 焦点元素、IMM 输入法开关状态。</summary>
+    private void LogFocusState(string tag)
+    {
+        try
+        {
+            var fg = GetForegroundWindow();
+            var focus = GetFocus();
+            var xamlFocus = FocusManager.GetFocusedElement(Root.XamlRoot);
+            var xamlName = (xamlFocus as FrameworkElement)?.Name
+                ?? (xamlFocus as TextBox)?.Name ?? xamlFocus?.GetType().Name ?? "null";
+
+            var imeOpen = false;
+            var focusHwnd = focus != IntPtr.Zero ? focus : _hwnd;
+            if (focusHwnd != IntPtr.Zero)
+            {
+                var himc = ImmGetContext(focusHwnd);
+                if (himc != IntPtr.Zero)
+                {
+                    imeOpen = ImmGetOpenStatus(himc);
+                    ImmReleaseContext(focusHwnd, himc);
+                }
+            }
+            App.Log("Focus", $"{tag}: fg={(fg == _hwnd)} focus=0x{focus.ToInt64():X} xaml={xamlName} imeOpen={imeOpen}");
+        }
+        catch (Exception ex) { App.Log("FocusState", ex); }
     }
 
     public void HideLauncher()
@@ -1096,6 +1141,10 @@ public sealed partial class MainWindow : Window
                 AttachThreadInput(fgTid, curTid, true);
 
             SetForegroundWindow(_hwnd);
+            // 当前线程的窗口可绕过前台锁直接激活（SetForegroundWindow 可能被拒）；
+            // 激活状态不完整时 TSF 输入上下文不会挂上（输入法候选窗不弹），
+            // 真实点击能恢复也是因为点击会完成激活链路。
+            SetActiveWindow(_hwnd);
             BringWindowToTop(_hwnd);
             SetWindowPos(_hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002); // HWND_TOPMOST
             SetWindowPos(_hwnd, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002); // HWND_NOTOPMOST
@@ -1179,6 +1228,10 @@ public sealed partial class MainWindow : Window
                 _ = LoadIconAsync(newItems[^1], gen);
         }
 
+        // 高亮查询词同步到每个结果项（复用对象也要更新，容器 DataContextChanged
+        // 只在引用变化时触发，同项复用依赖这里主动刷新）
+        foreach (var x in newItems) x.HighlightQuery = q;
+
         if (!sameIds)
         {
             _items.ReplaceAll(newItems);
@@ -1206,6 +1259,92 @@ public sealed partial class MainWindow : Window
         }
         // 搜索时收藏区变淡（对齐原型 dimmed）
         FavRoot.Opacity = string.IsNullOrWhiteSpace(q) ? 1.0 : 0.45;
+
+        // 高亮刷新：容器复用同一 item 时 DataContextChanged 不触发，这里主动重建
+        RefreshResultHighlights();
+    }
+
+    // ==================== 标题匹配高亮 ====================
+
+    /// <summary>结果项 DataContext 变化时重建标题高亮（容器生成/复用时触发；
+    /// 同项复用由 RefreshResultHighlights 兜底）。</summary>
+    private void OnTitleDataContextChanged(object sender, DataContextChangedEventArgs e)
+    {
+        if (sender is TextBlock tb && tb.DataContext is CandidateDto item)
+            RebuildTitleRuns(tb, item);
+    }
+
+    /// <summary>重建标题 Runs：查询词命中段用 accent 色，其余普通色。
+    /// Inlines 非空时 Text 绑定被忽略，无高亮（空查询/无匹配）时清空 Inlines 走 Text 绑定。</summary>
+    private void RebuildTitleRuns(TextBlock tb, CandidateDto item)
+    {
+        tb.Inlines.Clear();
+        var q = item.HighlightQuery;
+        if (string.IsNullOrEmpty(q) || string.IsNullOrEmpty(item.Title))
+            return;
+        var segs = FindHighlightSegments(item.Title, q);
+        if (segs.Count == 0)
+            return;
+
+        var accent = (Brush)Root.Resources["AccentBrush"];
+        var title = item.Title;
+        var pos = 0;
+        foreach (var (start, len) in segs)
+        {
+            if (start > pos)
+                tb.Inlines.Add(new Run { Text = title.Substring(pos, start - pos) });
+            tb.Inlines.Add(new Run { Text = title.Substring(start, len), Foreground = accent });
+            pos = start + len;
+        }
+        if (pos < title.Length)
+            tb.Inlines.Add(new Run { Text = title.Substring(pos) });
+    }
+
+    /// <summary>标题高亮分段：先找 query 的连续子串；找不到再逐字符顺序匹配
+    /// （近似 host 的模糊搜索，相邻命中合并成段）。不区分大小写。</summary>
+    private static List<(int Start, int Len)> FindHighlightSegments(string title, string query)
+    {
+        var segs = new List<(int Start, int Len)>();
+        var t = title.ToLowerInvariant();
+        var q = query.ToLowerInvariant();
+
+        var idx = t.IndexOf(q, StringComparison.Ordinal);
+        if (idx >= 0)
+        {
+            segs.Add((idx, q.Length));
+            return segs;
+        }
+
+        var ti = 0;
+        foreach (var ch in q)
+        {
+            var found = t.IndexOf(ch, ti);
+            if (found < 0) break;
+            if (segs.Count > 0 && segs[^1].Start + segs[^1].Len == found)
+                segs[^1] = (segs[^1].Start, segs[^1].Len + 1);  // 与上段相邻，合并
+            else
+                segs.Add((found, 1));
+            ti = found + 1;
+        }
+        return segs;
+    }
+
+    /// <summary>主动重建所有已生成容器的标题高亮（虚拟化未生成的由
+    /// OnTitleDataContextChanged 兜底）。</summary>
+    private void RefreshResultHighlights()
+    {
+        for (var i = 0; i < _items.Count; i++)
+        {
+            if (ResultList.ContainerFromIndex(i) is ListViewItem lvi
+                && (lvi.ContentTemplateRoot as FrameworkElement)?.FindName("RowTitle") is TextBlock rowTb
+                && rowTb.DataContext is CandidateDto rowItem)
+                RebuildTitleRuns(rowTb, rowItem);
+
+            if (ResultGrid.ContainerFromIndex(i) is GridViewItem gvi
+                && (gvi.ContentTemplateRoot as FrameworkElement)?.FindName("TileTitle") is TextBlock tileTb
+                && tileTb.DataContext is CandidateDto tileItem)
+                RebuildTitleRuns(tileTb, tileItem);
+        }
     }
 
     /// <summary>后台取图标补到行上：gen 过期（新一轮查询已开始）则丢弃。</summary>
@@ -2293,8 +2432,6 @@ public sealed partial class MainWindow : Window
             HideInvokeSwitch.IsChecked = LocalState.Ui.HideAfterInvoke;
             ThemeCombo.SelectedIndex = LocalState.Ui.Theme switch { "light" => 2, "dark" => 1, _ => 0 };
             ViewCombo.SelectedIndex = LocalState.Ui.DefaultView == "grid" ? 1 : 0;
-            WidthSlider.Value = LocalState.Ui.WindowWidth;
-            WidthValue.Text = $"{LocalState.Ui.WindowWidth}px";
             UpdateHotkeyPresets(animate: false);
         }
         finally { _syncing = false; }
@@ -2419,20 +2556,6 @@ public sealed partial class MainWindow : Window
         LocalState.Ui.DefaultView = ViewCombo.SelectedIndex == 1 ? "grid" : "list";
         LocalState.SaveUi();
         SetView(LocalState.Ui.DefaultView == "grid");
-    }
-
-    private void OnWidthChanged(object sender, RangeBaseValueChangedEventArgs e)
-    {
-        var w = (int)Math.Round(e.NewValue);
-        WidthValue.Text = $"{w}px";
-        if (_syncing) return;
-        // Slider 初始化（Value 从 0 钳到 Minimum）也会触发本事件；
-        // 只在设置页可见时才真正改窗口宽度，避免启动时误保存
-        if (SettingsPanel.Visibility != Visibility.Visible) return;
-        LocalState.Ui.WindowWidth = w;
-        LocalState.SaveUi();
-        if (_appWindow is not null)
-            PlaceWindow(w, 590);
     }
 
     private void OnHotkeyPreset(object sender, RoutedEventArgs e)
@@ -2990,10 +3113,16 @@ public sealed partial class MainWindow : Window
     private static extern bool ImmSetOpenStatus(IntPtr hIMC, bool fOpen);
 
     [DllImport("imm32.dll")]
+    private static extern bool ImmGetOpenStatus(IntPtr hIMC);
+
+    [DllImport("imm32.dll")]
     private static extern IntPtr ImmAssociateContext(IntPtr hWnd, IntPtr hIMC);
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetActiveWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -3004,8 +3133,16 @@ public sealed partial class MainWindow : Window
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
+    // SetWindowPos 标志：隐藏态移动窗口用（不动大小/层级/焦点）
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOZORDER = 0x0004;
+    private const uint SWP_NOACTIVATE = 0x0010;
+
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetFocus();
 
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
@@ -3058,8 +3195,27 @@ public sealed partial class MainWindow : Window
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }
 
-    private delegate bool EnumMonitorsProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT { public int X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int cbSize;      // 必须初始化 = Marshal.SizeOf<MONITORINFO>()，否则 GetMonitorInfo 失败
+        public RECT rcMonitor;  // 显示器完整矩形（物理像素）
+        public RECT rcWork;     // 工作区（不含任务栏，物理像素）
+        public uint dwFlags;
+    }
+
+    // MonitorFromPoint：找不到包含点时返回最近显示器
+    private const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
 
     [DllImport("user32.dll")]
-    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, EnumMonitorsProc lpfnEnum, IntPtr dwData);
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
 }

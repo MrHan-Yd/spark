@@ -36,8 +36,9 @@ pub trait SearchIndex: Send + Sync {
     }
 }
 
-/// 默认页（空查询）最多展示的最近使用条数：一屏扫完不滚屏（信息密度高≠好）。
-const EMPTY_QUERY_RECENT_LIMIT: usize = 6;
+/// 默认页（空查询）最多展示的最近使用条数：平铺视图 5~6 行 × 9 列 ≈ 54 个。
+/// 按窗口高度 590px 算，结果区实际可完整显示约 5 行，多出的行由 GridView 滚动承接。
+const EMPTY_QUERY_RECENT_LIMIT: usize = 54;
 
 /// App index + history fused search (P0).
 #[derive(Debug, Default)]
@@ -217,13 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_recents_capped_at_six() {
+    fn empty_query_recents_capped() {
         let mut idx = AppIndex::new();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        for i in 0..10 {
+        for i in 0..60 {
             idx.history_mut()
                 .seed_for_test(&format!("app.{i}"), 1, now - i * 60, None);
         }
@@ -231,7 +232,7 @@ mod tests {
         assert_eq!(
             items.len(),
             EMPTY_QUERY_RECENT_LIMIT,
-            "默认页最多 6 条最近使用"
+            "默认页最多展示平铺 5~6 行（54 条）最近使用"
         );
         assert_eq!(items[0].id, "app.0", "最新的排最前");
         assert_eq!(items[5].id, "app.5");

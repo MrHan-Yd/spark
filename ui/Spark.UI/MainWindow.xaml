@@ -520,8 +520,9 @@
                 </Border>
               </Grid>
               <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
-                <TextBlock Text="{Binding Title}" FontSize="14" FontWeight="Medium"
-                           Foreground="{StaticResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="RowTitle" Text="{Binding Title}" FontSize="14" FontWeight="Medium"
+                           Foreground="{StaticResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis"
+                           DataContextChanged="OnTitleDataContextChanged"/>
                 <TextBlock Text="{Binding Subtitle}" FontSize="12"
                            Foreground="{StaticResource TextSecondaryBrush}" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
@@ -621,9 +622,10 @@
                              Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
               </Grid>
-              <TextBlock Text="{Binding Title}" FontSize="10"
+              <TextBlock x:Name="TileTitle" Text="{Binding Title}" FontSize="10"
                          Foreground="{StaticResource TextSecondaryBrush}" TextAlignment="Center"
-                         TextTrimming="CharacterEllipsis" MaxLines="1"/>
+                         TextTrimming="CharacterEllipsis" MaxLines="1"
+                         DataContextChanged="OnTitleDataContextChanged"/>
             </StackPanel>
           </DataTemplate>
         </GridView.ItemTemplate>
@@ -909,19 +911,6 @@
                   </ComboBox>
                 </Grid>
               </Border>
-              <StackPanel Padding="0,13" BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,0,0,1">
-                <Grid ColumnSpacing="16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                  </Grid.ColumnDefinitions>
-                  <TextBlock Text="窗口宽度" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
-                  <TextBlock x:Name="WidthValue" Grid.Column="1" Text="800px" FontSize="12"
-                             Foreground="{StaticResource TextTertiaryBrush}" VerticalAlignment="Center"/>
-                </Grid>
-                <Slider x:Name="WidthSlider" Minimum="560" Maximum="840" StepFrequency="10"
-                        ValueChanged="OnWidthChanged" Margin="0,6,0,0"/>
-              </StackPanel>
             </StackPanel>
 
             <!-- 插件 -->
