@@ -520,7 +520,7 @@
                 </Border>
               </Grid>
               <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
-                <TextBlock x:Name="RowTitle" Text="{Binding Title}" FontSize="14" FontWeight="Medium"
+                <TextBlock x:Name="RowTitle" FontSize="14" FontWeight="Medium"
                            Foreground="{StaticResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis"
                            DataContextChanged="OnTitleDataContextChanged"/>
                 <TextBlock Text="{Binding Subtitle}" FontSize="12"
@@ -622,7 +622,7 @@
                              Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
               </Grid>
-              <TextBlock x:Name="TileTitle" Text="{Binding Title}" FontSize="10"
+              <TextBlock x:Name="TileTitle" FontSize="10"
                          Foreground="{StaticResource TextSecondaryBrush}" TextAlignment="Center"
                          TextTrimming="CharacterEllipsis" MaxLines="1"
                          DataContextChanged="OnTitleDataContextChanged"/>

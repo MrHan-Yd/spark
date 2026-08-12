@@ -22,6 +22,7 @@ using Windows.Foundation;
 using Windows.Graphics;
 using Windows.System;
 using Windows.UI;
+using Windows.UI.Input.Preview.Injection;
 using WinRT;
 using WinRT.Interop;
 
@@ -135,6 +136,9 @@ public sealed partial class MainWindow : Window
         // 箭头键在根上全局接管（handledEventsToo=true：输入框有文本时会先消费箭头键并把事件标为已处理，
         // 普通 KeyDown 收不到；这里在冒泡终点仍能收到），统一只控制下面选中项
         Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnRootKeyDown), true);
+        // 临时诊断：确认注入点击是否产生 XAML pointer 事件（验证 InputInjector 管道）
+        Root.PointerPressed += (_, e) =>
+            App.Log("Pointer", $"pressed at {e.GetCurrentPoint(Root).Position}");
         // 右键菜单：列表/平铺共用（handledEventsToo 保证行内元素命中也能收到）
         ResultList.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
         ResultGrid.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
@@ -193,6 +197,12 @@ public sealed partial class MainWindow : Window
                 return;
             }
             QueryBox.Focus(FocusState.Keyboard);
+            // 激活恢复：焦点往返强制 GotFocus 重触发，确保 TSF 重新挂接
+            // （唤起/跨屏 Move/抢焦点后窗口激活链变化，输入法候选窗会丢，
+            // 只有真实的 LostFocus→GotFocus 会让 TextBox 重新挂接文档管理器）
+            ResultList.Focus(FocusState.Programmatic);
+            QueryBox.Focus(FocusState.Keyboard);
+            ResetIme();
         };
 
         Closed += async (_, _) =>
@@ -620,6 +630,7 @@ public sealed partial class MainWindow : Window
     /// <summary>event + pipe 可能各推一次，300ms 内只处理一次。</summary>
     private void HandleToggle()
     {
+        App.Log("Toggle", $"enter: visible={_visible} hideAnim={_hideAnimating}");
         var now = Environment.TickCount64;
         if (now - _lastToggleTicks < 300)
             return;
@@ -656,9 +667,174 @@ public sealed partial class MainWindow : Window
         }
 
         if (_visible)
+        {
+            // 跨屏跟随（uTools 式）：窗口可见时按热键，鼠标不在窗口所在屏
+            // → 移到鼠标屏（不关闭）；想关闭时鼠标应在窗口所在屏再按热键。
+            if (!CursorOnWindowMonitor())
+            {
+                MoveToCursorMonitor();
+                return;
+            }
             HideLauncher(byToggle: true);
+        }
         else
             ShowLauncher();
+    }
+
+    /// <summary>鼠标是否在窗口所在显示器上（跨屏跟随判断用）。
+    /// 用 MonitorFromPoint 比较鼠标点与窗口中心的显示器归属。</summary>
+    private bool CursorOnWindowMonitor()
+    {
+        if (_hwnd == IntPtr.Zero) return true;
+        GetCursorPos(out var pt);
+        GetWindowRect(_hwnd, out var wr);
+        var winPt = new POINT { X = (wr.Left + wr.Right) / 2, Y = (wr.Top + wr.Bottom) / 2 };
+        return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+            == MonitorFromPoint(winPt, MONITOR_DEFAULTTONEAREST);
+    }
+
+    /// <summary>强制 backdrop 重连：让 DWM 重新模糊当前窗口位置后的屏幕内容。
+    /// 唤起/跨屏后 Acrylic 模糊可能停留在旧位置（玻璃呈"黑色"），重连即刷新。</summary>
+    private void ReconnectBackdrop()
+    {
+        try
+        {
+            SystemBackdrop = null;
+            SystemBackdrop = _acrylicBackdrop;
+            bool dark = LocalState.Ui.Theme switch
+            {
+                "light" => false,
+                "dark" => true,
+                _ => SystemUsesDark(),
+            };
+            _acrylicBackdrop.ApplyTheme(dark);
+            App.Log("Backdrop", "reconnected");
+        }
+        catch (Exception ex) { App.Log("Backdrop", ex); }
+    }
+
+    /// <summary>窗口可见时跨屏跟随：隐藏→重新显示在鼠标所在屏。
+    /// WinUI 3 中"已存在的 TextBox"跨屏 Move 后，TSF 文档管理器无法通过程序化
+    /// 聚焦重新挂接（只有真实输入事件能激活——用户实测点击才恢复）；而"隐藏→
+    /// 显示"会走完整显示周期（重建输入上下文 + 焦点往返），输入法必然恢复。
+    /// 注意：AppWindow.Hide/Show 是异步状态机，Hide+Show 同帧连续调用会合并，
+    /// Show 的激活/输入上下文部分被跳过（窗口显示但 TSF 不挂）——必须延迟到
+    /// 状态机处理完隐藏后再 Show。视觉上窗口从旧屏消失、在鼠标屏带 pop-in
+    /// 重新弹出；保留已输入文本。</summary>
+    private void MoveToCursorMonitor()
+    {
+        App.Log("CrossScreen", "move via hide+show (delayed)");
+        var text = QueryBox.Text ?? "";
+        _animOut.Stop();
+        HideNow();
+        _ = Task.Delay(100).ContinueWith(_ => DispatcherQueue.TryEnqueue(() =>
+        {
+            if (_visible) return;  // 期间用户已重新显示，跳过重复 Show
+            ShowLauncher();
+            // ShowLauncher 按"唤起"语义清空输入；跨屏跟随应保留已输入内容继续输入。
+            // 注意：给 Text 赋值后插入光标默认回到开头，需显式移到末尾（继续输入=追加）
+            if (!string.IsNullOrEmpty(text))
+            {
+                QueryBox.Text = text;
+                QueryBox.SelectionStart = text.Length;
+                QueryBox.SelectionLength = 0;
+                _ = RefreshResultsAsync(text);
+            }
+            // 跨屏后 TSF 文档管理器只有真实输入事件能重新激活（WinUI 3 框架 bug，
+            // 程序化聚焦/往返全部无效）——自动注入一次点击恢复输入法
+            _ = RestoreImeByClickAsync();
+        }));
+    }
+
+    /// <summary>跨屏显示稳定后注入一次真实指针输入恢复输入法（TSF 文档管理器激活）。
+    /// 位置实时取 GetWindowRect（窗口移到哪点哪，不怕用户移动窗口）。</summary>
+    private async Task RestoreImeByClickAsync()
+    {
+        await Task.Delay(150);  // 等窗口显示稳定（位置已定）
+        if (!_visible || _hwnd == IntPtr.Zero)
+            return;
+        await InjectImeKickClickAsync();
+    }
+
+    /// <summary>注入一次真实指针输入激活 TSF：优先触摸注入（InputInjector 走
+    /// WM_POINTER 指针管道，WinUI 3 XAML 原生识别，且不移动光标）；
+    /// mouse_event 经典鼠标消息不被 XAML 识别（实测 Pointer 事件不产生），
+    /// 仅作回退。点击输入框区域（顶部搜索行），位置实时取 GetWindowRect。</summary>
+    private async Task InjectImeKickClickAsync()
+    {
+        try
+        {
+            if (_hwnd == IntPtr.Zero) return;
+            if (!GetWindowRect(_hwnd, out var wr)) return;
+            GetCursorPos(out var cur);
+
+            var cx = (wr.Left + wr.Right) / 2;
+            var cy = wr.Top + 40;  // 输入框区域（顶部 16px 留白之下）
+
+            if (TryInjectTouchClick(cx, cy))
+            {
+                App.Log("Ime", $"touch injected at ({cx},{cy}) wr=({wr.Left},{wr.Top},{wr.Right},{wr.Bottom})");
+                return;
+            }
+            // 回退：SetCursorPos + mouse_event（经典消息，XAML 可能不识别）
+            SetCursorPos(cx, cy);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+            SetCursorPos(cur.X, cur.Y);
+            App.Log("Ime", $"mouse fallback at ({cx},{cy})");
+        }
+        catch (Exception ex) { App.Log("ImeKick", ex); }
+    }
+
+    /// <summary>InputInjector 触摸注入（WM_POINTER 管道，XAML 原生输入路径）。
+    /// 成功返回 true；不可用返回 false 走 mouse 回退。</summary>
+    private bool TryInjectTouchClick(int x, int y)
+    {
+        try
+        {
+            var injector = InputInjector.TryCreate();
+            if (injector is null)
+            {
+                App.Log("Ime", "InputInjector.TryCreate -> null");
+                return false;
+            }
+            // 触摸注入坐标是 DIP：物理像素除以窗口所在屏的缩放
+            var scale = Root.XamlRoot?.RasterizationScale ?? 1.0;
+            var dx = (int)(x / scale);
+            var dy = (int)(y / scale);
+            var pos = new InjectedInputPoint { PositionX = dx, PositionY = dy };
+            var down = new InjectedInputTouchInfo
+            {
+                PointerInfo = new InjectedInputPointerInfo
+                {
+                    PointerId = 1,
+                    PixelLocation = pos,
+                    PointerOptions = InjectedInputPointerOptions.New
+                        | InjectedInputPointerOptions.PointerDown
+                        | InjectedInputPointerOptions.InContact,
+                    PerformanceCount = 0,
+                },
+                Contact = new InjectedInputRectangle { Left = dx - 2, Top = dy - 2, Right = dx + 2, Bottom = dy + 2 },
+            };
+            injector.InjectTouchInput(new[] { down });
+            var up = new InjectedInputTouchInfo
+            {
+                PointerInfo = new InjectedInputPointerInfo
+                {
+                    PointerId = 1,
+                    PixelLocation = pos,
+                    PointerOptions = InjectedInputPointerOptions.PointerUp,
+                    PerformanceCount = 0,
+                },
+            };
+            injector.InjectTouchInput(new[] { up });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            App.Log("Ime", $"touch inject failed: {ex.Message}");
+            return false;
+        }
     }
 
     private static string? FindIconPath()
@@ -809,10 +985,17 @@ public sealed partial class MainWindow : Window
                 var work = mi.rcWork;
                 var workW = work.Right - work.Left;
                 var workH = work.Bottom - work.Top;
-                return new PointInt32(
+                var pos = new PointInt32(
                     work.Left + (workW - w) / 2,
                     work.Top + Math.Max(80, workH / 6));
+                App.Log("Cursor", $"mouse=({pt.X},{pt.Y}) mon work=({work.Left},{work.Top},{work.Right},{work.Bottom}) -> ({pos.X},{pos.Y})");
+                return pos;
             }
+            App.Log("Cursor", $"GetMonitorInfo failed hMon={hMon.ToInt64():X}");
+        }
+        else
+        {
+            App.Log("Cursor", "GetCursorPos failed");
         }
 
         // 兜底：主屏工作区居中（旧行为）
@@ -1001,6 +1184,11 @@ public sealed partial class MainWindow : Window
             await Task.Delay(120);
             if (!_visible || _hwnd == IntPtr.Zero)
                 return;
+            // 第一轮（窗口已显示稳定）：强制 backdrop 重连刷新 Acrylic 采样。
+            // 唤起/跨屏后 DWM 模糊可能停留在旧位置/旧屏（玻璃呈"黑色"），
+            // 点击触发重绘才恢复——这里主动重连，无需用户点击。
+            if (i == 0)
+                ReconnectBackdrop();
             if (GetForegroundWindow() != _hwnd)
             {
                 ForceForeground();
@@ -1015,8 +1203,8 @@ public sealed partial class MainWindow : Window
             QueryBox.Focus(FocusState.Keyboard);
             ResetIme();
             LogFocusState($"retry{i}");
-            // 已拿到前台且至少补了两轮（TSF 需要窗口激活稳定后才会挂上文档管理器）
-            if (GetForegroundWindow() == _hwnd && i >= 1)
+            // 已拿到前台且至少补了四轮（跨屏 DPI 重建可能较久，TSF 挂接需要窗口稳定）
+            if (GetForegroundWindow() == _hwnd && i >= 3)
                 return;
         }
     }
@@ -1266,25 +1454,38 @@ public sealed partial class MainWindow : Window
 
     // ==================== 标题匹配高亮 ====================
 
-    /// <summary>结果项 DataContext 变化时重建标题高亮（容器生成/复用时触发；
-    /// 同项复用由 RefreshResultHighlights 兜底）。</summary>
+    /// <summary>结果项 DataContext 变化时渲染标题（容器生成/复用时触发；
+    /// 同项复用由 RefreshResultHighlights 兜底）。
+    /// 不用 Text 绑定 + Inlines 互斥：WinUI 3 中 Inlines 集合一旦被访问，
+    /// Text 绑定就会被忽略（即使 Inlines 为空）——统一由代码渲染文本。</summary>
     private void OnTitleDataContextChanged(object sender, DataContextChangedEventArgs e)
     {
         if (sender is TextBlock tb && tb.DataContext is CandidateDto item)
-            RebuildTitleRuns(tb, item);
+        {
+            RenderTitle(tb, item);
+            App.Log("HL", $"ctx: title='{item.Title}' q='{item.HighlightQuery}' inlines={tb.Inlines.Count} name={tb.Name}");
+        }
     }
 
-    /// <summary>重建标题 Runs：查询词命中段用 accent 色，其余普通色。
-    /// Inlines 非空时 Text 绑定被忽略，无高亮（空查询/无匹配）时清空 Inlines 走 Text 绑定。</summary>
-    private void RebuildTitleRuns(TextBlock tb, CandidateDto item)
+    /// <summary>渲染标题文本：无高亮（空查询/无匹配）设 Text，有高亮填 Runs。</summary>
+    private void RenderTitle(TextBlock tb, CandidateDto item)
     {
-        tb.Inlines.Clear();
         var q = item.HighlightQuery;
         if (string.IsNullOrEmpty(q) || string.IsNullOrEmpty(item.Title))
+        {
+            if (tb.Inlines.Count > 0)
+                tb.Inlines.Clear();
+            tb.Text = item.Title;
             return;
+        }
+        tb.Text = "";
+        tb.Inlines.Clear();
         var segs = FindHighlightSegments(item.Title, q);
         if (segs.Count == 0)
+        {
+            tb.Text = item.Title;
             return;
+        }
 
         var accent = (Brush)Root.Resources["AccentBrush"];
         var title = item.Title;
@@ -1338,12 +1539,12 @@ public sealed partial class MainWindow : Window
             if (ResultList.ContainerFromIndex(i) is ListViewItem lvi
                 && (lvi.ContentTemplateRoot as FrameworkElement)?.FindName("RowTitle") is TextBlock rowTb
                 && rowTb.DataContext is CandidateDto rowItem)
-                RebuildTitleRuns(rowTb, rowItem);
+                RenderTitle(rowTb, rowItem);
 
             if (ResultGrid.ContainerFromIndex(i) is GridViewItem gvi
                 && (gvi.ContentTemplateRoot as FrameworkElement)?.FindName("TileTitle") is TextBlock tileTb
                 && tileTb.DataContext is CandidateDto tileItem)
-                RebuildTitleRuns(tileTb, tileItem);
+                RenderTitle(tileTb, tileItem);
         }
     }
 
@@ -3123,6 +3324,16 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern IntPtr SetActiveWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetCursorPos(int X, int Y);
+
+    [DllImport("user32.dll")]
+    private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
+
+    // mouse_event 标志（原地点击，无需坐标）
+    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    private const uint MOUSEEVENTF_LEFTUP = 0x0004;
 
     [DllImport("user32.dll")]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
