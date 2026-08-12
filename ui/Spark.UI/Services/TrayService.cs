@@ -22,8 +22,11 @@ public sealed class TrayService : IDisposable
     private const uint NIF_MESSAGE = 0x01;
     private const uint NIF_ICON = 0x02;
     private const uint NIF_TIP = 0x04;
+    private const uint NIF_INFO = 0x10;
     private const uint NIM_ADD = 0;
+    private const uint NIM_MODIFY = 1;
     private const uint NIM_DELETE = 2;
+    private const uint NIIF_INFO = 0x01;
     private const uint MF_STRING = 0;
     private const uint MF_SEPARATOR = 0x800;
     private const int ID_SHOW = 1001;
@@ -48,7 +51,9 @@ public sealed class TrayService : IDisposable
             uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage = WM_TRAY,
             hIcon = _hIcon,
-            szTip = "Spark"
+            szTip = "Spark",
+            szInfo = "",
+            szInfoTitle = ""
         };
 
         _added = Shell_NotifyIcon(NIM_ADD, ref _data);
@@ -93,6 +98,24 @@ public sealed class TrayService : IDisposable
         return CallWindowProc(_oldProc, hWnd, msg, wParam, lParam);
     }
 
+    /// <summary>右下角气泡提示（Win10/11 显示为 toast 风格），如复制结果反馈。</summary>
+    public void ShowBalloon(string title, string text)
+    {
+        if (!_added)
+        {
+            App.Log("Tray", $"ShowBalloon skipped: not added (cbSize={_data.cbSize})");
+            return;
+        }
+        _data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
+        _data.szInfoTitle = title;
+        _data.szInfo = text;
+        _data.dwInfoFlags = NIIF_INFO;
+        var ok = Shell_NotifyIcon(NIM_MODIFY, ref _data);
+        App.Log("Tray", $"ShowBalloon '{title}': {text} -> Shell_NotifyIcon={ok} cbSize={_data.cbSize}");
+        // 还原标志位，避免常驻 INFO 字段干扰后续更新
+        _data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    }
+
     public void Dispose()
     {
         if (_added)
@@ -122,6 +145,16 @@ public sealed class TrayService : IDisposable
         public IntPtr hIcon;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
         public string szTip;
+        public uint dwState;
+        public uint dwStateMask;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string szInfo;
+        public uint uTimeoutOrVersion;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string szInfoTitle;
+        public uint dwInfoFlags;
+        public Guid guidItem;
+        public IntPtr hBalloonIcon;
     }
 
     [StructLayout(LayoutKind.Sequential)]

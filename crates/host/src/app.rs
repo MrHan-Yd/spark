@@ -1,5 +1,7 @@
+use crate::builtins;
 use crate::config::HostConfig;
 use crate::shell;
+use crate::tray::TrayIcon;
 use anyhow::{bail, Result};
 use spark_core::{ensure_data_dir, Candidate, Query};
 use spark_index::{AppIndex, SearchIndex};
@@ -13,6 +15,8 @@ pub struct HostApp {
     index: AppIndex,
     plugins: PluginManager,
     pub config: HostConfig,
+    /// 托盘图标（win_loop 创建后注入；用于右下角气泡提示）
+    pub tray: Option<TrayIcon>,
 }
 
 impl HostApp {
@@ -40,6 +44,7 @@ impl HostApp {
             index,
             plugins,
             config,
+            tray: None,
         })
     }
 
@@ -52,6 +57,42 @@ impl HostApp {
     }
 
     pub fn invoke(&mut self, params: &InvokeParams) -> Result<InvokeResult> {
+        // 内置系统命令走专用执行层（不依赖 target 文件，也不记历史/上默认页）
+        if let Some(spec) = spark_index::builtin::find(&params.item_id) {
+            let action = if params.action_id.is_empty() {
+                "open"
+            } else {
+                params.action_id.as_str()
+            };
+            // 不可逆操作（关机/重启等）：首次回车只返回确认请求，UI 弹窗
+            // 确认后以 "confirm" action 重新 invoke 才真正执行。
+            if action == "open" {
+                if let Some(message) = spec.confirm {
+                    return Ok(InvokeResult::Confirm {
+                        message: message.into(),
+                    });
+                }
+            }
+            return match builtins::execute(spec.id) {
+                Ok(builtins::BuiltinOutcome::Close(msg)) => {
+                    Ok(InvokeResult::Close { message: Some(msg) })
+                }
+                Ok(builtins::BuiltinOutcome::CopyText(text)) => {
+                    // 右下角气泡提示已复制（utools 同款反馈）；托盘由 host 常驻持有
+                    if let Some(tray) = self.tray.as_mut() {
+                        tray.show_balloon("已复制到剪贴板", &format!("{}：{text}", spec.title));
+                    }
+                    Ok(InvokeResult::CopyText { text })
+                }
+                Err(e) => {
+                    warn!(?e, id = %spec.id, "builtin invoke failed");
+                    Ok(InvokeResult::ShowError {
+                        message: e.to_string(),
+                    })
+                }
+            };
+        }
+
         let item = self
             .index
             .find_by_id(&params.item_id)

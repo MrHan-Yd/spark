@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.UI;
 using Microsoft.UI.Text;
@@ -18,6 +19,7 @@ using XamlPath = Microsoft.UI.Xaml.Shapes.Path;
 using Microsoft.Win32;
 using Spark.UI.Models;
 using Spark.UI.Services;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 using Windows.Graphics;
 using Windows.System;
@@ -121,6 +123,7 @@ public sealed partial class MainWindow : Window
         // pane 切换过渡用的位移变换映射（XAML 字段须在 InitializeComponent 之后才能引用）
         _paneShifts[PaneGeneral] = PaneGeneralShift;
         _paneShifts[PaneAppearance] = PaneAppearanceShift;
+        _paneShifts[PaneBuiltins] = PaneBuiltinsShift;
         _paneShifts[PanePlugins] = PanePluginsShift;
         _paneShifts[PaneAbout] = PaneAboutShift;
 
@@ -1551,9 +1554,16 @@ public sealed partial class MainWindow : Window
     /// <summary>后台取图标补到行上：gen 过期（新一轮查询已开始）则丢弃。</summary>
     private async Task LoadIconAsync(CandidateDto item, int gen)
     {
-        var src = await AppIconService.GetIconAsync(item.Id, item.Target ?? item.IconPath);
-        if (src is null || gen != _queryGen) return;
-        item.IconImage = src;
+        try
+        {
+            var src = await AppIconService.GetIconAsync(item.Id, item.Target ?? item.IconPath);
+            if (src is null || gen != _queryGen) return;
+            item.IconImage = src;
+        }
+        catch (Exception ex)
+        {
+            App.Log("LoadIcon", ex);
+        }
     }
 
     /// <summary>收藏卡图标异步补齐：后台提取完成后替换字母占位。
@@ -2487,9 +2497,49 @@ public sealed partial class MainWindow : Window
     {
         SyncSettingsUi();
         ShowPane("general");
+        _ = LoadBuiltinsAsync();   // 内置命令清单（host 不可达则保持空列表）
         // SettingsPanel 无背景（玻璃下透壁纸），主页必须隐藏，否则内容从透明区透出来叠在一起
         ApplyModeSwitch(open: true, animate: _visible);
         UpdateDragRegions();
+    }
+
+    /// <summary>设置页"命令"栏：从 host 拉取命令表（含图标路径），失败/未连接时降级为空。</summary>
+    private async Task LoadBuiltinsAsync()
+    {
+        try
+        {
+            var items = await _host.GetBuiltinsAsync();
+            if (items.Count > 0)
+            {
+                BuiltinList.ItemsSource = items;
+                // 逐行异步补系统图标（字形先占位，提取完切换显示）
+                foreach (var it in items)
+                {
+                    _ = LoadBuiltinListIconAsync(it);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log("LoadBuiltins", ex);
+        }
+    }
+
+    /// <summary>命令栏行图标：有系统图标路径就提取显示，否则保持字形。</summary>
+    private async Task LoadBuiltinListIconAsync(BuiltinInfoDto item)
+    {
+        try
+        {
+            var src = await AppIconService.GetIconAsync(item.Id, item.IconPath);
+            if (src is not null)
+            {
+                item.IconImage = src;
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log("BuiltinIcon", ex);
+        }
     }
 
     private void OnCloseSettings(object sender, RoutedEventArgs e)
@@ -2524,7 +2574,8 @@ public sealed partial class MainWindow : Window
         foreach (var (b, icon) in new (Button, FontIcon?)[]
         {
             (NavGeneral, NavIconGeneral),
-            (NavAppearance, NavIconAppearance), (NavPlugins, NavIconPlugins),
+            (NavAppearance, NavIconAppearance), (NavBuiltins, NavIconBuiltins),
+            (NavPlugins, NavIconPlugins),
             (NavAbout, NavIconAbout),
         })
         {
@@ -2539,6 +2590,7 @@ public sealed partial class MainWindow : Window
         var target = pane switch
         {
             "appearance" => PaneAppearance,
+            "builtins" => PaneBuiltins,
             "plugins" => PanePlugins,
             "about" => PaneAbout,
             _ => PaneGeneral,
@@ -2811,14 +2863,19 @@ public sealed partial class MainWindow : Window
     // ==================== 关于 ====================
 
     private const string GithubRepo = "https://github.com/MrHan-Yd/spark";
-    private const string UpdateApiUrl = "https://api.github.com/repos/MrHan-Yd/spark/releases/latest";
+    /// <summary>发布清单：GitHub Release 最新版的 latest.json 资产（latest/download 重定向，CDN 直取、不走 API）。</summary>
+    private const string UpdateManifestUrl = GithubRepo + "/releases/latest/download/latest.json";
     private bool _checkingUpdate;
+    private UpdateManifest? _pendingUpdate;
 
     /// <summary>当前应用版本（csproj Version，与 Cargo 工作区版本保持一致）。</summary>
     private static Version AppVersion
         => Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 1, 0);
 
     private static string AppVersionText => AppVersion.ToString(3);
+
+    /// <summary>更新清单：版本号 + 安装包地址 + SHA-256。</summary>
+    private sealed record UpdateManifest(string Version, string Url, string Sha256);
 
     private void OnOpenGithub(object sender, RoutedEventArgs e) => OpenUrl(GithubRepo);
 
@@ -2830,11 +2887,17 @@ public sealed partial class MainWindow : Window
         catch (Exception ex) { App.Log("OpenUrl", ex); }
     }
 
-    /// <summary>检查更新：请求 GitHub 最新 Release 并与本地版本比较。
+    /// <summary>检查更新：拉取发布清单（latest.json）并与本地版本比较；
+    /// 发现新版本后按钮转为"下载并安装"（再点一次进入下载安装流程）。
     /// 未发布过 Release（404）或网络失败都只更新状态文字，不弹窗打断。</summary>
     private async void OnCheckUpdate(object sender, RoutedEventArgs e)
     {
         if (_checkingUpdate) return;
+        if (_pendingUpdate is not null)
+        {
+            await DownloadAndInstallAsync(_pendingUpdate);
+            return;
+        }
         _checkingUpdate = true;
         BtnCheckUpdate.IsEnabled = false;
         CheckUpdateLabel.Text = "检查中…";
@@ -2844,15 +2907,19 @@ public sealed partial class MainWindow : Window
         {
             using var client = new HttpClient();
             client.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
-            var json = await client.GetStringAsync(UpdateApiUrl);
-            using var doc = JsonDocument.Parse(json);
-            var tag = doc.RootElement.TryGetProperty("tag_name", out var t) ? t.GetString() : null;
-            var remote = ParseVersion(tag ?? "");
-            var local = ParseVersion(AppVersionText);
-            var cmp = remote.CompareTo(local);
+            var json = await client.GetStringAsync(UpdateManifestUrl);
+            var m = ParseManifest(json);
+            if (m is null)
+            {
+                AboutUpdateStatus.Text = "检查失败，请稍后重试";
+                return;
+            }
+            var cmp = ParseVersion(m.Version).CompareTo(ParseVersion(AppVersionText));
             if (cmp > 0)
             {
-                AboutUpdateStatus.Text = $"发现新版本 {tag}";
+                _pendingUpdate = m;
+                CheckUpdateLabel.Text = "下载并安装";
+                AboutUpdateStatus.Text = $"发现新版本 {m.Version}";
                 BtnOpenRelease.Visibility = Visibility.Visible;
             }
             else if (cmp == 0)
@@ -2861,16 +2928,12 @@ public sealed partial class MainWindow : Window
             }
             else
             {
-                AboutUpdateStatus.Text = $"本地版本更新于远端（{tag}）";
+                AboutUpdateStatus.Text = $"本地版本更新于远端（{m.Version}）";
             }
         }
         catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
             AboutUpdateStatus.Text = "暂无发布版本";
-        }
-        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden)
-        {
-            AboutUpdateStatus.Text = "检查失败：请求过于频繁，请稍后再试";
         }
         catch (Exception ex)
         {
@@ -2881,7 +2944,137 @@ public sealed partial class MainWindow : Window
         {
             _checkingUpdate = false;
             BtnCheckUpdate.IsEnabled = true;
-            CheckUpdateLabel.Text = "检查更新";
+            if (_pendingUpdate is null) CheckUpdateLabel.Text = "检查更新";
+        }
+    }
+
+    /// <summary>下载 → 校验 SHA-256 → 静默安装 → 退出。
+    /// 安装器会强制关闭运行中的 Spark.exe / spark-host.exe，装完 [Run] 拉起新版 host（host 再拉起 UI），
+    /// 完成"自动重启"；校验不过或安装失败都保留"打开下载页"手动兜底。</summary>
+    private async Task DownloadAndInstallAsync(UpdateManifest m)
+    {
+        _checkingUpdate = true;
+        BtnCheckUpdate.IsEnabled = false;
+        CheckUpdateLabel.Text = "下载中…";
+        UpdateProgress.Visibility = Visibility.Visible;
+        UpdateProgress.Value = 0;
+        var dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Spark", "update");
+        Directory.CreateDirectory(dir);
+        var setup = Path.Combine(dir, $"Spark-{m.Version}-setup.exe");
+        try
+        {
+            // 下载（流式落盘 + 进度）
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
+            using var resp = await client.GetAsync(m.Url, HttpCompletionOption.ResponseHeadersRead);
+            resp.EnsureSuccessStatusCode();
+            var total = resp.Content.Headers.ContentLength;
+            await using var src = await resp.Content.ReadAsStreamAsync();
+            await using (var dst = File.Create(setup))
+            {
+                var buf = new byte[64 * 1024];
+                long done = 0;
+                while (true)
+                {
+                    var n = await src.ReadAsync(buf);
+                    if (n <= 0) break;
+                    await dst.WriteAsync(buf.AsMemory(0, n));
+                    done += n;
+                    if (total > 0)
+                    {
+                        var pct = (int)(done * 100 / total);
+                        UpdateProgress.Value = pct;
+                        AboutUpdateStatus.Text = $"正在下载 {pct}%";
+                    }
+                }
+            }
+
+            // 校验 SHA-256：不一致不安装
+            AboutUpdateStatus.Text = "正在校验…";
+            string hash;
+            await using (var fs = File.OpenRead(setup))
+            {
+                hash = Convert.ToHexString(await SHA256.HashDataAsync(fs));
+            }
+            if (!string.Equals(hash, m.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                AboutUpdateStatus.Text = "校验失败，请稍后重试";
+                return;
+            }
+
+            // 静默安装到原安装路径（注册表记录；读不到则默认目录）
+            CheckUpdateLabel.Text = "正在安装…";
+            AboutUpdateStatus.Text = "正在安装，完成后将自动重启…";
+            var installDir = ReadInstallPath()
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Programs", "Spark");
+            var psi = new ProcessStartInfo(setup)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                Arguments = $"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=\"{installDir}\"",
+            };
+            using var proc = Process.Start(psi);
+            if (proc is null)
+            {
+                AboutUpdateStatus.Text = "安装启动失败，请手动下载";
+                return;
+            }
+            await proc.WaitForExitAsync();
+            if (proc.ExitCode != 0)
+            {
+                AboutUpdateStatus.Text = $"安装失败（{proc.ExitCode}），请手动下载";
+                return;
+            }
+            // 安装成功：本进程退出，新版 host 已由安装器拉起
+            Environment.Exit(0);
+        }
+        catch (Exception ex)
+        {
+            AboutUpdateStatus.Text = "更新失败，请稍后重试";
+            App.Log("Update", ex);
+        }
+        finally
+        {
+            UpdateProgress.Visibility = Visibility.Collapsed;
+            _checkingUpdate = false;
+            BtnCheckUpdate.IsEnabled = true;
+            CheckUpdateLabel.Text = _pendingUpdate is null ? "检查更新" : "下载并安装";
+        }
+    }
+
+    /// <summary>读注册表里安装器记录的安装路径（HKCU\Software\Spark\InstallPath）。</summary>
+    private static string? ReadInstallPath()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Spark");
+            return key?.GetValue("InstallPath") as string;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>解析 latest.json 发布清单；字段缺失或 JSON 损坏返回 null。</summary>
+    private static UpdateManifest? ParseManifest(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var r = doc.RootElement;
+            var v = r.TryGetProperty("version", out var t) ? t.GetString() : null;
+            var u = r.TryGetProperty("url", out var x) ? x.GetString() : null;
+            var h = r.TryGetProperty("sha256", out var y) ? y.GetString() : null;
+            return string.IsNullOrEmpty(v) || string.IsNullOrEmpty(u) || string.IsNullOrEmpty(h)
+                ? null
+                : new UpdateManifest(v, u, h);
+        }
+        catch (JsonException)
+        {
+            return null;
         }
     }
 
@@ -3213,11 +3406,8 @@ public sealed partial class MainWindow : Window
         try
         {
             var result = await _host.InvokeAsync(itemId, actionId, QueryBox.Text ?? "");
-            if (result is not null && result.Value.TryGetProperty("type", out var t)
-                && t.GetString() == "show_error"
-                && result.Value.TryGetProperty("message", out var msg))
+            if (await HandleInvokeResultAsync(itemId, title, result))
             {
-                Footer.Text = msg.GetString() ?? "执行失败";
                 return;
             }
             Footer.Text = actionId == "runas" ? "已以管理员身份打开：" + title : "已执行：" + title;
@@ -3233,6 +3423,85 @@ public sealed partial class MainWindow : Window
             await Task.Delay(60);
             HideLauncher();
         }
+    }
+
+    /// <summary>
+    /// 处理 invoke 返回的特殊结果类型（show_error / confirm / copy_text / keep）。
+    /// 返回 true 表示已自行处理完毕（调用方直接返回、不隐藏）；false 表示正常收尾。
+    /// </summary>
+    private async Task<bool> HandleInvokeResultAsync(string itemId, string title, JsonElement? result)
+    {
+        if (result is null || !result.Value.TryGetProperty("type", out var t))
+        {
+            return false;
+        }
+        switch (t.GetString())
+        {
+            case "show_error":
+                if (result.Value.TryGetProperty("message", out var err))
+                {
+                    Footer.Text = err.GetString() ?? "执行失败";
+                }
+                return true;
+
+            case "confirm":
+                // 不可逆内置命令（关机/重启等）：弹确认框，确认后以 "confirm" action 重新执行
+                var message = result.Value.TryGetProperty("message", out var m)
+                    ? m.GetString()
+                    : "确认执行？";
+                if (await ConfirmDestructiveAsync(message ?? "确认执行？"))
+                {
+                    Footer.Text = "执行中：" + title;
+                    var second = await _host.InvokeAsync(itemId, "confirm", QueryBox.Text ?? "");
+                    return await HandleInvokeResultAsync(itemId, title, second);
+                }
+                Footer.Text = "已取消";
+                return true;
+
+            case "copy_text":
+                // 信息类命令（内网IP 等）：复制到剪贴板，右下角气泡提示（学 utools）
+                if (result.Value.TryGetProperty("text", out var text))
+                {
+                    var copied = text.GetString() ?? "";
+                    var data = new DataPackage();
+                    data.SetText(copied);
+                    Clipboard.SetContent(data);
+                    Footer.Text = "已复制：" + copied;
+                    _tray?.ShowBalloon("已复制到剪贴板", $"{title}：{copied}");
+                }
+                return false;
+
+            case "keep":
+                // 保持打开：只显示消息（如需要继续操作的提示）
+                if (result.Value.TryGetProperty("message", out var keepMsg))
+                {
+                    Footer.Text = keepMsg.GetString() ?? "已执行：" + title;
+                }
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>不可逆操作的确认弹窗；返回是否确认执行。</summary>
+    private async Task<bool> ConfirmDestructiveAsync(string message)
+    {
+        if (Root.XamlRoot is null)
+        {
+            return false;
+        }
+        var dialog = new ContentDialog
+        {
+            Title = "确认操作",
+            Content = message,
+            PrimaryButtonText = "确认执行",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Root.XamlRoot,
+        };
+        var r = await dialog.ShowAsync();
+        return r == ContentDialogResult.Primary;
     }
 
     // ==================== P/Invoke ====================

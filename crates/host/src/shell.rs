@@ -12,6 +12,28 @@ pub fn shell_open(target: &str) -> Result<()> {
     shell_execute(target, "open")
 }
 
+/// Open a file/executable with extra command-line parameters（如 rundll32 环境变量对话框）。
+pub fn shell_open_with_args(file: &str, args: &str) -> Result<()> {
+    let wide = to_wide(file);
+    let params = to_wide(args);
+    // ShellExecuteW returns > 32 on success (as HINSTANCE cast).
+    let rc = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR::null(),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR(params.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = rc.0 as isize;
+    if code <= 32 {
+        bail!("ShellExecute({file} {args}) failed (code {code})");
+    }
+    Ok(())
+}
+
 /// Open elevated（触发 UAC）via the "runas" verb.
 pub fn shell_runas(target: &str) -> Result<()> {
     shell_execute(target, "runas")

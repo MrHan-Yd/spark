@@ -6,6 +6,9 @@
 # ===== 构建 / 发布产物 =====
 /dist/
 /out/
+/installer/dist/
+/installer/output/
+/dist-publish/
 /build/
 /release/
 *.exe

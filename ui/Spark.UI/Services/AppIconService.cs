@@ -45,6 +45,10 @@ public static class AppIconService
         byte[]? src = null;
         try
         {
+            // 内置命令优先用系统图标（纸篓/安全锁/explorer 等）；无系统图标的保持 Fluent 字形
+            if (BuiltinSystemIcons.TryGetValue(itemId, out var getter))
+                return getter();
+
             // Prefer explicit target / icon path from Host
             if (!string.IsNullOrWhiteSpace(pathHint))
             {
@@ -250,6 +254,137 @@ public static class AppIconService
         }
     }
 
+    /// <summary>系统股票图标（SHGetStockIconInfo），如回收站 SIID_RECYCLER。</summary>
+    private static byte[]? FromStockIcon(int siid)
+    {
+        var sii = new SHSTOCKICONINFO { cbSize = (uint)Marshal.SizeOf<SHSTOCKICONINFO>() };
+        if (SHGetStockIconInfo(siid, SHGSI_ICON, ref sii) != 0 || sii.hIcon == IntPtr.Zero)
+            return null;
+        try
+        {
+            return HiconToPng(sii.hIcon);
+        }
+        finally
+        {
+            DestroyIcon(sii.hIcon);
+        }
+    }
+
+    /// <summary>内置命令 → 系统图标来源；无系统图标的命令（关机/重启/管理工具等）不在此表，保持 Fluent 字形。</summary>
+    private static readonly Dictionary<string, Func<byte[]?>> BuiltinSystemIcons =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["builtin.recycle_bin"] = () => FromStockIcon(SIID_RECYCLER),
+            ["builtin.empty_recycle_bin"] = () => FromStockIcon(SIID_RECYCLERFULL),
+            ["builtin.lock"] = () => FromStockIcon(SIID_LOCK),
+            ["builtin.explorer"] = () => ExtractFromFile(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"), 0),
+            ["builtin.remote_desktop"] = () => ExtractFromFile(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "mstsc.exe"), 0),
+            ["builtin.screenshot"] = () => ExtractStoreAppIcon("Microsoft.ScreenSketch", "SnippingTool\\SnippingTool.exe"),
+            ["builtin.paint"] = () => ExtractStoreAppIcon("Microsoft.Paint", "PaintApp\\mspaint.exe"),
+            // Win11 商店版应用：取包内 AppList logo（即 Win11 真实图标），失败回退 exe 图标
+            ["builtin.calc"] = () => ExtractStoreAppIcon("Microsoft.WindowsCalculator", "CalculatorApp.exe"),
+            // 应用索引里的商店应用存根（System32\calc.exe 只是启动器）：同样取包内 Win11 图标
+            ["sys.calc"] = () => ExtractStoreAppIcon("Microsoft.WindowsCalculator", "CalculatorApp.exe"),
+            // Win11 设置宿主：系统组件安装在 %WINDIR%\ImmersiveControlPanel（不在 WindowsApps），
+            // logo 在 images\ 下（logo.scale-200/400.png），取它才是真正的 Win11 设置图标
+            ["builtin.settings"] = () => ExtractStoreAppIcon("windows.immersivecontrolpanel", "SystemSettings.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "ImmersiveControlPanel")),
+        };
+
+    /// <summary>商店应用图标：安装目录由注册表 AppModel Repository 解析（WindowsApps 目录本身对普通用户
+    /// 不可枚举，但按包全名拼出的子目录可精确访问）。优先取包内 AppList logo PNG（Win11 真实图标），
+    /// 失败回退 exe 图标。</summary>
+    private static byte[]? ExtractStoreAppIcon(string familyName, string? exeRelative = null, string? fixedDir = null)
+    {
+        try
+        {
+            var dir = fixedDir ?? FindPackageInstallDir(familyName);
+            if (dir is null) return null;
+
+            var logo = FindPackageLogo(dir);
+            if (logo is not null)
+            {
+                var bytes = File.ReadAllBytes(logo);
+                if (bytes.Length > 0) return bytes;
+            }
+
+            if (exeRelative is not null)
+            {
+                var exe = Path.Combine(dir, exeRelative);
+                if (File.Exists(exe)) return ExtractFromFile(exe, 0);
+            }
+        }
+        catch
+        {
+            // 解析/读取失败：回退字形
+        }
+        return null;
+    }
+
+    /// <summary>当前用户的包安装目录：HKCU AppModel Repository 子键名即 PackageFullName（含版本号）。</summary>
+    private static string? FindPackageInstallDir(string familyName)
+    {
+        const string repo =
+            @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+        using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(repo);
+        if (key is null) return null;
+        foreach (var full in key.GetSubKeyNames())
+        {
+            if (!full.StartsWith(familyName + "_", StringComparison.OrdinalIgnoreCase)) continue;
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps", full);
+            if (Directory.Exists(dir)) return dir;
+        }
+        return null;
+    }
+
+    /// <summary>包内 logo PNG：Assets/images 目录里挑评分最高者（AppList &gt; StoreLogo &gt; logo &gt; 瓦片，
+    /// scale-400 &gt; scale-200 &gt; …；排除 contrast/altform/SplashScreen 变体）。</summary>
+    private static string? FindPackageLogo(string dir)
+    {
+        var best = (string?)null;
+        var bestScore = int.MinValue;
+        foreach (var root in new[] { Path.Combine(dir, "Assets"), Path.Combine(dir, "images") })
+        {
+            if (!Directory.Exists(root)) continue;
+            foreach (var f in Directory.EnumerateFiles(root, "*.png"))
+            {
+                var score = ScoreLogo(Path.GetFileNameWithoutExtension(f));
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = f;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static int ScoreLogo(string name)
+    {
+        if (name.Contains("contrast", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("altform", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("SplashScreen", StringComparison.OrdinalIgnoreCase))
+            return int.MinValue;
+
+        var score = 0;
+        if (name.Contains("AppList", StringComparison.OrdinalIgnoreCase)) score += 100_000;
+        else if (name.Contains("StoreLogo", StringComparison.OrdinalIgnoreCase)) score += 50_000;
+        else if (name.StartsWith("logo", StringComparison.OrdinalIgnoreCase)) score += 30_000;
+        else if (name.Contains("SmallTile", StringComparison.OrdinalIgnoreCase)) score += 20_000;
+        else if (name.Contains("MedTile", StringComparison.OrdinalIgnoreCase)) score += 10_000;
+
+        if (name.Contains("scale-400", StringComparison.OrdinalIgnoreCase)) score += 400;
+        else if (name.Contains("scale-200", StringComparison.OrdinalIgnoreCase)) score += 200;
+        else if (name.Contains("scale-150", StringComparison.OrdinalIgnoreCase)) score += 150;
+        else if (name.Contains("scale-125", StringComparison.OrdinalIgnoreCase)) score += 125;
+        else if (name.Contains("scale-100", StringComparison.OrdinalIgnoreCase)) score += 100;
+        else if (name.Contains("targetsize-256", StringComparison.OrdinalIgnoreCase)) score += 256;
+        else if (name.Contains("targetsize-48", StringComparison.OrdinalIgnoreCase)) score += 48;
+        return score;
+    }
+
     private static byte[]? HiconToPng(IntPtr hIcon)
     {
         // 通过 GDI GetIconInfo + GetDIBits 转 PNG 字节，再 BitmapImage
@@ -450,8 +585,23 @@ public static class AppIconService
 
     private const uint SHGFI_ICON = 0x000000100;
     private const uint SHGFI_LARGEICON = 0x000000000;
+    private const uint SHGSI_ICON = 0x000000100;
+    private const int SIID_RECYCLER = 0x1F;       // 31：回收站（空）
+    private const int SIID_RECYCLERFULL = 0x20;   // 32：回收站（满）
+    private const int SIID_LOCK = 0x2F;           // 47：安全锁
     private const int DIB_RGB_COLORS = 0;
     private const int BI_RGB = 0;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SHSTOCKICONINFO
+    {
+        public uint cbSize;
+        public IntPtr hIcon;
+        public int iSysIconIndex;
+        public int iIcon;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szPath;
+    }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct SHFILEINFO
@@ -501,6 +651,9 @@ public static class AppIconService
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes,
         ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHGetStockIconInfo(int siid, uint uFlags, ref SHSTOCKICONINFO psii);
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern uint ExtractIconEx(string lpszFile, int nIconIndex,

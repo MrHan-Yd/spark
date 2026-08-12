@@ -78,6 +78,8 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
     }
 
     let tray = TrayIcon::add(hwnd, "Spark", icon_path.as_deref()).context("tray icon")?;
+    // 托盘由 host 持有（invoke 气泡提示要用）；消息循环结束时随 host drop 自动 NIM_DELETE
+    host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?.tray = Some(tray);
     info!(
         ui_clients = hub.client_count(),
         "tray ready; message loop running"
@@ -92,7 +94,6 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
     }
 
     Hotkey::unregister(hwnd, HOTKEY_ID_TOGGLE);
-    drop(tray);
     unsafe {
         HOST_PTR = None;
         HUB_PTR = None;

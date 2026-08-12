@@ -231,6 +231,26 @@ public sealed class HostIpcClient : IAsyncDisposable
         }
     }
 
+    /// <summary>内置系统命令清单（设置页"内置命令"栏；host 不可达返回空列表）。</summary>
+    public async Task<List<BuiltinInfoDto>> GetBuiltinsAsync(CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) return new List<BuiltinInfoDto>();
+        try
+        {
+            var el = await CallAsync("host.get_builtins", new { }, ct);
+            if (el.ValueKind == JsonValueKind.Array)
+            {
+                return JsonSerializer.Deserialize<List<BuiltinInfoDto>>(el.GetRawText()) ?? new();
+            }
+        }
+        catch
+        {
+            // 忽略：设置页降级为空列表
+        }
+        return new List<BuiltinInfoDto>();
+    }
+
     private async Task<JsonElement> CallAsync(string method, object paramsObj, CancellationToken ct)
     {
         if (!IsConnected || _writer is null)

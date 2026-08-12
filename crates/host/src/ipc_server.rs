@@ -254,6 +254,10 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
             JsonRpcResponse::result(id, serde_json::to_value(&g.config)?)
         }
+        m if m == HostMethod::GetBuiltins.as_str() => {
+            // 内置命令清单（设置页展示用，无需锁 host）
+            JsonRpcResponse::result(id, serde_json::to_value(spark_index::builtin::infos())?)
+        }
         other => JsonRpcResponse::error(id, -32601, format!("method not found: {other}")),
     };
     reply(pipe, &resp)

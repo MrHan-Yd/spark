@@ -3,10 +3,12 @@
 use anyhow::Result;
 use std::mem;
 use std::path::Path;
+use tracing::info;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, LoadImageW, SetForegroundWindow,
@@ -24,6 +26,10 @@ pub const CMD_EXIT: u32 = 1003;
 pub struct TrayIcon {
     data: NOTIFYICONDATAW,
 }
+
+// NOTIFYICONDATAW 含 HWND/HICON 原始指针字段，本身不 Send；
+// 数据只在 HostApp 的 Mutex 保护下访问，Shell_NotifyIconW 线程安全，跨线程共享安全。
+unsafe impl Send for TrayIcon {}
 
 impl TrayIcon {
     pub fn add(hwnd: HWND, tip: &str, icon_path: Option<&Path>) -> Result<Self> {
@@ -49,11 +55,31 @@ impl TrayIcon {
         Ok(Self { data })
     }
 
+    /// 右下角气泡提示（Win10/11 显示为 toast 风格），如复制结果反馈。
+    pub fn show_balloon(&mut self, title: &str, text: &str) {
+        write_wide(&mut self.data.szInfoTitle, title);
+        write_wide(&mut self.data.szInfo, text);
+        self.data.dwInfoFlags = NIIF_INFO;
+        self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
+        let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.data) };
+        info!(ok = ok.as_bool(), title, "tray balloon");
+        // 还原标志位，避免常驻 INFO 字段干扰后续更新
+        self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    }
+
     pub fn remove(&mut self) {
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.data);
         }
     }
+}
+
+/// 把字符串写进定长 WCHAR 缓冲区（尾部补零，保证以空字符结尾）。
+fn write_wide(dst: &mut [u16], s: &str) {
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    let copy_len = wide.len().min(dst.len().saturating_sub(1));
+    dst[..copy_len].copy_from_slice(&wide[..copy_len]);
+    dst[copy_len] = 0;
 }
 
 impl Drop for TrayIcon {

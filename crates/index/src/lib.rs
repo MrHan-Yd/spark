@@ -1,6 +1,7 @@
 //! Search index facade. MVP: in-memory + Start Menu scan; SQLite FTS5 later.
 
 mod apps;
+pub mod builtin;
 mod history;
 mod lnk;
 mod memory;
@@ -26,6 +27,13 @@ pub(crate) fn is_app_target(target: &str) -> bool {
         ext.as_str(),
         "" | "exe" | "com" | "bat" | "cmd" | "msc" | "cpl" | "scr" | "lnk"
     )
+}
+
+/// 两个标题是否视为同一功能（相同或一方包含另一方，忽略大小写）。
+/// 用于内置命令与开始菜单应用去重，如"文件资源管理" vs "文件资源管理器"。
+fn titles_overlap(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    a == b || a.contains(&b) || b.contains(&a)
 }
 
 pub trait SearchIndex: Send + Sync {
@@ -119,6 +127,19 @@ impl AppIndex {
             let title = h.title.to_lowercase();
             if title.contains(&q) {
                 hits.push(h);
+            }
+        }
+
+        // 内置系统命令（utools 风格）：与应用混排，靠分数与别名区分。
+        // 与已命中的应用/历史候选标题重复（相同/互相包含）时跳过——开始菜单里已有
+        // 同功能应用（如"文件资源管理器"）就不重复展示内置命令，内置命令兜底。
+        // 内置命令之间不去重（"回收站"与"清空回收站"是不同命令，标题包含只是巧合）。
+        for b in builtin::candidates(&q) {
+            let duplicated = hits
+                .iter()
+                .any(|c| c.source != Source::Builtin && titles_overlap(&c.title, &b.title));
+            if !duplicated {
+                hits.push(b);
             }
         }
 
@@ -236,5 +257,37 @@ mod tests {
         );
         assert_eq!(items[0].id, "app.0", "最新的排最前");
         assert_eq!(items[5].id, "app.5");
+    }
+
+    #[test]
+    fn builtin_deduped_against_same_app() {
+        // 开始菜单已有"文件资源管理器"（explorer.exe）时，内置"文件资源管理"不重复展示
+        let mut idx = AppIndex::new();
+        idx.memory
+            .upsert(app("sys.explorer", "文件资源管理器", 0.85));
+        let items = idx.search_with_history(&Query {
+            text: "文件资源".into(),
+            limit: 50,
+        });
+        let explorer: Vec<_> = items
+            .iter()
+            .filter(|c| c.title.contains("文件资源"))
+            .collect();
+        assert_eq!(explorer.len(), 1, "同功能只保留一个");
+        assert_eq!(explorer[0].source, Source::App, "保留开始菜单应用版本");
+    }
+
+    #[test]
+    fn builtin_shows_when_no_app_conflict() {
+        // 开始菜单没有同功能应用时，内置命令正常出现
+        let idx = AppIndex::new();
+        let items = idx.search_with_history(&Query {
+            text: "锁屏".into(),
+            limit: 50,
+        });
+        assert!(
+            items.iter().any(|c| c.id == "builtin.lock"),
+            "无冲突时内置命令应出现"
+        );
     }
 }

@@ -12,10 +12,10 @@ members = [
 default-members = ["crates/host"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/example/spark"
+repository = "https://github.com/MrHan-Yd/spark"
 authors = ["Spark Contributors"]
 rust-version = "1.75"
 

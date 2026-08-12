@@ -16,6 +16,7 @@ pub enum HostMethod {
     Invoke,
     GetConfig,
     SetConfig,
+    GetBuiltins,
     Toggle,
     Show,
     Hide,
@@ -28,6 +29,7 @@ impl HostMethod {
             Self::Invoke => "host.invoke",
             Self::GetConfig => "host.get_config",
             Self::SetConfig => "host.set_config",
+            Self::GetBuiltins => "host.get_builtins",
             Self::Toggle => "host.toggle",
             Self::Show => "ui.show",
             Self::Hide => "ui.hide",
@@ -137,9 +139,24 @@ pub struct InvokeParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InvokeResult {
-    Close { message: Option<String> },
-    Keep { message: Option<String> },
-    CopyText { text: String },
-    OpenUrl { url: String },
-    ShowError { message: String },
+    Close {
+        message: Option<String>,
+    },
+    Keep {
+        message: Option<String>,
+    },
+    CopyText {
+        text: String,
+    },
+    OpenUrl {
+        url: String,
+    },
+    ShowError {
+        message: String,
+    },
+    /// 不可逆操作（关机/重启等）的确认请求：UI 弹窗，确认后以
+    /// `action_id = "confirm"` 重新 invoke 才真正执行。
+    Confirm {
+        message: String,
+    },
 }

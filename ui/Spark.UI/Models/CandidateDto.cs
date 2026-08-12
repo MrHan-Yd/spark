@@ -61,12 +61,20 @@ public sealed class CandidateDto : INotifyPropertyChanged
         _ => Source,
     };
 
+    /// <summary>内置命令专属图标样式（字形/颜色/字体定义在 BuiltinIcon，与设置页命令栏共用）。</summary>
+    private (string Glyph, Color Color)? BuiltinIconEntry => Source == "builtin"
+        ? BuiltinIcon.For(Id) : null;
+
     /// <summary>Letter fallback when no system icon.</summary>
     [JsonIgnore]
     public string IconGlyph
     {
         get
         {
+            if (BuiltinIconEntry is { } bi)
+            {
+                return bi.Glyph;
+            }
             if (!string.IsNullOrEmpty(Title))
             {
                 var ch = Title.Trim()[0];
@@ -75,6 +83,14 @@ public sealed class CandidateDto : INotifyPropertyChanged
             return "?";
         }
     }
+
+    /// <summary>图标字体：内置命令专属字形用 Segoe Fluent Icons，其余默认字体（中文回退）。</summary>
+    [JsonIgnore]
+    public FontFamily IconFont => BuiltinIconEntry is null ? BuiltinIcon.FontDefault : BuiltinIcon.FontFluent;
+
+    /// <summary>图标字号：内置命令专属字形更大更醒目（19px vs 13px）。</summary>
+    [JsonIgnore]
+    public double IconFontSize => BuiltinIconEntry is null ? 13 : 19;
 
     [JsonIgnore]
     public string Shortcut { get; set; } = "";
@@ -112,6 +128,10 @@ public sealed class CandidateDto : INotifyPropertyChanged
     {
         get
         {
+            if (BuiltinIconEntry is { } bi)
+            {
+                return new SolidColorBrush(bi.Color);
+            }
             var c = Kind switch
             {
                 "file" => Color.FromArgb(255, 48, 176, 199),

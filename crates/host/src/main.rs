@@ -1,6 +1,7 @@
 //! spark-host: P0 — app index, launch, history, single-instance, hotkey, tray, IPC.
 
 mod app;
+mod builtins;
 mod config;
 mod hotkey;
 mod ipc_server;
