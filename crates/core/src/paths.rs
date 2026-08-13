@@ -29,8 +29,8 @@ pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
     let d = data_dir();
     std::fs::create_dir_all(&d)?;
     std::fs::create_dir_all(d.join("logs"))?;
-    std::fs::create_dir_all(d.join("plugins"))?;
     std::fs::create_dir_all(d.join("cache"))?;
+    // 插件目录固定在应用安装目录（{app}\plugins），不在此处创建，避免误导。
     Ok(d)
 }
 

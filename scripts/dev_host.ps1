@@ -25,6 +25,11 @@ if ($forward.Count -eq 0) {
     $forward = @("--no-ui")
 }
 
+# 插件只从安装目录（host 同目录）加载；开发时显式指定仓库 plugins（绝对路径）
+if (-not ($forward -contains "--plugins-dir")) {
+    $forward += @("--plugins-dir", (Join-Path (Get-Location) "plugins"))
+}
+
 # 常驻启动前默认清残留，避免 instance exists + pipe 拒绝访问
 # 一次性子命令（--query / --toggle / --launch）不杀，以免误伤正在用的 Host
 $isOneShot = $forward | Where-Object { $_ -eq "--query" -or $_ -eq "--toggle" -or $_ -eq "--launch" }

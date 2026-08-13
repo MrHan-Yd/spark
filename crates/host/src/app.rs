@@ -28,14 +28,22 @@ impl HostApp {
         info!(apps = index.len(), "app index ready");
 
         let mut plugins = PluginManager::new();
-        let default_plugins = Path::new("plugins");
-        if default_plugins.is_dir() {
-            let n = plugins.scan_dir(default_plugins)?;
-            info!(count = n, "scanned ./plugins");
+        // 插件只从应用安装目录（host 同目录）的 plugins 文件夹加载，安装位置无关；
+        // 开发/测试用 `--plugins-dir` 或配置 `plugins_dir` 显式指定（dev_host.ps1 已传）。
+        if let Some(dir) = crate::exe_dir().map(|d| d.join("plugins")) {
+            if dir.is_dir() {
+                let n = plugins.scan_dir(&dir)?;
+                info!(count = n, path = %dir.display(), "scanned plugins");
+            }
         }
         if let Some(dir) = extra_plugins.or(config.plugins_dir.as_deref()) {
+            // 配置/CLI 里写相对路径时按 host 目录解析，避免依赖 CWD。
+            let dir = match crate::exe_dir() {
+                Some(base) if dir.is_relative() => base.join(dir),
+                _ => dir.to_path_buf(),
+            };
             if dir.is_dir() {
-                let n = plugins.scan_dir(dir)?;
+                let n = plugins.scan_dir(&dir)?;
                 info!(count = n, path = %dir.display(), "scanned plugins dir");
             }
         }

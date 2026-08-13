@@ -1,5 +1,9 @@
 //! spark-host: P0 — app index, launch, history, single-instance, hotkey, tray, IPC.
 
+// 发布版不分配控制台窗口（安装器 [Run] / 快捷方式直接启动时不再弹黑窗）；
+// debug 版保留控制台，终端里跑 dev_host.ps1 仍可看日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod builtins;
 mod config;
@@ -137,25 +141,51 @@ fn try_spawn_ui_on_boot() {
         info!("spark already running");
         return;
     }
-    let candidates = [
-        "ui/Spark.UI/bin/Debug/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
-        "ui/Spark.UI/bin/Release/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
-    ];
-    for c in candidates {
-        let p = std::path::PathBuf::from(c);
+    let Some(p) = find_ui_exe() else {
+        info!("Spark.exe not found — start UI manually for IPC");
+        return;
+    };
+    info!(path = %p.display(), "spawning spark on boot");
+    let mut cmd = std::process::Command::new(&p);
+    if let Some(dir) = p.parent() {
+        cmd.current_dir(dir);
+    }
+    match cmd.spawn() {
+        Ok(_) => {}
+        Err(e) => tracing::warn!(?e, "spawn UI failed"),
+    }
+}
+
+/// host 可执行文件所在目录（安装位置无关的基准路径：用户装到哪都以它为准）。
+pub(crate) fn exe_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+}
+
+/// 定位 Spark.exe（UI 启动器）：
+/// 1) host 同目录 —— 安装布局 `{app}\spark-host.exe` + `{app}\Spark.exe`（绝对路径）；
+/// 2) 开发目录 —— cargo 产物 `ui/Spark.UI/bin/{Debug,Release}/…/Spark.exe`。
+/// 不用裸文件名 "Spark.exe" 作 lpApplicationName：CreateProcess 对不含目录的相对名
+/// 报 ERROR_INVALID_NAME(123)（安装器把 CWD 设为 {app} 时裸名会命中 is_file 但拉起失败）。
+pub(crate) fn find_ui_exe() -> Option<std::path::PathBuf> {
+    if let Some(dir) = exe_dir() {
+        let p = dir.join("Spark.exe");
         if p.is_file() {
-            info!(path = %p.display(), "spawning spark on boot");
-            let mut cmd = std::process::Command::new(&p);
-            if let Some(dir) = p.parent() {
-                cmd.current_dir(dir);
-            }
-            match cmd.spawn() {
-                Ok(_) => return,
-                Err(e) => tracing::warn!(?e, "spawn UI failed"),
-            }
+            return Some(p);
         }
     }
-    info!("Spark.exe not found — start UI manually for IPC");
+    for c in [
+        "ui/Spark.UI/bin/Debug/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
+        "ui/Spark.UI/bin/Release/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
+    ] {
+        let p = std::path::PathBuf::from(c);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 pub(crate) fn is_ui_running() -> bool {
@@ -173,27 +203,24 @@ pub(crate) fn is_ui_running() -> bool {
 }
 
 fn find_default_icon() -> Option<std::path::PathBuf> {
-    let candidates = [
+    // 安装布局：host 同目录的 spark.ico（或 Assets 子目录），安装位置无关。
+    if let Some(dir) = exe_dir() {
+        for name in ["spark.ico", "Assets/spark.ico"] {
+            let p = dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    // 开发布局：仓库内相对 CWD 的候选。
+    for c in [
         "ui/Spark.UI/Assets/spark.ico",
         "brand/spark.ico",
         "resources/spark.ico",
-    ];
-    for c in candidates {
+    ] {
         let p = std::path::PathBuf::from(c);
         if p.is_file() {
             return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("spark.ico");
-            if p.is_file() {
-                return Some(p);
-            }
-            let p = dir.join("Assets").join("spark.ico");
-            if p.is_file() {
-                return Some(p);
-            }
         }
     }
     None

@@ -163,40 +163,17 @@ fn on_toggle() {
 
 fn try_spawn_ui() {
     // Look for spark near host or in known build output
-    let candidates = [
-        "ui/Spark.UI/bin/Debug/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
-        "ui/Spark.UI/bin/Release/net8.0-windows10.0.19041.0/win-x64/Spark.exe",
-        "Spark.exe",
-    ];
-    let mut path = None;
-    for c in candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.is_file() {
-            path = Some(p);
-            break;
-        }
-    }
-    if path.is_none() {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let p = dir.join("Spark.exe");
-                if p.is_file() {
-                    path = Some(p);
-                }
-            }
-        }
-    }
-    if let Some(p) = path {
-        info!(path = %p.display(), "spawning spark");
-        let mut cmd = std::process::Command::new(&p);
-        if let Some(dir) = p.parent() {
-            cmd.current_dir(dir);
-        }
-        if let Err(e) = cmd.spawn() {
-            warn!(?e, "failed to spawn UI");
-        }
-    } else {
+    let Some(p) = crate::find_ui_exe() else {
         warn!("no UI clients and Spark.exe not found — start UI manually");
+        return;
+    };
+    info!(path = %p.display(), "spawning spark");
+    let mut cmd = std::process::Command::new(&p);
+    if let Some(dir) = p.parent() {
+        cmd.current_dir(dir);
+    }
+    if let Err(e) = cmd.spawn() {
+        warn!(?e, "failed to spawn UI");
     }
 }
 
