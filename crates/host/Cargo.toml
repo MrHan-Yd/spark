@@ -10,6 +10,10 @@ rust-version.workspace = true
 name = "spark-host"
 path = "src/main.rs"
 
+[build-dependencies]
+# 嵌入与 UI 相同的 spark.ico（build.rs），host 在任务栏/搜索/资源管理器都有图标
+embed-resource = "2"
+
 [dependencies]
 spark-core = { workspace = true }
 spark-ipc = { workspace = true }

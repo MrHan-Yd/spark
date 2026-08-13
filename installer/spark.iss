@@ -49,9 +49,17 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 Root: HKCU; Subkey: "Software\Spark"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Spark"; ValueType: string; ValueName: "Version"; ValueData: "{#AppVersion}"; Flags: uninsdeletevalue
 
+[InstallDelete]
+; 先删旧快捷方式再重建：Windows 搜索索引对"同名同路径"的 .lnk 覆盖更新
+; 不会重新提取图标（实测重装后搜索图标变回占位），删除→新建才能触发重索引。
+Type: files; Name: "{autoprograms}\Spark.lnk"
+Type: files; Name: "{autodesktop}\Spark.lnk"
+
 [Icons]
-Name: "{autoprograms}\Spark"; Filename: "{app}\{#MyAppHostExe}"
-Name: "{autodesktop}\Spark"; Filename: "{app}\{#MyAppHostExe}"; Tasks: desktopicon
+; 快捷方式目标必须是 host（host 会拉起整个应用）；图标显式用 Spark.exe 的——
+; spark-host.exe 是 Rust 二进制无图标资源，Windows 搜索/资源管理器会显示默认占位。
+Name: "{autoprograms}\Spark"; Filename: "{app}\{#MyAppHostExe}"; IconFilename: "{app}\Spark.exe,0"
+Name: "{autodesktop}\Spark"; Filename: "{app}\{#MyAppHostExe}"; IconFilename: "{app}\Spark.exe,0"; Tasks: desktopicon
 
 [Run]
 ; 装完拉起 host（host 会自行拉起 UI）；静默更新同样生效，完成"自动重启"闭环

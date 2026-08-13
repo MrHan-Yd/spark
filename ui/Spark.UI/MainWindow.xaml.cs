@@ -38,6 +38,10 @@ public sealed partial class MainWindow : Window
     private TrayService? _tray;
     private ToggleWatcher? _toggleWatcher;
     private ExitWatcher? _exitWatcher;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _showFallback;
+    /// <summary>--hidden：host 后台拉起（boot/开机自启/安装后启动），不预热不弹出，
+    /// 只连 IPC + 托盘常驻，等快捷键/托盘唤起。直接双击 Spark.exe 无此参数，正常弹出。</summary>
+    private readonly bool _startHidden;
     private int _active;
     /// <summary>收藏卡片选中索引（-1 = 未选中，焦点在结果区）；方向键可在结果区 ↔ 收藏区之间移动。</summary>
     private int _favActive = -1;
@@ -118,6 +122,12 @@ public sealed partial class MainWindow : Window
 
     public MainWindow()
     {
+        _startHidden = Environment.GetCommandLineArgs().Any(a => a == "--hidden");
+
+        // WinUI 3 窗口构造即显示：先隐藏，等 XAML 内容渲染完成（Content.Loaded）再显示，
+        // 消除启动时"空白窗口框弹一下就消失"的体感问题。
+        this.AppWindow.Hide();
+
         try { InitializeComponent(); }
         catch (Exception ex) { App.Log("InitializeComponent", ex); throw; }
 
@@ -185,6 +195,42 @@ public sealed partial class MainWindow : Window
         // 托盘"退出"/host.exit → 整个应用退出（独立进程需要自己的退出信号）
         _exitWatcher = new ExitWatcher(() =>
             DispatcherQueue.TryEnqueue(OnHostExit));
+
+        // 内容渲染完成后再显示窗口（配合构造开头 AppWindow.Hide 消除启动空壳框）。
+        // 兜底：2 秒后仍未显示则强制显示，防止 Loaded 未触发的极端情况导致窗口永久隐藏。
+        if (Content is FrameworkElement root)
+        {
+            if (_startHidden)
+            {
+                // 静默后台模式（host --hidden 拉起）：保持隐藏常驻，绝不弹出。
+                // 首帧预热（Show→Hide）会闪一下窗口，违背"默默运行"；ShowLauncher
+                // 自带焦点保护与防白圈处理，首次唤起即时渲染即可。这里不挂任何
+                // 显示逻辑，窗口由快捷键/托盘（HandleToggle/ShowLauncher）唤起。
+            }
+            else
+            {
+                root.Loaded += (_, _) => ShowAfterReady();
+                _showFallback = DispatcherQueue.CreateTimer();
+                _showFallback.Interval = TimeSpan.FromSeconds(2);
+                _showFallback.Tick += (_, _) => { _showFallback.Stop(); ShowAfterReady(); };
+                _showFallback.Start();
+            }
+        }
+
+        // 预热一帧再正式显示：窗口隐藏时合成器不提交帧，直接 Show 的瞬间是"空窗口"
+        // （首帧未提交，加上 Acrylic backdrop 未连接，体感就是"空白框弹一下"）。
+        // 先显示一帧触发合成器提交与 backdrop 连接，立即隐藏，再走 ShowLauncher 完整
+        // 流程（动画/焦点/失焦保护），此时首帧即完整内容，无空白框。
+        void ShowAfterReady()
+        {
+            if (this.AppWindow.IsVisible) return;
+            this.AppWindow.Show();
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                this.AppWindow.Hide();
+                DispatcherQueue.TryEnqueue(ShowLauncher);
+            });
+        }
 
         Activated += (_, e) =>
         {

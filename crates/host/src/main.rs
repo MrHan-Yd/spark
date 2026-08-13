@@ -18,6 +18,8 @@ mod win_loop;
 
 use anyhow::Result;
 use clap::Parser;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
@@ -160,6 +162,8 @@ fn try_spawn_ui_on_boot() {
     };
     info!(path = %p.display(), "spawning spark on boot");
     let mut cmd = std::process::Command::new(&p);
+    // 后台静默：UI 不弹窗，只连 IPC + 托盘常驻，用户按快捷键/点托盘才唤起
+    cmd.arg("--hidden");
     if let Some(dir) = p.parent() {
         cmd.current_dir(dir);
     }
@@ -204,7 +208,10 @@ pub(crate) fn find_ui_exe() -> Option<std::path::PathBuf> {
 pub(crate) fn is_ui_running() -> bool {
     // Lightweight: try open pipe is not enough (host is the server).
     // Check process name.
+    // CREATE_NO_WINDOW：host 是 GUI 子系统，直接 spawn tasklist（控制台程序）会
+    // 新建一个控制台窗口闪一下（用户看到的"命令行黑框"），必须禁止创建窗口。
     std::process::Command::new("tasklist")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args(["/FI", "IMAGENAME eq Spark.exe", "/NH"])
         .output()
         .map(|o| {

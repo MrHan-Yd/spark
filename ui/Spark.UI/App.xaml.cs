@@ -44,7 +44,8 @@ public partial class App : Application
             _singleInstance = m; // 持有锁直到进程退出，防止被 GC
 
             _window = new MainWindow();
-            _window.Activate();
+            // 窗口显示时机由 MainWindow 自行控制（构造先隐藏，内容 Loaded 后再显示），
+            // 这里不能 Activate——会立即显示窗口，破坏启动防闪框逻辑。
         }
         catch (Exception ex)
         {
