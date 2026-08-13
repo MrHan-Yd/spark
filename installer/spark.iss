@@ -58,8 +58,11 @@ Type: files; Name: "{autodesktop}\Spark.lnk"
 [Icons]
 ; 快捷方式目标必须是 host（host 会拉起整个应用）；图标显式用 Spark.exe 的——
 ; spark-host.exe 是 Rust 二进制无图标资源，Windows 搜索/资源管理器会显示默认占位。
-Name: "{autoprograms}\Spark"; Filename: "{app}\{#MyAppHostExe}"; IconFilename: "{app}\Spark.exe,0"
-Name: "{autodesktop}\Spark"; Filename: "{app}\{#MyAppHostExe}"; IconFilename: "{app}\Spark.exe,0"; Tasks: desktopicon
+; 注意：IconFilename 不能带 ",0" 索引！实测 Inno 会把 "path,0" 原样写进 lnk 的
+; IconLocation，shell 读回 "path,0,0" 找不到文件 → 回退通用文档图标（v0.2.3 踩过）。
+; 只写文件名（不带索引）时 Inno 正确写入 index=0，读回 "path,0" 才能正常解析。
+Name: "{autoprograms}\Spark"; Filename: "{app}\{#MyAppHostExe}"; IconFilename: "{app}\Spark.exe"
+Name: "{autodesktop}\Spark"; Filename: "{app}\{#MyAppHostExe}"; IconFilename: "{app}\Spark.exe"; Tasks: desktopicon
 
 [Run]
 ; 装完拉起 host（host 会自行拉起 UI）；静默更新同样生效，完成"自动重启"闭环
