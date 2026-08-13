@@ -57,6 +57,16 @@ public static class AppIconService
                     src = ExtractFromFile(p, 0);
             }
 
+            // 兜底：host（spark-host.exe）曾因资源嵌入失效而无图标，搜索 "Spark" 显示占位；
+            // 若再次出现，改从同目录 Spark.exe（一定有品牌图标）提取
+            if (src is null && pathHint is not null
+                && Path.GetFileName(pathHint).Equals("spark-host.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                var sparkExe = Path.Combine(Path.GetDirectoryName(pathHint) ?? "", "Spark.exe");
+                if (File.Exists(sparkExe))
+                    src = ExtractFromFile(sparkExe, 0);
+            }
+
             if (src is null && ShellIndex.TryGetValue(itemId, out var shell))
             {
                 src = ExtractFromFile(shell.path, shell.index);

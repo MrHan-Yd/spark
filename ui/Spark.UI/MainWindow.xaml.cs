@@ -1,5 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Headers;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -3009,7 +3011,11 @@ public sealed partial class MainWindow : Window
 
     /// <summary>下载 → 校验 SHA-256 → 静默安装 → 退出。
     /// 安装器会强制关闭运行中的 Spark.exe / spark-host.exe，装完 [Run] 拉起新版 host（host 再拉起 UI），
-    /// 完成"自动重启"；校验不过或安装失败都保留"打开下载页"手动兜底。</summary>
+    /// 完成"自动重启"；校验不过或安装失败都保留"打开下载页"手动兜底。
+    /// 弱网（GitHub 大文件易中断/损坏）下：下载中断自动重试（断点续传，不必全量重下），
+    /// 校验失败同样自动重下重试，最多 <see cref="MaxDownloadAttempts"/> 次。</summary>
+    private const int MaxDownloadAttempts = 3;
+
     private async Task DownloadAndInstallAsync(UpdateManifest m)
     {
         _checkingUpdate = true;
@@ -3023,42 +3029,49 @@ public sealed partial class MainWindow : Window
         var setup = Path.Combine(dir, $"Spark-{m.Version}-setup.exe");
         try
         {
-            // 下载（流式落盘 + 进度）
             using var client = new HttpClient();
             client.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
-            using var resp = await client.GetAsync(m.Url, HttpCompletionOption.ResponseHeadersRead);
-            resp.EnsureSuccessStatusCode();
-            var total = resp.Content.Headers.ContentLength;
-            await using var src = await resp.Content.ReadAsStreamAsync();
-            await using (var dst = File.Create(setup))
+
+            var verified = false;
+            for (var attempt = 1; attempt <= MaxDownloadAttempts && !verified; attempt++)
             {
-                var buf = new byte[64 * 1024];
-                long done = 0;
-                while (true)
+                var downloaded = await TryDownloadAsync(client, m.Url, setup);
+                if (!downloaded)
                 {
-                    var n = await src.ReadAsync(buf);
-                    if (n <= 0) break;
-                    await dst.WriteAsync(buf.AsMemory(0, n));
-                    done += n;
-                    if (total > 0)
+                    if (attempt < MaxDownloadAttempts)
                     {
-                        var pct = (int)(done * 100 / total);
-                        UpdateProgress.Value = pct;
-                        AboutUpdateStatus.Text = $"正在下载 {pct}%";
+                        AboutUpdateStatus.Text = $"下载中断（第 {attempt} 次），稍后自动重试…";
+                        await Task.Delay(1500);
                     }
+                    continue;
+                }
+
+                // 校验 SHA-256：不一致不安装
+                AboutUpdateStatus.Text = "正在校验…";
+                string hash;
+                await using (var fs = File.OpenRead(setup))
+                {
+                    hash = Convert.ToHexString(await SHA256.HashDataAsync(fs));
+                }
+                if (string.Equals(hash, m.Sha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    verified = true;
+                    break;
+                }
+
+                // 内容损坏：删掉重下（断点续传对坏文件无意义）
+                File.Delete(setup);
+                if (attempt < MaxDownloadAttempts)
+                {
+                    AboutUpdateStatus.Text =
+                        $"校验失败（期望 {ShortHash(m.Sha256)}，实际 {ShortHash(hash)}），第 {attempt} 次，重新下载…";
+                    await Task.Delay(1500);
                 }
             }
 
-            // 校验 SHA-256：不一致不安装
-            AboutUpdateStatus.Text = "正在校验…";
-            string hash;
-            await using (var fs = File.OpenRead(setup))
+            if (!verified)
             {
-                hash = Convert.ToHexString(await SHA256.HashDataAsync(fs));
-            }
-            if (!string.Equals(hash, m.Sha256, StringComparison.OrdinalIgnoreCase))
-            {
-                AboutUpdateStatus.Text = "校验失败，请稍后重试";
+                AboutUpdateStatus.Text = $"校验失败，请稍后重试（期望 {ShortHash(m.Sha256)}）";
                 return;
             }
 
@@ -3102,6 +3115,52 @@ public sealed partial class MainWindow : Window
             CheckUpdateLabel.Text = _pendingUpdate is null ? "检查更新" : "下载并安装";
         }
     }
+
+    /// <summary>流式下载到 setup 文件（带进度）；已存在部分文件时发 Range 续传。
+    /// 中断/失败返回 false（由调用方决定重试），不抛异常。</summary>
+    private async Task<bool> TryDownloadAsync(HttpClient client, string url, string file)
+    {
+        try
+        {
+            var done = File.Exists(file) ? new FileInfo(file).Length : 0;
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            if (done > 0)
+                req.Headers.Range = new RangeHeaderValue(done, null);
+            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            resp.EnsureSuccessStatusCode();
+            // 服务器忽略 Range（200 全量）→ 从头重写；206 才追加续传
+            var append = resp.StatusCode == HttpStatusCode.PartialContent;
+            var remaining = resp.Content.Headers.ContentLength ?? 0;
+            await using var src = await resp.Content.ReadAsStreamAsync();
+            await using var dst = append
+                ? new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.None)
+                : File.Create(file);
+            var buf = new byte[64 * 1024];
+            long total = append ? done + remaining : remaining;
+            while (true)
+            {
+                var n = await src.ReadAsync(buf);
+                if (n <= 0) break;
+                await dst.WriteAsync(buf.AsMemory(0, n));
+                done += n;
+                if (total > 0)
+                {
+                    var pct = (int)(done * 100 / total);
+                    UpdateProgress.Value = pct;
+                    AboutUpdateStatus.Text = $"正在下载 {pct}%（{done / 1048576} MB）";
+                }
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            App.Log("UpdateDownload", ex);
+            return false;
+        }
+    }
+
+    /// <summary>sha256 摘要取前 8 位用于错误提示（完整串太长）。</summary>
+    private static string ShortHash(string s) => s is { Length: > 8 } ? s[..8] : s ?? "";
 
     /// <summary>读注册表里安装器记录的安装路径（HKCU\Software\Spark\InstallPath）。</summary>
     private static string? ReadInstallPath()
