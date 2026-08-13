@@ -18,7 +18,7 @@ mod win_loop;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
 #[command(name = "spark-host", version, about = "Spark launcher host process")]
@@ -46,6 +46,10 @@ struct Cli {
     /// Ask running host to toggle UI (via pipe)
     #[arg(long)]
     toggle: bool,
+
+    /// Gracefully exit the running app (host + UI), e.g. before silent install
+    #[arg(long)]
+    exit: bool,
 
     /// Print spark window visibility, then exit (diagnostics)
     #[arg(long)]
@@ -91,6 +95,15 @@ fn main() -> Result<()> {
             Err(e) => {
                 info!(?e, "pipe toggle failed; event already signaled");
             }
+        }
+        return Ok(());
+    }
+
+    if cli.exit {
+        // 优雅退出运行中的实例（走 host.exit → WM_SPARK_EXIT → 广播 ui.exit）
+        match ipc_server::send_request_to_host("host.exit", serde_json::json!({})) {
+            Ok(()) => info!("exit request sent"),
+            Err(e) => warn!(?e, "exit request failed (host not running?)"),
         }
         return Ok(());
     }

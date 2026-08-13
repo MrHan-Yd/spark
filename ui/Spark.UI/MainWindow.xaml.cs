@@ -37,6 +37,7 @@ public sealed partial class MainWindow : Window
     private AppWindow? _appWindow;
     private TrayService? _tray;
     private ToggleWatcher? _toggleWatcher;
+    private ExitWatcher? _exitWatcher;
     private int _active;
     /// <summary>收藏卡片选中索引（-1 = 未选中，焦点在结果区）；方向键可在结果区 ↔ 收藏区之间移动。</summary>
     private int _favActive = -1;
@@ -181,6 +182,10 @@ public sealed partial class MainWindow : Window
         _toggleWatcher = new ToggleWatcher(() =>
             DispatcherQueue.TryEnqueue(HandleToggle));
 
+        // 托盘"退出"/host.exit → 整个应用退出（独立进程需要自己的退出信号）
+        _exitWatcher = new ExitWatcher(() =>
+            DispatcherQueue.TryEnqueue(OnHostExit));
+
         Activated += (_, e) =>
         {
             if (e.WindowActivationState == WindowActivationState.Deactivated)
@@ -219,6 +224,8 @@ public sealed partial class MainWindow : Window
             try { RemoveWindowSubclass(_hwnd, _noMaximizeProc, new UIntPtr(CaptionSubclassId)); } catch { /* ignore */ }
             _toggleWatcher?.Dispose();
             _toggleWatcher = null;
+            _exitWatcher?.Dispose();
+            _exitWatcher = null;
             await _host.DisposeAsync();
             HideLauncher();  // 正常关闭按钮 = 隐藏，不是真正关闭，保留托盘
         };
@@ -613,8 +620,7 @@ public sealed partial class MainWindow : Window
         DispatcherQueue.TryEnqueue(() =>
         {
             switch (method)
-            {
-                case "ui.show":
+            {                case "ui.show":
                     ShowLauncher();
                     break;
                 case "ui.hide":
@@ -628,6 +634,13 @@ public sealed partial class MainWindow : Window
                 // Host 端也不再广播 ui.toggle。
             }
         });
+    }
+
+    /// <summary>Host 托盘"退出"/host.exit → 整个应用退出（ExitWatcher 事件触发）。</summary>
+    private void OnHostExit()
+    {
+        App.Log("Exit", "exit signal received; exiting");
+        Application.Current.Exit();
     }
 
     /// <summary>event + pipe 可能各推一次，300ms 内只处理一次。</summary>

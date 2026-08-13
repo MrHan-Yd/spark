@@ -15,12 +15,16 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
     RegisterClassW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, MSG, WINDOW_EX_STYLE,
-    WM_DESTROY, WM_HOTKEY, WNDCLASSW, WS_OVERLAPPED,
+    WM_DESTROY, WM_HOTKEY, WM_USER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 static HOTKEY_PAUSED: AtomicBool = AtomicBool::new(false);
 static mut HOST_PTR: Option<*const SharedHost> = None;
 static mut HUB_PTR: Option<*const UiHub> = None;
+/// 主消息循环窗口句柄（ipc_server 收到 host.exit 时投递退出消息用）。
+pub(crate) static mut EXIT_HWND: Option<HWND> = None;
+/// IPC host.exit → 主窗口自定义消息，走与托盘"退出"相同的退出路径。
+pub(crate) const WM_SPARK_EXIT: u32 = WM_USER + 2;
 
 pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<()> {
     let class_name = w!("SparkHostMsgWindow");
@@ -59,6 +63,7 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
     unsafe {
         HOST_PTR = Some(Arc::as_ptr(&host) as *const SharedHost);
         HUB_PTR = Some(Arc::as_ptr(&hub) as *const UiHub);
+        EXIT_HWND = Some(hwnd);
     }
 
     {
@@ -97,10 +102,25 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
     unsafe {
         HOST_PTR = None;
         HUB_PTR = None;
+        EXIT_HWND = None;
     }
     // keep hub alive until end
     drop(hub);
     Ok(())
+}
+
+/// 退出整个应用：广播 ui.exit 让 UI（独立进程）一起退出，再结束本进程消息循环。
+/// 托盘"退出"与 IPC host.exit 共用此路径。
+/// 退出整个应用：信号 EXIT_EVENT 让 UI（独立进程）一起退出，再结束本进程消息循环。
+/// 托盘"退出"与 IPC host.exit 共用此路径。
+/// 注：不用 pipe 广播通知 UI——host 管道句柄是同步的，read_loop 的 ReadFile 挂起时
+/// 同句柄 WriteFile 会阻塞到读方向返回（实测 11-30s 延迟），命名事件无此问题。
+fn exit_app() {
+    info!("app exit requested");
+    crate::toggle_signal::signal_exit();
+    unsafe {
+        PostQuitMessage(0);
+    }
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -124,11 +144,15 @@ unsafe extern "system" fn wnd_proc(
                     CMD_TOGGLE_HOTKEY => toggle_hotkey_pause(hwnd),
                     CMD_EXIT => {
                         info!("exit from tray");
-                        PostQuitMessage(0);
+                        exit_app();
                     }
                     _ => {}
                 }
             }
+            LRESULT(0)
+        }
+        m if m == WM_SPARK_EXIT => {
+            exit_app();
             LRESULT(0)
         }
         WM_DESTROY => {

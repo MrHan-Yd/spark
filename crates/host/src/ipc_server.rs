@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, HANDLE,
-    INVALID_HANDLE_VALUE,
+    INVALID_HANDLE_VALUE, LPARAM, WPARAM,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -23,11 +23,13 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 /// Connected UI writers for Host→UI notifications.
 #[derive(Default, Clone)]
 pub struct UiHub {
-    inner: Arc<Mutex<Vec<u64>>>,
+    /// (client_id, pipe handle)——持有句柄才能向 UI 推送 notification。
+    inner: Arc<Mutex<Vec<(u64, SendHandle)>>>,
 }
 
 /// HANDLE wrapper marked Send (pipe I/O is serialized by our design).
@@ -47,10 +49,10 @@ impl UiHub {
         Self::default()
     }
 
-    fn register(&self) -> u64 {
+    fn register(&self, pipe: SendHandle) -> u64 {
         let id = NEXT_CLIENT.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut g) = self.inner.lock() {
-            g.push(id);
+            g.push((id, pipe));
             info!(client = id, clients = g.len(), "UI connected");
         }
         id
@@ -58,13 +60,25 @@ impl UiHub {
 
     fn unregister(&self, id: u64) {
         if let Ok(mut g) = self.inner.lock() {
-            g.retain(|&c| c != id);
+            g.retain(|&(c, _)| c != id);
             info!(client = id, clients = g.len(), "UI disconnected");
         }
     }
 
     pub fn client_count(&self) -> usize {
         self.inner.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// 向所有已连接的 UI 推送一条 JSON-RPC notification（无 id，UI 触发 HostNotification）。
+    /// 单条写失败（客户端已断开）即移除该客户端，不中断其余。
+    /// 注意：host 的管道句柄是同步的（CreateNamedPipeW 未带 FILE_FLAG_OVERLAPPED），
+    /// 若 client_read_loop 的 ReadFile 正挂起，同句柄 WriteFile 会被阻塞到读方向返回
+    /// （实测 11-30s），因此热路径（如退出通知）应改用命名事件而非此广播。
+    pub fn broadcast(&self, method: &str) {
+        let line = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\"}}\n");
+        if let Ok(mut g) = self.inner.lock() {
+            g.retain(|(_, handle)| write_all_handle(handle.raw(), line.as_bytes()).is_ok());
+        }
     }
 }
 
@@ -153,7 +167,7 @@ fn create_pipe_instance() -> Result<HANDLE> {
 }
 
 fn handle_client(pipe: SendHandle, host: SharedHost, hub: UiHub) -> Result<()> {
-    let client_id = hub.register();
+    let client_id = hub.register(pipe);
     let result = client_read_loop(pipe, &host);
     hub.unregister(client_id);
     unsafe {
@@ -216,6 +230,26 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
         // 只打命名事件（唯一 toggle 通道）；不再广播 pipe ui.toggle ——
         // 双通道竞态会让 UI 收到第二次 toggle（见 win_loop::on_toggle 注释）。
         crate::toggle_signal::signal_toggle();
+        return Ok(());
+    }
+
+    if req.method == "host.exit" {
+        // 优雅退出（静默安装/CLI 用）：向主窗口投递 WM_SPARK_EXIT，
+        // 走与托盘"退出"相同的路径（广播 ui.exit + PostQuitMessage）。
+        if id.is_some() {
+            let resp = JsonRpcResponse::result(id, serde_json::json!({"ok": true}));
+            reply(pipe, &resp)?;
+        }
+        unsafe {
+            if let Some(hwnd) = crate::win_loop::EXIT_HWND {
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    crate::win_loop::WM_SPARK_EXIT,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
         return Ok(());
     }
 

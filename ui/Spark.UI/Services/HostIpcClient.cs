@@ -86,6 +86,7 @@ public sealed class HostIpcClient : IAsyncDisposable
     private async Task ReadLoopAsync(CancellationToken ct)
     {
         if (_pipe is null) return;
+        App.Log("Ipc", "read loop started");
         var reader = new StreamReader(_pipe, Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
         // 单飞行读：同一时刻只挂一个 ReadLineAsync。空闲超时（Host 无保活）时绝不能
         // 放弃当前读另起新读——旧读仍挂在管道上成为"幽灵读"，后续到达的响应会被它
