@@ -3091,6 +3091,7 @@ public sealed partial class MainWindow : Window
             client.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
 
             var verified = false;
+            var everDownloaded = false;
             for (var attempt = 1; attempt <= MaxDownloadAttempts && !verified; attempt++)
             {
                 var downloaded = await TryDownloadAsync(client, m.Url, setup);
@@ -3103,6 +3104,7 @@ public sealed partial class MainWindow : Window
                     }
                     continue;
                 }
+                everDownloaded = true;
 
                 // 校验 SHA-256：不一致不安装
                 AboutUpdateStatus.Text = "正在校验…";
@@ -3129,7 +3131,10 @@ public sealed partial class MainWindow : Window
 
             if (!verified)
             {
-                AboutUpdateStatus.Text = $"校验失败，请稍后重试（期望 {ShortHash(m.Sha256)}）";
+                // 一次都没下载成功（网络/416 恢复失败）与"下载成功但校验不过"是两回事，提示分开
+                AboutUpdateStatus.Text = everDownloaded
+                    ? $"校验失败，请稍后重试（期望 {ShortHash(m.Sha256)}）"
+                    : "下载失败，请检查网络后重试";
                 return;
             }
 
@@ -3175,40 +3180,53 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>流式下载到 setup 文件（带进度）；已存在部分文件时发 Range 续传。
-    /// 中断/失败返回 false（由调用方决定重试），不抛异常。</summary>
+    /// 中断/失败返回 false（由调用方决定重试），不抛异常。
+    /// 服务端回 416（本地残留长度 ≥ 远端文件：上次已下满但校验/安装中断，或远端重新发布）
+    /// 时删除残留、去掉 Range 全量重下 —— 否则每次重试都撞同一个 416 死循环。</summary>
     private async Task<bool> TryDownloadAsync(HttpClient client, string url, string file)
     {
         try
         {
             var done = File.Exists(file) ? new FileInfo(file).Length : 0;
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            if (done > 0)
-                req.Headers.Range = new RangeHeaderValue(done, null);
-            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
-            resp.EnsureSuccessStatusCode();
-            // 服务器忽略 Range（200 全量）→ 从头重写；206 才追加续传
-            var append = resp.StatusCode == HttpStatusCode.PartialContent;
-            var remaining = resp.Content.Headers.ContentLength ?? 0;
-            await using var src = await resp.Content.ReadAsStreamAsync();
-            await using var dst = append
-                ? new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.None)
-                : File.Create(file);
-            var buf = new byte[64 * 1024];
-            long total = append ? done + remaining : remaining;
-            while (true)
+            for (var fresh = true; ; fresh = false)
             {
-                var n = await src.ReadAsync(buf);
-                if (n <= 0) break;
-                await dst.WriteAsync(buf.AsMemory(0, n));
-                done += n;
-                if (total > 0)
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                if (done > 0)
+                    req.Headers.Range = new RangeHeaderValue(done, null);
+                using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+                if (resp.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
-                    var pct = (int)(done * 100 / total);
-                    UpdateProgress.Value = pct;
-                    AboutUpdateStatus.Text = $"正在下载 {pct}%（{done / 1048576} MB）";
+                    // 416：残留文件已无续传价值，删掉从头下；仍 416（第二次）就放弃
+                    if (!fresh) return false;
+                    File.Delete(file);
+                    done = 0;
+                    continue;
                 }
+                resp.EnsureSuccessStatusCode();
+                // 服务器忽略 Range（200 全量）→ 从头重写；206 才追加续传
+                var append = resp.StatusCode == HttpStatusCode.PartialContent;
+                var remaining = resp.Content.Headers.ContentLength ?? 0;
+                await using var src = await resp.Content.ReadAsStreamAsync();
+                await using var dst = append
+                    ? new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.None)
+                    : File.Create(file);
+                var buf = new byte[64 * 1024];
+                long total = append ? done + remaining : remaining;
+                while (true)
+                {
+                    var n = await src.ReadAsync(buf);
+                    if (n <= 0) break;
+                    await dst.WriteAsync(buf.AsMemory(0, n));
+                    done += n;
+                    if (total > 0)
+                    {
+                        var pct = (int)(done * 100 / total);
+                        UpdateProgress.Value = pct;
+                        AboutUpdateStatus.Text = $"正在下载 {pct}%（{done / 1048576} MB）";
+                    }
+                }
+                return true;
             }
-            return true;
         }
         catch (Exception ex)
         {

@@ -29,10 +29,12 @@ SetupIconFile=..\ui\Spark.UI\Assets\spark.ico
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
-; 更新时强制关闭运行中的 Spark.exe / spark-host.exe（解决运行时替换文件）
+; 更新时强制关闭运行中的 Spark.exe / spark-host.exe（解决运行时替换文件）。
+; 注意：不能用 AppMutex —— 静默更新时 Spark 必然在运行（它自己就是更新发起者），
+; Inno 检测到互斥体被持有会弹"Spark 正在运行"并静默默认取消（EAbort），
+; CloseApplications=force 根本没机会执行。去掉互斥体，靠 force 关进程（v0.2.8 修）。
 CloseApplications=force
 CloseApplicationsFilter=Spark.exe,spark-host.exe
-AppMutex=SparkUISingleInstance_v1,SparkLauncherHost_v1
 ; 静默安装日志（%TEMP%\Setup Log*.txt），排查更新失败用
 SetupLogging=yes
 UninstallDisplayIcon={app}\Spark.exe
