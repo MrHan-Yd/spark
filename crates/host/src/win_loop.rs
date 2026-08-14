@@ -19,8 +19,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 static HOTKEY_PAUSED: AtomicBool = AtomicBool::new(false);
-static mut HOST_PTR: Option<*const SharedHost> = None;
-static mut HUB_PTR: Option<*const UiHub> = None;
+/// 主消息循环线程持有的 HostApp / UiHub Arc（消息处理与后台线程共用）。
+/// 注意：不能只存 `Arc::as_ptr` 的裸指针再 `(*ptr).clone()` 还原 —— as_ptr 返回的是
+/// ArcInner 内 T 的地址（即 Mutex<HostApp> 本体），按 Arc 布局去读会把 Mutex 的
+/// SRWLOCK 内部值当成 data 指针，未锁定时为 0，`lock inc [0]` 直接访问违例
+/// （v0.2.7 WM_TIMER 定时器实测崩溃 0xc0000005 @0x56d40）。必须持有 Arc 本体再克隆。
+static mut HOST_ARC: Option<SharedHost> = None;
+static mut HUB_ARC: Option<Arc<UiHub>> = None;
 /// 主消息循环窗口句柄（ipc_server 收到 host.exit 时投递退出消息用）。
 pub(crate) static mut EXIT_HWND: Option<HWND> = None;
 /// IPC host.exit → 主窗口自定义消息，走与托盘"退出"相同的退出路径。
@@ -65,8 +70,8 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
 
     let hub = Arc::new(hub);
     unsafe {
-        HOST_PTR = Some(Arc::as_ptr(&host) as *const SharedHost);
-        HUB_PTR = Some(Arc::as_ptr(&hub) as *const UiHub);
+        HOST_ARC = Some(host.clone());
+        HUB_ARC = Some(hub.clone());
         EXIT_HWND = Some(hwnd);
     }
 
@@ -113,8 +118,8 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
     };
     Hotkey::unregister(hwnd, HOTKEY_ID_TOGGLE);
     unsafe {
-        HOST_PTR = None;
-        HUB_PTR = None;
+        HOST_ARC = None;
+        HUB_ARC = None;
         EXIT_HWND = None;
     }
     // keep hub alive until end
@@ -174,9 +179,8 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_TIMER => {
             if wparam.0 as usize == INDEX_TIMER_ID {
-                if let Some(ptr) = unsafe { HOST_PTR } {
-                    let host = unsafe { (*ptr).clone() };
-                    crate::index_watch::poll(&host);
+                if let Some(host) = unsafe { HOST_ARC.as_ref() } {
+                    crate::index_watch::poll(host);
                 }
             }
             LRESULT(0)
@@ -199,8 +203,7 @@ fn on_toggle() {
     // 只在 UI 进程完全不存在时才拉起，避免每次热键都重复 spawn。
     // 若 UI 在运行但没连 pipe（演示模式），client_count 为 0 —— 此时
     // 再 spawn 会产生多个 UI 实例抢同一个 auto-reset 事件，热键时灵时不灵。
-    if let Some(ptr) = unsafe { HUB_PTR } {
-        let hub = unsafe { &*ptr };
+    if let Some(hub) = unsafe { HUB_ARC.as_ref() } {
         let n = hub.client_count();
         info!(ui_clients = n, "toggle → event");
         if n == 0 && !crate::is_ui_running() {
@@ -230,8 +233,7 @@ fn try_spawn_ui() {
 fn toggle_hotkey_pause(hwnd: HWND) {
     let paused = HOTKEY_PAUSED.fetch_xor(true, Ordering::SeqCst);
     let now_paused = !paused;
-    if let Some(ptr) = unsafe { HOST_PTR } {
-        let host = unsafe { &*ptr };
+    if let Some(host) = unsafe { HOST_ARC.as_ref() } {
         if let Ok(mut g) = host.lock() {
             g.set_hotkey_enabled(!now_paused);
             if now_paused {
@@ -260,10 +262,9 @@ fn rehook_hotkey(hwnd: HWND) {
         info!("hotkey paused; re-register deferred until resumed");
         return;
     }
-    let Some(ptr) = (unsafe { HOST_PTR }) else {
+    let Some(host) = (unsafe { HOST_ARC.as_ref() }) else {
         return;
     };
-    let host = unsafe { &*ptr };
     let Ok(g) = host.lock() else { return };
     Hotkey::unregister(hwnd, HOTKEY_ID_TOGGLE);
     match Hotkey::parse(&g.config.hotkey_toggle) {

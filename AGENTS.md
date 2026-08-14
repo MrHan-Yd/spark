@@ -1,6 +1,40 @@
-# Spark — Agent / 协作者备忘
+# AGENTS.md — Spark Agent / 协作者备忘 & 协作规约
 
-- 技术栈定稿：`docs/TECH_STACK.md`（Rust host + C# WinUI 3 UI）
-- 热路径逻辑只进 `crates/`，不要把索引/热键做进 UI
-- HTML `ui-prototype/` 仅设计参考，不是生产 UI
-- 提交前：`cargo test --workspace`；有 Rust 改动时 `cargo fmt`
+## 📌 项目架构与硬性约束 (Project Guidelines)
+
+- **技术栈定稿**：详见 `docs/TECH_STACK.md`（Rust Host + C# WinUI 3 UI）。
+- **性能与分层原则**：热路径逻辑（Hot Path）只进 `crates/`，**绝对不要**把索引、热键或核心计算逻辑做进 UI 层。
+- **UI 参考说明**：HTML 原型 `ui-prototype/` 仅作为设计与视觉参考，**不是**生产环境 UI 代码，切勿直接迁移其实现。
+- **提交与质量门禁**：
+    - 每次代码交付/提交前必须通过：`cargo test --workspace`
+    - 只要包含 Rust 相关改动，必须执行：`cargo fmt`
+
+---
+
+## 🤖 角色定义 (Roles Definition)
+
+- **Main Developer (主模型)**：负责理解用户需求、编写代码、修复缺陷及执行本地编译校验。
+- **Code Auditor (代码审查子智能体)**：独立的质量审计员。**只找 Bug、查架构违规、提修复要求，绝不代写代码**。
+
+---
+
+## 🔄 主从协作与自动审查工作流 (Workflow & Trigger Rules)
+
+当你（主模型）完成任何代码编写、重构或修改后，**严禁直接结束对话或向用户交付**。必须严格按以下闭环流转：
+
+### 1. 自动触发 Review
+代码编写完成且通过基础检查后，必须自动切换/调用 **Code Auditor** 子智能体的审计逻辑，对本次改动进行代码审计。
+
+### 2. 审查项与门禁 (Review Checklist)
+审查子智能体将依据以下标准进行苛刻审计：
+- **架构合规**：检查是否违背热路径原则（如把索引/热键逻辑写进了 UI 层）。
+- **正确性与安全性**：空指针、内存泄漏、并发竞态、边界条件缺失、未处理的异常。
+- **工程规范**： Rust 改动是否符合 `cargo fmt` 与测试约束。
+
+### 3. 处理 Review 结果
+- **若返回 `[STATUS: NEEDS_FIX]`**：
+  根据子智能体提出的 🔴 **阻断级缺陷**，由**主模型（你自己）**重新思考并进行修复，修复后再次提交给子智能体回归验证，直到通过。
+- **若返回 `[STATUS: PASSED]`**：
+  确认代码可靠且符合 Spark 架构规范，此时方可向用户交付最终代码，并附带简要的 Review 结论。
+
+> **对用户的表现**：用户只需正常提出需求，系统在后台自动跑完“编写 ➔ Review ➔ 修复 ➔ 确认 PASSED”的全流程后再向用户输出。
