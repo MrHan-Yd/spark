@@ -53,6 +53,11 @@ impl MemoryIndex {
         self.items
     }
 
+    /// 索引条目数（宿主侧后台重建时统计用；SearchIndex::len 是 trait 方法，非 pub）。
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Candidate> {
         self.items.iter()
     }

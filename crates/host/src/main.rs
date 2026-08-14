@@ -8,6 +8,7 @@ mod app;
 mod builtins;
 mod config;
 mod hotkey;
+mod index_watch;
 mod ipc_server;
 mod probe;
 mod shell;

@@ -6,7 +6,7 @@ mod history;
 mod lnk;
 mod memory;
 
-pub use apps::enumerate_start_menu_apps;
+pub use apps::{enumerate_start_menu_apps, start_menu_fingerprint};
 pub use history::HistoryStore;
 pub use lnk::resolve_lnk;
 pub use memory::MemoryIndex;
@@ -157,6 +157,11 @@ impl AppIndex {
         for app in enumerate_start_menu_apps() {
             memory.upsert(app);
         }
+        self.memory = memory;
+    }
+
+    /// 后台重建完成后原子换入新内存索引（历史记录保留），避免重建期间长时间占用锁。
+    pub fn swap_memory(&mut self, memory: MemoryIndex) {
         self.memory = memory;
     }
 }

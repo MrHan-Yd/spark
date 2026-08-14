@@ -16,20 +16,8 @@ use tracing::{debug, info};
 
 /// Scan common Start Menu roots and return app candidates.
 pub fn enumerate_start_menu_apps() -> Vec<Candidate> {
-    let mut roots = Vec::new();
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        roots.push(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs"));
-    }
-    if let Ok(program_data) = std::env::var("ProgramData") {
-        roots.push(PathBuf::from(program_data).join(r"Microsoft\Windows\Start Menu\Programs"));
-    }
-    // Common extra locations
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join(r"Microsoft\Windows\Start Menu\Programs"));
-    }
-
     let mut collected = Vec::new();
-    for root in roots {
+    for root in start_menu_roots() {
         if !root.is_dir() {
             continue;
         }
@@ -44,6 +32,79 @@ pub fn enumerate_start_menu_apps() -> Vec<Candidate> {
 
     info!(count = items.len(), "enumerated start-menu apps");
     items
+}
+
+/// Start Menu 扫描根目录（用户/系统/本地三处 Programs 目录）。
+fn start_menu_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        roots.push(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs"));
+    }
+    if let Ok(program_data) = std::env::var("ProgramData") {
+        roots.push(PathBuf::from(program_data).join(r"Microsoft\Windows\Start Menu\Programs"));
+    }
+    // Common extra locations
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join(r"Microsoft\Windows\Start Menu\Programs"));
+    }
+    roots
+}
+
+/// 目录树指纹：对每个目录递归做 FNV-1a(path + dir mtime)。
+/// 快捷方式的新增/删除/改名都会更新所在目录的 mtime；只 stat 目录、不解析 .lnk，
+/// 一次遍历毫秒级，host 定时器每 30s 算一次，变化时才重建索引（新装应用无需重启即可搜到）。
+pub fn start_menu_fingerprint() -> u64 {
+    let mut entries: Vec<(String, u128)> = Vec::new();
+    for root in start_menu_roots() {
+        if root.is_dir() {
+            fingerprint_dir(&root, &mut entries);
+        }
+    }
+    entries.sort();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for (path, mtime) in entries {
+        hash ^= path.len() as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        for b in path.bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= mtime as u64;
+        hash ^= (mtime >> 64) as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn fingerprint_dir(dir: &Path, out: &mut Vec<(String, u128)>) {
+    let mtime = dir
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    out.push((dir.to_string_lossy().into_owned(), mtime));
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // 与 collect_entries 一致的忽略规则：Startup 与隐藏目录不入索引，也不入指纹
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if name == "startup" || name.starts_with('.') {
+            continue;
+        }
+        fingerprint_dir(&path, out);
+    }
 }
 
 /// A raw Start Menu entry, before merging by target exe.

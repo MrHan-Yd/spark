@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 pub struct HostApp {
-    index: AppIndex,
+    /// 应用索引（index_watch 后台重建后 swap_memory 原子换入）。
+    pub index: AppIndex,
     plugins: PluginManager,
     pub config: HostConfig,
     /// 托盘图标（win_loop 创建后注入；用于右下角气泡提示）

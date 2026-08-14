@@ -13,9 +13,9 @@ use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, MSG, WINDOW_EX_STYLE,
-    WM_DESTROY, WM_HOTKEY, WM_USER, WNDCLASSW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostQuitMessage,
+    RegisterClassW, SetTimer, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, MSG,
+    WINDOW_EX_STYLE, WM_DESTROY, WM_HOTKEY, WM_TIMER, WM_USER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 static HOTKEY_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -27,6 +27,8 @@ pub(crate) static mut EXIT_HWND: Option<HWND> = None;
 pub(crate) const WM_SPARK_EXIT: u32 = WM_USER + 2;
 /// IPC host.set_config（热键变更）→ 主窗口重注册全局热键。
 pub(crate) const WM_SPARK_REHOTKEY: u32 = WM_USER + 3;
+/// Start Menu 变更检测定时器（每 30s 一次指纹，变化了才重建索引）。
+const INDEX_TIMER_ID: usize = 0x5350; // "SP"
 
 pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<()> {
     let class_name = w!("SparkHostMsgWindow");
@@ -92,6 +94,12 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
         "tray ready; message loop running"
     );
 
+    // 索引热更新：记录基线后每 30s 检测 Start Menu 变化（新装应用无需重启即可搜到）
+    crate::index_watch::record_baseline();
+    unsafe {
+        SetTimer(Some(hwnd), INDEX_TIMER_ID, 30_000, None);
+    }
+
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -100,6 +108,9 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
         }
     }
 
+    unsafe {
+        let _ = KillTimer(Some(hwnd), INDEX_TIMER_ID);
+    };
     Hotkey::unregister(hwnd, HOTKEY_ID_TOGGLE);
     unsafe {
         HOST_PTR = None;
@@ -159,6 +170,15 @@ unsafe extern "system" fn wnd_proc(
         }
         m if m == WM_SPARK_REHOTKEY => {
             rehook_hotkey(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 as usize == INDEX_TIMER_ID {
+                if let Some(ptr) = unsafe { HOST_PTR } {
+                    let host = unsafe { (*ptr).clone() };
+                    crate::index_watch::poll(&host);
+                }
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
