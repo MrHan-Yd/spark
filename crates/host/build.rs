@@ -13,7 +13,10 @@ fn main() {
     assert!(ico.exists(), "spark.ico not found: {}", ico.display());
     let rc = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("spark.rc");
     // rc 脚本里用正斜杠路径：rc.exe 两种都接受，正斜杠无需转义
-    let script = format!("1 ICON \"{}\"\n", ico.display().to_string().replace('\\', "/"));
+    let script = format!(
+        "1 ICON \"{}\"\n",
+        ico.display().to_string().replace('\\', "/")
+    );
     std::fs::write(&rc, script).expect("write spark.rc");
     embed_resource::compile(&rc, embed_resource::NONE);
 }

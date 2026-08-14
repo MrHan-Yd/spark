@@ -25,6 +25,8 @@ static mut HUB_PTR: Option<*const UiHub> = None;
 pub(crate) static mut EXIT_HWND: Option<HWND> = None;
 /// IPC host.exit → 主窗口自定义消息，走与托盘"退出"相同的退出路径。
 pub(crate) const WM_SPARK_EXIT: u32 = WM_USER + 2;
+/// IPC host.set_config（热键变更）→ 主窗口重注册全局热键。
+pub(crate) const WM_SPARK_REHOTKEY: u32 = WM_USER + 3;
 
 pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<()> {
     let class_name = w!("SparkHostMsgWindow");
@@ -155,6 +157,10 @@ unsafe extern "system" fn wnd_proc(
             exit_app();
             LRESULT(0)
         }
+        m if m == WM_SPARK_REHOTKEY => {
+            rehook_hotkey(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             PostQuitMessage(0);
             LRESULT(0)
@@ -224,5 +230,27 @@ fn toggle_hotkey_pause(hwnd: HWND) {
                 }
             }
         }
+    }
+}
+
+/// host.set_config 变更热键后重注册：先注销旧键再注册新键。
+/// 热键暂停中（托盘"暂停热键"）只更新 config，注册留待恢复时进行。
+fn rehook_hotkey(hwnd: HWND) {
+    if HOTKEY_PAUSED.load(Ordering::SeqCst) {
+        info!("hotkey paused; re-register deferred until resumed");
+        return;
+    }
+    let Some(ptr) = (unsafe { HOST_PTR }) else {
+        return;
+    };
+    let host = unsafe { &*ptr };
+    let Ok(g) = host.lock() else { return };
+    Hotkey::unregister(hwnd, HOTKEY_ID_TOGGLE);
+    match Hotkey::parse(&g.config.hotkey_toggle) {
+        Ok(hk) => match hk.register(hwnd, HOTKEY_ID_TOGGLE) {
+            Ok(()) => info!(hotkey = %g.config.hotkey_toggle, "hotkey re-registered"),
+            Err(e) => error!(?e, "hotkey re-register failed"),
+        },
+        Err(e) => error!(?e, raw = %g.config.hotkey_toggle, "invalid hotkey"),
     }
 }

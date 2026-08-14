@@ -4,7 +4,7 @@ use crate::app::SharedHost;
 use anyhow::{Context, Result};
 use spark_ipc::{
     decode_line, encode_line, HostMethod, InvokeParams, JsonRpcRequest, JsonRpcResponse,
-    QueryParams, QueryResult, PIPE_PATH,
+    QueryParams, QueryResult, SetConfigParams, PIPE_PATH,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -287,6 +287,40 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
         m if m == HostMethod::GetConfig.as_str() => {
             let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
             JsonRpcResponse::result(id, serde_json::to_value(&g.config)?)
+        }
+        m if m == HostMethod::SetConfig.as_str() => {
+            let params: SetConfigParams = serde_json::from_value(req.params).unwrap_or_default();
+            let hotkey_changed = {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                let mut changed = false;
+                if let Some(hk) = params.hotkey_toggle {
+                    if hk != g.config.hotkey_toggle {
+                        info!(old = %g.config.hotkey_toggle, new = %hk, "hotkey updated");
+                        g.config.hotkey_toggle = hk;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Err(e) = g.config.save() {
+                        warn!(?e, "config save failed after set_config");
+                    }
+                }
+                changed
+            };
+            if hotkey_changed {
+                // 重注册必须走主消息循环线程（与 HOTKEY_PAUSED/托盘开关同一路径）
+                unsafe {
+                    if let Some(hwnd) = crate::win_loop::EXIT_HWND {
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            crate::win_loop::WM_SPARK_REHOTKEY,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            }
+            JsonRpcResponse::result(id, serde_json::json!({"ok": true}))
         }
         m if m == HostMethod::GetBuiltins.as_str() => {
             // 内置命令清单（设置页展示用，无需锁 host）

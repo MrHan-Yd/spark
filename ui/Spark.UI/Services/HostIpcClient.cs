@@ -252,6 +252,22 @@ public sealed class HostIpcClient : IAsyncDisposable
         return new List<BuiltinInfoDto>();
     }
 
+    /// <summary>把唤起热键预设推给 host（host 负责注册全局热键并持久化到 config.toml）。
+    /// host 不可达时静默放弃：连接建立/重建时会重新同步。</summary>
+    public async Task SetHotkeyAsync(string hotkey, CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) return;
+        try
+        {
+            await CallAsync("host.set_config", new { hotkey_toggle = hotkey }, ct);
+        }
+        catch
+        {
+            // 热键注册失败不影响设置页本地状态；重连时会再推
+        }
+    }
+
     private async Task<JsonElement> CallAsync(string method, object paramsObj, CancellationToken ct)
     {
         if (!IsConnected || _writer is null)

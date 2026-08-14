@@ -136,6 +136,14 @@ pub struct InvokeParams {
     pub text: String,
 }
 
+/// `host.set_config` 参数：UI 设置页改动推送（缺省字段不动）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetConfigParams {
+    /// 唤起热键（"Alt+Space"/"Ctrl+Space"…），变更后 host 重注册全局热键。
+    #[serde(default)]
+    pub hotkey_toggle: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InvokeResult {

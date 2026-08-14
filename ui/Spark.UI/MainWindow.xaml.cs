@@ -148,6 +148,8 @@ public sealed partial class MainWindow : Window
         ResultList.ItemsSource = _items;
         ResultGrid.ItemsSource = _items;
         LocalState.Load();
+        // 旧版 Run 项指向 Spark.exe（UI）→ 自动迁移到 spark-host.exe，修复开机热键失效
+        MigrateStartupEntry();
 
         // 箭头键在根上全局接管（handledEventsToo=true：输入框有文本时会先消费箭头键并把事件标为已处理，
         // 普通 KeyDown 收不到；这里在冒泡终点仍能收到），统一只控制下面选中项
@@ -285,6 +287,8 @@ public sealed partial class MainWindow : Window
             // 构造时窗口句柄可能未就绪（Acrylic 挂 target 需要），Loaded 后重放一次主题
             try { ApplyTheme(); } catch (Exception ex) { App.Log("Theme", ex); }
             try { await _host.EnsureConnectedAsync(); } catch (Exception ex) { App.Log("HostConnect", ex); }
+            // 首次连上即同步唤起热键预设（host 只认自己 config.toml 里的值）
+            _ = _host.SetHotkeyAsync(LocalState.Ui.Hotkey);
             try { SetupTray(); } catch (Exception ex) { App.Log("SetupTray", ex); }
             HideLauncher();
             await RefreshResultsAsync("");
@@ -654,7 +658,11 @@ public sealed partial class MainWindow : Window
                     // 从"未连接"变为"已连接"：首启的 DemoData 兜底已过期，
                     // 自动补一次刷新拿到完整列表（否则要等用户按热键唤醒才看得到）
                     if (_host.IsConnected && !wasConnected)
+                    {
                         DispatcherQueue.TryEnqueue(() => ScheduleRefresh(QueryBox.Text ?? ""));
+                        // host 重启/晚于 UI 启动：重连后补推热键预设
+                        _ = _host.SetHotkeyAsync(LocalState.Ui.Hotkey);
+                    }
                 }
             }
             catch { /* ignore */ }
@@ -2768,7 +2776,31 @@ public sealed partial class MainWindow : Window
         catch { return false; }
     }
 
-    /// <summary>写入/删除开机启动项：true = 注册 exe 路径（带引号，路径含空格时注册表才认得）。</summary>
+    /// <summary>
+    /// 定位 spark-host.exe：优先 UI 同目录（安装布局 {app}\Spark.exe + {app}\spark-host.exe）；
+    /// 开发布局回退到仓库根 target/{debug,release}\spark-host.exe
+    /// （UI 在 ui/Spark.UI/bin/{Debug,Release}/net8.0-…/win-x64，上溯 6 层到仓库根）。
+    /// 返回 null 表示找不到 host。
+    /// </summary>
+    private static string? FindHostExe()
+    {
+        var baseDir = AppContext.BaseDirectory;
+        var beside = Path.Combine(baseDir, "spark-host.exe");
+        if (File.Exists(beside)) return beside;
+        var repo = Path.GetFullPath(Path.Combine(
+            baseDir, "..", "..", "..", "..", "..", ".."));
+        foreach (var profile in new[] { "debug", "release" })
+        {
+            var p = Path.Combine(repo, "target", profile, "spark-host.exe");
+            if (File.Exists(p)) return p;
+        }
+        return null;
+    }
+
+    /// <summary>写入/删除开机启动项：true = 注册 host 路径（带引号，路径含空格时注册表才认得）。
+    /// 必须写 spark-host.exe 而不是 Spark.exe：热键/托盘/索引都在 host 里，
+    /// 开机只拉起 UI 的话热键不生效（host 会自行以 --hidden 拉起 UI）。
+    /// 开发布局找不到 host 时退回 UI exe，保证开关在 dev 下仍可用。</summary>
     private static void SetStartupEntry(bool enable)
     {
         try
@@ -2777,13 +2809,37 @@ public sealed partial class MainWindow : Window
             if (k is null) return;
             if (enable)
             {
-                var exe = Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "Spark.exe");
+                var exe = FindHostExe()
+                    ?? Environment.ProcessPath
+                    ?? Path.Combine(AppContext.BaseDirectory, "Spark.exe");
                 k.SetValue(RunValueName, $"\"{exe}\"");
             }
             else
             {
                 k.DeleteValue(RunValueName, throwOnMissingValue: false);
             }
+        }
+        catch (Exception ex) { App.Log("StartupRegistry", ex); }
+    }
+
+    /// <summary>旧版本把 Run 项写成 UI（Spark.exe），开机只拉起 UI、host 缺失导致热键失效。
+    /// 每次启动时检测并自动迁移到同目录的 spark-host.exe；只迁移指向 Spark.exe 的旧项，
+    /// 用户手动改过的值不动。</summary>
+    private static void MigrateStartupEntry()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+            if (k?.GetValue(RunValueName) is not string s || string.IsNullOrEmpty(s)) return;
+            var target = s.Trim().Trim('"');
+            if (target.Contains("spark-host.exe", StringComparison.OrdinalIgnoreCase)) return;
+            if (!Path.GetFileName(target).Equals("Spark.exe", StringComparison.OrdinalIgnoreCase)) return;
+            var dir = Path.GetDirectoryName(target);
+            if (string.IsNullOrEmpty(dir)) return;
+            var host = Path.Combine(dir, "spark-host.exe");
+            if (!File.Exists(host)) return;
+            using var w = Registry.CurrentUser.CreateSubKey(RunKeyPath);
+            w?.SetValue(RunValueName, $"\"{host}\"");
         }
         catch (Exception ex) { App.Log("StartupRegistry", ex); }
     }
@@ -2877,6 +2933,8 @@ public sealed partial class MainWindow : Window
         LocalState.Ui.Hotkey = (string)((Button)sender).Tag;
         LocalState.SaveUi();
         UpdateHotkeyPresets(animate: true);
+        // 热键由 host 注册：推送到 host 重注册（host 不可达时重连后自动补同步）
+        _ = _host.SetHotkeyAsync(LocalState.Ui.Hotkey);
     }
 
     /// <summary>预设按钮选中态：背景/边框颜色 200ms 渐变切换（对齐开关动画）。
