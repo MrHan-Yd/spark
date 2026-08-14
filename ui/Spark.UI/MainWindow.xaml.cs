@@ -3067,9 +3067,12 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>下载 → 校验 SHA-256 → 静默安装 → 退出。
-    /// 安装器会强制关闭运行中的 Spark.exe / spark-host.exe，装完 [Run] 拉起新版 host（host 再拉起 UI），
-    /// 完成"自动重启"；校验不过或安装失败都保留"打开下载页"手动兜底。
+    /// <summary>下载 → 校验 SHA-256 → 静默安装 → 杀旧 host → 拉起新版 host/UI → 退出。
+    /// 安装器会强制关闭运行中的 Spark.exe / spark-host.exe（CloseApplications=force，Restart Manager
+    /// 检测，仅对占用安装目录待更新文件的进程生效），装完 [Run] 拉起新版 host；但对"运行副本不在
+    /// 安装目录"的场景（开发副本等）旧 host 杀不到，由本方法在安装成功后显式补杀旧 host（释放
+    /// 单实例互斥体）再拉起新版 host/UI，完成"自动重启"（详见 <see cref="KillOldHostAsync"/>）。
+    /// 安装成功前不动旧 host —— 校验不过/安装失败时环境完好，仅保留"打开下载页"手动兜底。
     /// 弱网（GitHub 大文件易中断/损坏）下：下载中断自动重试（断点续传，不必全量重下），
     /// 校验失败同样自动重下重试，最多 <see cref="MaxDownloadAttempts"/> 次。</summary>
     private const int MaxDownloadAttempts = 3;
@@ -3141,9 +3144,16 @@ public sealed partial class MainWindow : Window
             // 静默安装到原安装路径（注册表记录；读不到则默认目录）
             CheckUpdateLabel.Text = "正在安装…";
             AboutUpdateStatus.Text = "正在安装，完成后将自动重启…";
-            var installDir = ReadInstallPath()
-                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            var installDir = ReadInstallPath() ?? "";
+            // 注册表 InstallPath 可能被写坏（空串/相对路径/带引号），兜底到默认目录，
+            // 避免 /DIR 参数损坏导致装错位置
+            installDir = installDir.Trim().Trim('"');
+            if (!Path.IsPathRooted(installDir))
+            {
+                installDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "Programs", "Spark");
+            }
             var psi = new ProcessStartInfo(setup)
             {
                 UseShellExecute = false,
@@ -3159,10 +3169,25 @@ public sealed partial class MainWindow : Window
             await proc.WaitForExitAsync();
             if (proc.ExitCode != 0)
             {
+                // 安装失败：此时旧 host 未动（成功前绝不杀它），热键/托盘/索引环境完好
                 AboutUpdateStatus.Text = $"安装失败（{proc.ExitCode}），请手动下载";
                 return;
             }
-            // 安装成功：本进程退出，新版 host 已由安装器拉起
+            // 安装成功。旧 host 可能还活着（不在安装目录的实例，CloseApplications 杀不到，见
+            // KillOldHostAsync）——先杀掉释放单实例互斥体，再显式拉起新版 host/UI 完成"自动重启"。
+            // 重启步骤成败可观测：旧 host 没杀干净（互斥体仍被占）或新版 host 没起来时不能静默
+            // 退出（否则留下"无 host/旧 host"残缺态），保留本进程并提示用户手动重启应用。
+            if (!await KillOldHostAsync() || !LaunchNewHost(installDir))
+            {
+                AboutUpdateStatus.Text = "更新完成，请手动重启应用";
+                return;
+            }
+            // 新版 host 已接管（安装期间 [Run] 拉起的 host 实例若还活着，也随上面的 taskkill
+            // 一并结束，最终恰好一个 host）。UI 由本进程补拉：host 启动时检测到本进程
+            // （Spark.exe）在运行，不会自己拉起 UI；补拉失败也无妨，下次热键/托盘唤起时
+            // host 会自行拉起新版 UI（自愈）。开发副本场景安装期间，[Run] 的 host 实例向
+            // 旧 host 转发过一次 toggle，更新窗口可能被显隐一次 —— 纯外观副作用。
+            LaunchNewUi(installDir);
             Environment.Exit(0);
         }
         catch (Exception ex)
@@ -3176,6 +3201,103 @@ public sealed partial class MainWindow : Window
             _checkingUpdate = false;
             BtnCheckUpdate.IsEnabled = true;
             CheckUpdateLabel.Text = _pendingUpdate is null ? "检查更新" : "下载并安装";
+        }
+    }
+
+    /// <summary>强杀运行中的旧 host（taskkill 按映像名，与安装位置无关；host 不在运行时空跑无害）。
+    /// 为什么必须显式杀：安装器的 CloseApplications=force 走 Windows Restart Manager，只关闭
+    /// "占用安装目录待更新文件"的进程 —— 当正在运行的 spark-host.exe 不在安装目录（开发副本、
+    /// 手动拷贝的运行位置）时检测不到，旧 host 会带着单实例互斥体/热键/托盘活过安装，
+    /// [Run] 拉起的 host 因"实例已存在"立即退出并转发 toggle，之后所有唤醒仍由旧 host 提供，
+    /// 表现为"更新成功但唤醒后还是旧版本"（v0.2.9 实测）。
+    /// 不用 spark-host --exit：它走 host.exit 广播退出事件，会把正在执行更新的本 UI 一起关掉。
+    /// 不带 /T：host 可能以本 UI 为子进程（host 拉起 UI），带 /T 会把更新流程自己杀死。
+    /// 注意：按映像名杀会把安装期间 [Run] 刚拉起的 host 实例一并结束（它也是 spark-host.exe），
+    /// 由调用方随后显式拉起新版 host，最终恰好一个实例。
+    /// 返回 false 表示确认仍有 spark-host 进程存活（taskkill 被拦截等）——单实例互斥体未释放，
+    /// 调用方必须保留本进程并提示用户，不能静默退出。</summary>
+    private static async Task<bool> KillOldHostAsync()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("taskkill")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                Arguments = "/IM spark-host.exe /F",
+            };
+            using var p = Process.Start(psi);
+            if (p is not null)
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                try { await p.WaitForExitAsync(cts.Token); } catch (OperationCanceledException) { }
+            }
+            // taskkill 返回只代表终止请求已发出，再等进程真正退出 —— 单实例互斥体随进程
+            // 结束才释放，新版 host 必须在互斥体空闲时启动（否则又退回旧 host 兜底）。
+            for (var i = 0; i < 20 && Process.GetProcessesByName("spark-host").Length > 0; i++)
+                await Task.Delay(100);
+            var stillRunning = Process.GetProcessesByName("spark-host").Length > 0;
+            if (stillRunning)
+                App.Log("KillOldHost", "taskkill 未生效，spark-host 仍在运行 — 更新后可能仍回退旧版本");
+            return !stillRunning;
+        }
+        catch (Exception ex)
+        {
+            App.Log("KillOldHost", ex);
+            return false;
+        }
+    }
+
+    /// <summary>安装成功后显式拉起新版 host。安装器 [Run] 已尝试过拉起；[Run] 的实例若因旧 host
+    /// 占互斥体而退出（开发副本场景），这里补拉；若旧 host 杀不掉，本次启动会走"实例已存在→
+    /// 转发 toggle"后退出。host 文件不存在或启动被拦截（杀软等）时返回 false。
+    /// host 启动时若检测到 Spark.exe 在运行（本更新进程），不会自动拉起 UI，需配合
+    /// <see cref="LaunchNewUi"/>。</summary>
+    private static bool LaunchNewHost(string installDir)
+    {
+        try
+        {
+            var host = Path.Combine(installDir, "spark-host.exe");
+            if (!File.Exists(host)) return false;
+            var psi = new ProcessStartInfo(host)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = installDir,
+            };
+            return Process.Start(psi) is not null;
+        }
+        catch (Exception ex)
+        {
+            App.Log("LaunchNewHost", ex);
+            return false;
+        }
+    }
+
+    /// <summary>安装成功后显式拉起新版 UI（--hidden，与 host 启动同款参数），补全"自动重启"：
+    /// [Run] 的 host 启动时本更新进程还活着，host 的"UI 已在运行"检查（tasklist 按映像名）
+    /// 会跳过拉起，本进程退出后就没人拉 UI 了 —— 由更新发起者自己补拉。
+    /// 时序安全：调用后紧接着 Environment.Exit(0)（毫秒级），新版 UI 冷启动（数百毫秒）
+    /// 远慢于本进程退出，届时 UI 单实例互斥体（Local\SparkUISingleInstance_v1）已随进程
+    /// 结束释放，不会误入"已有实例→转发 toggle→退出"分支。文件不存在时静默放弃。</summary>
+    private static void LaunchNewUi(string installDir)
+    {
+        try
+        {
+            var ui = Path.Combine(installDir, "Spark.exe");
+            if (!File.Exists(ui)) return;
+            var psi = new ProcessStartInfo(ui)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                Arguments = "--hidden",
+                WorkingDirectory = installDir,
+            };
+            Process.Start(psi);
+        }
+        catch (Exception ex)
+        {
+            App.Log("LaunchNewUi", ex);
         }
     }
 
