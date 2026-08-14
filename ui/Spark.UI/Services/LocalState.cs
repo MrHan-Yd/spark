@@ -69,6 +69,17 @@ public sealed class AppUiState
     /// <summary>上次拖拽后的窗口位置（物理像素，屏幕坐标）；-1 = 未记录，居中显示。</summary>
     public int WindowX { get; set; } = -1;
     public int WindowY { get; set; } = -1;
+    /// <summary>桌面悬浮球开关（通用设置）：true = 常驻置顶悬浮球，点击唤起/隐藏主窗口。</summary>
+    public bool FloatingBallEnabled { get; set; }
+    /// <summary>悬浮球驻留模式：true = 贴边驻留（只露窄条，悬停滑出），
+    /// false = 自由悬浮常显（任意位置）。旧设置缺省贴边。</summary>
+    public bool BallDocked { get; set; } = true;
+    /// <summary>悬浮球贴边方向（"left"/"right"/"top"/"bottom"）。</summary>
+    public string BallEdge { get; set; } = "right";
+    /// <summary>自由悬浮时悬浮球水平位置（物理像素，屏幕坐标）；-1 = 未记录，水平居中。</summary>
+    public int BallX { get; set; } = -1;
+    /// <summary>悬浮球垂直位置（物理像素，屏幕坐标）；-1 = 未记录，取工作区垂直 1/4 处。</summary>
+    public int BallY { get; set; } = -1;
 }
 
 public sealed class FavoritesState

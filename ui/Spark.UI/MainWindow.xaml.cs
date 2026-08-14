@@ -38,6 +38,8 @@ public sealed partial class MainWindow : Window
     private readonly HostIpcClient _host = new();
     private AppWindow? _appWindow;
     private TrayService? _tray;
+    /// <summary>桌面悬浮球（uTools 式贴边悬浮球）；「通用设置 → 悬浮球」开关控制，null = 未启用。</summary>
+    private FloatingBallWindow? _ball;
     private ToggleWatcher? _toggleWatcher;
     private ExitWatcher? _exitWatcher;
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _showFallback;
@@ -276,6 +278,7 @@ public sealed partial class MainWindow : Window
             _toggleWatcher = null;
             _exitWatcher?.Dispose();
             _exitWatcher = null;
+            HideBall();  // 悬浮球独立于主窗生命周期，随应用退出一起销毁
             await _host.DisposeAsync();
             HideLauncher();  // 正常关闭按钮 = 隐藏，不是真正关闭，保留托盘
         };
@@ -290,6 +293,7 @@ public sealed partial class MainWindow : Window
             // 首次连上即同步唤起热键预设（host 只认自己 config.toml 里的值）
             _ = _host.SetHotkeyAsync(LocalState.Ui.Hotkey);
             try { SetupTray(); } catch (Exception ex) { App.Log("SetupTray", ex); }
+            if (LocalState.Ui.FloatingBallEnabled) ShowBall();
             HideLauncher();
             await RefreshResultsAsync("");
             RenderFavorites();
@@ -398,6 +402,7 @@ public sealed partial class MainWindow : Window
         // 内容/系统控件主题跟随玻璃主题（浅色系统下 TextBox 光标、滚动条、弹窗默认是浅色的）
         Root.RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light;
         ApplyDwmDarkMode();
+        _ball?.ApplyTheme(dark);
     }
 
     /// <summary>系统是否开启透明效果。关闭时 Acrylic 会静默回退成纯色，此时回退纯色背景。</summary>
@@ -2752,6 +2757,7 @@ public sealed partial class MainWindow : Window
             StartupSwitch.IsChecked = GetStartupEntry();
             HideFocusSwitch.IsChecked = LocalState.Ui.HideOnFocusLost;
             HideInvokeSwitch.IsChecked = LocalState.Ui.HideAfterInvoke;
+            BallSwitch.IsChecked = LocalState.Ui.FloatingBallEnabled;
             ThemeCombo.SelectedIndex = LocalState.Ui.Theme switch { "light" => 2, "dark" => 1, _ => 0 };
             ViewCombo.SelectedIndex = LocalState.Ui.DefaultView == "grid" ? 1 : 0;
             UpdateHotkeyPresets(animate: false);
@@ -2910,6 +2916,62 @@ public sealed partial class MainWindow : Window
         if (_syncing) return;
         LocalState.Ui.HideAfterInvoke = on;
         LocalState.SaveUi();
+    }
+
+    // ==================== 悬浮球 ====================
+
+    private void OnToggleBall(object sender, RoutedEventArgs e)
+    {
+        var on = BallSwitch.IsChecked == true;
+        AnimateSwitchToggle(BallSwitch, on, animate: !_syncing);
+        if (_syncing) return;
+        LocalState.Ui.FloatingBallEnabled = on;
+        LocalState.SaveUi();
+        if (on) ShowBall();
+        else HideBall();
+    }
+
+    /// <summary>创建并驻留悬浮球（独立置顶小窗）。失败时回弹开关与设置，避免
+    /// 「开关开着但球不在」的假状态（用户可随时再开重试），不弹窗打断。</summary>
+    private void ShowBall()
+    {
+        if (_ball is not null) return;
+        try
+        {
+            var dark = LocalState.Ui.Theme switch { "light" => false, "dark" => true, _ => SystemUsesDark() };
+            _ball = new FloatingBallWindow(
+                dark,
+                onToggle: () => DispatcherQueue.TryEnqueue(() =>
+                {
+                    // 点击悬浮球 = 唤起/隐藏主窗口（与热键一致；byToggle 绕过显示保护期）
+                    if (_visible) HideLauncher(byToggle: true);
+                    else ShowLauncher();
+                }),
+                onShow: () => DispatcherQueue.TryEnqueue(ShowLauncher),
+                onExit: () => DispatcherQueue.TryEnqueue(() => Application.Current.Exit()));
+            App.Log("Ball", "floating ball created");
+        }
+        catch (Exception ex)
+        {
+            App.Log("Ball", ex);
+            _ball = null;
+            // 回弹开关与设置（_syncing 下 IsChecked 赋值不触发 OnToggleBall 副作用；
+            // finally 保证即使赋值抛异常也不会卡死设置页所有开关）
+            try
+            {
+                _syncing = true;
+                LocalState.Ui.FloatingBallEnabled = false;
+                LocalState.SaveUi();
+                BallSwitch.IsChecked = false;
+            }
+            finally { _syncing = false; }
+        }
+    }
+
+    private void HideBall()
+    {
+        try { _ball?.Dispose(); } catch (Exception ex) { App.Log("Ball", ex); }
+        _ball = null;
     }
 
     private void OnThemeChanged(object sender, SelectionChangedEventArgs e)

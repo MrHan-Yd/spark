@@ -434,18 +434,49 @@ public static class AppIconService
                     handle.Free();
                 }
 
-                // BGRA → 预乘/修正 alpha（部分图标 alpha 全 0）
-                for (var i = 0; i < buf.Length; i += 4)
+                // BGRA → 修正 alpha。区分两条提取路径：
+                // 1) hbmMask（单色掩码，hbmColor 为空时回退）：1bpp 无 alpha 通道，
+                //    GetDIBits 读出 alpha 恒 0、白色剪影 RGB 非 0——保留旧版逐像素语义：
+                //    白剪影置不透明、透明底（RGB 全 0）保持透明，避免整图强制出黑底。
+                // 2) hbmColor（真彩色 32bpp）：仅当整图 alpha 全 0 **且存在颜色内容**
+                //    时才判定为 alpha 通道丢失（24bpp 转 32bpp 场景）并批量置不透明；
+                //    alpha 全 0 且 RGB 全 0 = 合法全透明空帧，保持透明；
+                //    存在非零 alpha（微信等图标的"透明白角" (255,255,255,0)）→ 保留
+                //    原始 alpha，透明角不被误伤成白角。
+                if (ii.hbmColor == IntPtr.Zero)
                 {
-                    var b = buf[i];
-                    var g = buf[i + 1];
-                    var r = buf[i + 2];
-                    var a = buf[i + 3];
-                    if (a == 0 && (r | g | b) != 0) a = 255;
-                    buf[i] = b;
-                    buf[i + 1] = g;
-                    buf[i + 2] = r;
-                    buf[i + 3] = a;
+                    for (var i = 0; i < buf.Length; i += 4)
+                    {
+                        var b = buf[i];
+                        var g = buf[i + 1];
+                        var r = buf[i + 2];
+                        var a = buf[i + 3];
+                        if (a == 0 && (r | g | b) != 0) a = 255;
+                        buf[i] = b;
+                        buf[i + 1] = g;
+                        buf[i + 2] = r;
+                        buf[i + 3] = a;
+                    }
+                }
+                else
+                {
+                    var alphaLost = true;
+                    var hasColor = false;
+                    for (var i = 0; i < buf.Length; i += 4)
+                    {
+                        if (buf[i + 3] != 0)
+                        {
+                            alphaLost = false;
+                            break;
+                        }
+                        if ((buf[i] | buf[i + 1] | buf[i + 2]) != 0) hasColor = true;
+                    }
+
+                    if (alphaLost && hasColor)
+                    {
+                        for (var i = 3; i < buf.Length; i += 4)
+                            buf[i] = 255;
+                    }
                 }
 
                 return BgraToPng(buf, w, h);

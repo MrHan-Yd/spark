@@ -880,6 +880,19 @@
                   </StackPanel>
                 </Grid>
               </Border>
+              <Border Style="{StaticResource PaneRowBorder}">
+                <Grid ColumnSpacing="16">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <StackPanel Spacing="3">
+                    <TextBlock Text="悬浮球" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
+                    <TextBlock Text="桌面边缘常驻悬浮球，点击唤起/隐藏主窗口（可拖拽贴边）" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"/>
+                  </StackPanel>
+                  <ToggleButton x:Name="BallSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Checked="OnToggleBall" Unchecked="OnToggleBall"/>
+                </Grid>
+              </Border>
             </StackPanel>
 
             <!-- 外观 -->
