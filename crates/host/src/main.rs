@@ -6,6 +6,7 @@
 
 mod app;
 mod builtins;
+mod clipboard;
 mod config;
 mod hotkey;
 mod index_watch;

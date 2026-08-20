@@ -21,6 +21,7 @@ using XamlPath = Microsoft.UI.Xaml.Shapes.Path;
 using Microsoft.Win32;
 using Spark.UI.Models;
 using Spark.UI.Services;
+using Spark.UI.ViewModels;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 using Windows.Graphics;
@@ -90,6 +91,7 @@ public sealed partial class MainWindow : Window
     private Storyboard _animOut = new();
     /// <summary>同步设置控件时避免触发保存/换主题副作用。</summary>
     private bool _syncing;
+    private HostConfigUpdate? _pendingHostConfig;
     /// <summary>列表/平铺切换动画；_viewAnimGen 让旧动画的 Completed 回调失配（快速连续切换不误折叠面板）。</summary>
     private Storyboard? _viewAnim;
     private int _viewAnimGen;
@@ -290,8 +292,7 @@ public sealed partial class MainWindow : Window
             // 构造时窗口句柄可能未就绪（Acrylic 挂 target 需要），Loaded 后重放一次主题
             try { ApplyTheme(); } catch (Exception ex) { App.Log("Theme", ex); }
             try { await _host.EnsureConnectedAsync(); } catch (Exception ex) { App.Log("HostConnect", ex); }
-            // 首次连上即同步唤起热键预设（host 只认自己 config.toml 里的值）
-            _ = _host.SetHotkeyAsync(LocalState.Ui.Hotkey);
+            try { await SyncFromHostAsync(); } catch (Exception ex) { App.Log("HostConfig", ex); }
             try { SetupTray(); } catch (Exception ex) { App.Log("SetupTray", ex); }
             if (LocalState.Ui.FloatingBallEnabled) ShowBall();
             HideLauncher();
@@ -650,6 +651,123 @@ public sealed partial class MainWindow : Window
 
     // ==================== Host / 托盘 ====================
 
+    private readonly SemaphoreSlim _hostConfigSync = new(1, 1);
+    private void QueueHostConfigUpdate(Action<HostConfigUpdate> update)
+    {
+        _pendingHostConfig ??= new HostConfigUpdate
+        {
+            HotkeyToggle = LocalState.Ui.Hotkey,
+            HideOnFocusLost = LocalState.Ui.HideOnFocusLost,
+            HideOnExecute = LocalState.Ui.HideAfterInvoke,
+            LaunchOnStartup = LocalState.Ui.LaunchOnStartup,
+        };
+        update(_pendingHostConfig);
+        _ = SyncPendingHostConfigAsync();
+    }
+
+    private async Task SyncPendingHostConfigAsync()
+    {
+        if (!await _hostConfigSync.WaitAsync(0)) return;
+        try
+        {
+            while (true)
+            {
+                var pending = _pendingHostConfig?.Clone();
+                if (pending is null || !await _host.SetConfigAsync(pending)) return;
+                await RunOnUiAsync(() =>
+                {
+                    if (_pendingHostConfig is not null && _pendingHostConfig.Equals(pending))
+                        _pendingHostConfig = null;
+                });
+                if (_pendingHostConfig is null) return;
+            }
+        }
+        finally { _hostConfigSync.Release(); }
+    }
+
+    private async Task SyncFromHostAsync()
+    {
+        var config = await _host.GetConfigAsync();
+        if (config is null) return;
+        await RunOnUiAsync(() =>
+        {
+            _syncing = true;
+            try
+            {
+                // 以 LocalState 为权威源：如果 UI 端已持久化的值与 host 不一致，
+                // 说明 host 之前没收到推送（连不上/进程重启回滚到旧 config）——
+                // 把 LocalState 的值推回 host，而不是用 host 旧值覆盖 LocalState。
+                var pushHost = new HostConfigUpdate();
+                var changed = false;
+                if (LocalState.Ui.Hotkey != config.HotkeyToggle)
+                {
+                    pushHost.HotkeyToggle = LocalState.Ui.Hotkey;
+                    changed = true;
+                }
+                else
+                {
+                    LocalState.Ui.Hotkey = config.HotkeyToggle;
+                }
+                if (LocalState.Ui.HideOnFocusLost != config.HideOnFocusLost)
+                {
+                    pushHost.HideOnFocusLost = LocalState.Ui.HideOnFocusLost;
+                    changed = true;
+                }
+                else
+                {
+                    LocalState.Ui.HideOnFocusLost = config.HideOnFocusLost;
+                }
+                if (LocalState.Ui.HideAfterInvoke != config.HideOnExecute)
+                {
+                    pushHost.HideOnExecute = LocalState.Ui.HideAfterInvoke;
+                    changed = true;
+                }
+                else
+                {
+                    LocalState.Ui.HideAfterInvoke = config.HideOnExecute;
+                }
+                if (LocalState.Ui.LaunchOnStartup != config.LaunchOnStartup)
+                {
+                    pushHost.LaunchOnStartup = LocalState.Ui.LaunchOnStartup;
+                    changed = true;
+                }
+                else
+                {
+                    LocalState.Ui.LaunchOnStartup = config.LaunchOnStartup;
+                }
+                _hideOnDeactivate = LocalState.Ui.HideOnFocusLost;
+                if (LocalState.Ui.LaunchOnStartup != GetStartupEntry())
+                    SetStartupEntry(LocalState.Ui.LaunchOnStartup);
+                SyncSettingsUi();
+                LocalState.SaveUi();
+                // LocalState 与 host 有分歧 → 把 LocalState 推回 host（覆盖 host 旧 config）
+                if (changed)
+                {
+                    QueueHostConfigUpdate(x =>
+                    {
+                        if (pushHost.HotkeyToggle is not null) x.HotkeyToggle = pushHost.HotkeyToggle;
+                        if (pushHost.HideOnFocusLost is not null) x.HideOnFocusLost = pushHost.HideOnFocusLost;
+                        if (pushHost.HideOnExecute is not null) x.HideOnExecute = pushHost.HideOnExecute;
+                        if (pushHost.LaunchOnStartup is not null) x.LaunchOnStartup = pushHost.LaunchOnStartup;
+                    });
+                }
+            }
+            finally { _syncing = false; }
+        });
+    }
+
+    private Task RunOnUiAsync(Action action)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!DispatcherQueue.TryEnqueue(() =>
+        {
+            try { action(); tcs.SetResult(); }
+            catch (Exception ex) { tcs.SetException(ex); }
+        }))
+            tcs.SetException(new InvalidOperationException("UI dispatcher unavailable"));
+        return tcs.Task;
+    }
+
     private async Task MaintainHostConnectionAsync()
     {
         var wasConnected = _host.IsConnected;
@@ -664,9 +782,10 @@ public sealed partial class MainWindow : Window
                     // 自动补一次刷新拿到完整列表（否则要等用户按热键唤醒才看得到）
                     if (_host.IsConnected && !wasConnected)
                     {
+                        await SyncPendingHostConfigAsync();
+                        if (_pendingHostConfig is null)
+                            try { await SyncFromHostAsync(); } catch (Exception ex) { App.Log("HostConfig", ex); }
                         DispatcherQueue.TryEnqueue(() => ScheduleRefresh(QueryBox.Text ?? ""));
-                        // host 重启/晚于 UI 启动：重连后补推热键预设
-                        _ = _host.SetHotkeyAsync(LocalState.Ui.Hotkey);
                     }
                 }
             }
@@ -701,6 +820,8 @@ public sealed partial class MainWindow : Window
     private void OnHostExit()
     {
         App.Log("Exit", "exit signal received; exiting");
+        // 插件窗口是独立顶层窗口，不随主窗关闭；不先收掉会残留在任务栏。
+        PluginWindowHost.CloseAll();
         Application.Current.Exit();
     }
 
@@ -2633,7 +2754,12 @@ public sealed partial class MainWindow : Window
     }
 
     private void OnSettingsNav(object sender, RoutedEventArgs e)
-        => ShowPane((string)((Button)sender).Tag);
+    {
+        var pane = (string)((Button)sender).Tag;
+        ShowPane(pane);
+        // 插件清单是 host 侧动态状态，每次进入插件页都重新拉一次。
+        if (pane == "plugins") _ = LoadPluginsAsync();
+    }
 
     /// <summary>设置页 pane 切换过渡：旧 pane 淡出上移 → 新 pane 从下方淡入升起（轻量，对齐收藏分组切换思路）。
     /// 快速连点/动画中再点直接落定；减少动画时瞬时切换。</summary>
@@ -2754,7 +2880,7 @@ public sealed partial class MainWindow : Window
         _syncing = true;
         try
         {
-            StartupSwitch.IsChecked = GetStartupEntry();
+            StartupSwitch.IsChecked = LocalState.Ui.LaunchOnStartup;
             HideFocusSwitch.IsChecked = LocalState.Ui.HideOnFocusLost;
             HideInvokeSwitch.IsChecked = LocalState.Ui.HideAfterInvoke;
             BallSwitch.IsChecked = LocalState.Ui.FloatingBallEnabled;
@@ -2894,9 +3020,14 @@ public sealed partial class MainWindow : Window
         var on = StartupSwitch.IsChecked == true;
         AnimateSwitchToggle(StartupSwitch, on, animate: !_syncing);
         if (_syncing) return;
-        LocalState.Ui.LaunchOnStartup = on;
-        LocalState.SaveUi();
-        SetStartupEntry(on);
+        try
+        {
+            LocalState.Ui.LaunchOnStartup = on;
+            SetStartupEntry(on);
+            LocalState.SaveUi();
+            QueueHostConfigUpdate(x => x.LaunchOnStartup = on);
+        }
+        catch (Exception ex) { App.Log("StartupConfig", ex); }
     }
 
     private void OnToggleHideFocus(object sender, RoutedEventArgs e)
@@ -2907,6 +3038,7 @@ public sealed partial class MainWindow : Window
         LocalState.Ui.HideOnFocusLost = on;
         _hideOnDeactivate = on;
         LocalState.SaveUi();
+        QueueHostConfigUpdate(x => x.HideOnFocusLost = on);
     }
 
     private void OnToggleHideInvoke(object sender, RoutedEventArgs e)
@@ -2916,6 +3048,7 @@ public sealed partial class MainWindow : Window
         if (_syncing) return;
         LocalState.Ui.HideAfterInvoke = on;
         LocalState.SaveUi();
+        QueueHostConfigUpdate(x => x.HideOnExecute = on);
     }
 
     // ==================== 悬浮球 ====================
@@ -2948,7 +3081,7 @@ public sealed partial class MainWindow : Window
                     else ShowLauncher();
                 }),
                 onShow: () => DispatcherQueue.TryEnqueue(ShowLauncher),
-                onExit: () => DispatcherQueue.TryEnqueue(() => Application.Current.Exit()));
+                onExit: () => DispatcherQueue.TryEnqueue(OnHostExit));
             App.Log("Ball", "floating ball created");
         }
         catch (Exception ex)
@@ -2996,7 +3129,7 @@ public sealed partial class MainWindow : Window
         LocalState.SaveUi();
         UpdateHotkeyPresets(animate: true);
         // 热键由 host 注册：推送到 host 重注册（host 不可达时重连后自动补同步）
-        _ = _host.SetHotkeyAsync(LocalState.Ui.Hotkey);
+        QueueHostConfigUpdate(x => x.HotkeyToggle = LocalState.Ui.Hotkey);
     }
 
     /// <summary>预设按钮选中态：背景/边框颜色 200ms 渐变切换（对齐开关动画）。
@@ -3038,8 +3171,197 @@ public sealed partial class MainWindow : Window
         sb.Begin();
     }
 
-    private void OnInstallPlugin(object sender, RoutedEventArgs e)
-        => PluginStatus.Text = "安装本地插件：功能开发中，敬请期待。";
+    // ==================== 插件 ====================
+
+    private readonly List<PluginRowVm> _pluginRows = new();
+
+    /// <summary>拉插件清单 + 当前插件目录，重绘列表/空态。</summary>
+    private async Task LoadPluginsAsync()
+    {
+        try
+        {
+            var list = await _host.PluginListAsync();
+            _pluginRows.Clear();
+            _pluginRows.AddRange(list.Select(p => new PluginRowVm(p)));
+
+            PluginList.ItemsSource = null;
+            PluginList.ItemsSource = _pluginRows;
+
+            var empty = _pluginRows.Count == 0;
+            PluginEmpty.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
+            PluginList.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
+
+            var cfg = await _host.GetConfigAsync();
+            PluginDirText.Text = string.IsNullOrWhiteSpace(cfg?.PluginsDir)
+                ? "默认（安装目录 / plugins）"
+                : cfg!.PluginsDir!;
+        }
+        catch (Exception ex)
+        {
+            App.Log("LoadPlugins", ex);
+            SetPluginStatus("插件清单加载失败：" + ex.Message);
+        }
+    }
+
+    private void SetPluginStatus(string? text)
+    {
+        PluginStatus.Text = text ?? "";
+        PluginStatus.Visibility = string.IsNullOrEmpty(text)
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+    }
+
+    private async void OnRefreshPlugins(object sender, RoutedEventArgs e)
+    {
+        SetPluginStatus(null);
+        await LoadPluginsAsync();
+    }
+
+    private async void OnInstallPlugin(object sender, RoutedEventArgs e)
+    {
+        var dir = await PickFolderAsync("选择插件目录（含 plugin.json）");
+        if (dir is null) return;
+        try
+        {
+            var id = await _host.PluginInstallAsync(dir);
+            SetPluginStatus($"已安装：{id}");
+            await LoadPluginsAsync();
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginInstall", ex);
+            SetPluginStatus("安装失败：" + ex.Message);
+        }
+    }
+
+    private async void OnDevLoadPlugin(object sender, RoutedEventArgs e)
+    {
+        var dir = await PickFolderAsync("选择开发目录（不拷贝，改文件即生效）");
+        if (dir is null) return;
+        try
+        {
+            var id = await _host.PluginDevLoadAsync(dir);
+            SetPluginStatus($"已加载开发插件：{id}");
+            await LoadPluginsAsync();
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginDevLoad", ex);
+            SetPluginStatus("加载失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>更换插件目录；已装插件一并迁移过去（host 侧做实际搬运）。</summary>
+    private async void OnChangePluginDir(object sender, RoutedEventArgs e)
+    {
+        var dir = await PickFolderAsync("选择新的插件目录");
+        if (dir is null) return;
+        if (!await ConfirmDestructiveAsync($"把插件目录改为\n{dir}\n并迁移现有插件？"))
+            return;
+        try
+        {
+            if (await _host.PluginSetDirAsync(dir, migrate: true))
+            {
+                SetPluginStatus("插件目录已更新");
+                await LoadPluginsAsync();
+            }
+            else
+            {
+                SetPluginStatus("插件目录更新失败");
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginSetDir", ex);
+            SetPluginStatus("插件目录更新失败：" + ex.Message);
+        }
+    }
+
+    private async void OnPluginToggled(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
+        // 容器虚拟化：ToggleSwitch 上屏时绑定会补触发一次 Toggled，值与 host 一致就是回声。
+        if (row.Enabled == row.SyncedEnabled) return;
+
+        var target = row.Enabled;
+        if (await _host.PluginToggleAsync(row.Id, target))
+        {
+            row.SyncedEnabled = target;
+            // 禁用后旧窗口若还开着，页面仍能调 spark.*（host 只按 granted 鉴权，不看 enabled），必须关掉。
+            if (!target) PluginWindowHost.CloseIfOpen(row.Id);
+            SetPluginStatus($"{row.Name} 已{(target ? "启用" : "禁用")}");
+        }
+        else
+        {
+            row.Enabled = row.SyncedEnabled;   // 回滚开关，避免 UI 与 host 不一致
+            SetPluginStatus($"{row.Name} 状态更新失败");
+        }
+    }
+
+    private async void OnPermissionToggled(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not PermissionVm perm) return;
+        if (perm.Granted == perm.SyncedGranted) return;   // 绑定回声
+
+        var row = _pluginRows.FirstOrDefault(r => r.Permissions.Contains(perm));
+        if (row is null) return;
+
+        // grant 是全量覆盖：把该插件当前所有已勾选的权限一起提交。
+        var granted = row.Permissions.Where(p => p.Granted).Select(p => p.Key).ToList();
+        if (await _host.PluginGrantAsync(row.Id, granted))
+        {
+            foreach (var p in row.Permissions) p.SyncedGranted = p.Granted;
+            // 收回权限后已开着的窗口仍持有旧 granted 快照，关掉它强制重新取。
+            if (!perm.Granted) PluginWindowHost.CloseIfOpen(row.Id);
+            SetPluginStatus($"{row.Name} 权限已更新");
+        }
+        else
+        {
+            perm.Granted = perm.SyncedGranted;
+            SetPluginStatus($"{row.Name} 权限更新失败");
+        }
+    }
+
+    private async void OnUninstallPlugin(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
+        if (!await ConfirmDestructiveAsync($"卸载插件「{row.Name}」？\n插件目录将被删除。")) return;
+
+        if (await _host.PluginUninstallAsync(row.Id))
+        {
+            // 目录已被删除，窗口里的页面资源随之失效，先收窗口再刷新列表。
+            PluginWindowHost.CloseIfOpen(row.Id);
+            SetPluginStatus($"已卸载：{row.Name}");
+            await LoadPluginsAsync();
+        }
+        else
+        {
+            SetPluginStatus($"卸载失败：{row.Name}");
+        }
+    }
+
+    /// <summary>系统文件夹选择器；取消返回 null。WinUI3 需显式绑定 HWND。</summary>
+    private async Task<string?> PickFolderAsync(string commitText)
+    {
+        try
+        {
+            var picker = new Windows.Storage.Pickers.FolderPicker
+            {
+                SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.ComputerFolder,
+                CommitButtonText = commitText,
+            };
+            picker.FileTypeFilter.Add("*");
+            InitializeWithWindow.Initialize(picker, _hwnd);
+            var folder = await picker.PickSingleFolderAsync();
+            return folder?.Path;
+        }
+        catch (Exception ex)
+        {
+            App.Log("PickFolder", ex);
+            SetPluginStatus("打开文件夹选择器失败：" + ex.Message);
+            return null;
+        }
+    }
 
     // ==================== 关于 ====================
 
@@ -3779,7 +4101,17 @@ public sealed partial class MainWindow : Window
     /// <summary>按 action 执行（回车/点击与右键菜单共用；含错误处理与 HideAfterInvoke）。</summary>
     private async Task InvokeActionAsync(string itemId, string actionId, string? titleOverride = null)
     {
-        var title = titleOverride ?? _items.FirstOrDefault(x => x.Id == itemId)?.Title ?? itemId;
+        var item = _items.FirstOrDefault(x => x.Id == itemId);
+        var title = titleOverride ?? item?.Title ?? itemId;
+
+        // 插件 page 命中：走 host.plugin.open 开 WebView2 窗口，不走 host.invoke。
+        // target 形如 "plugin:page:<id>"（《插件开发规范》§5.4 路由契约）。
+        if (item is not null && TryGetPluginPageId(item, actionId, out var pluginId))
+        {
+            await OpenPluginPageAsync(pluginId, item, title);
+            return;
+        }
+
         Footer.Text = "执行中：" + title;
         try
         {
@@ -3800,6 +4132,83 @@ public sealed partial class MainWindow : Window
         {
             await Task.Delay(60);
             HideLauncher();
+        }
+    }
+
+    private const string PluginPagePrefix = "plugin:page:";
+
+    /// <summary>候选项（或其指定 action）是否指向插件 page，是则取出插件 id。</summary>
+    private static bool TryGetPluginPageId(CandidateDto item, string actionId, out string pluginId)
+    {
+        var target = item.Actions.FirstOrDefault(a => a.Id == actionId)?.Target ?? item.Target;
+        if (target is not null && target.StartsWith(PluginPagePrefix, StringComparison.Ordinal))
+        {
+            pluginId = target[PluginPagePrefix.Length..];
+            return pluginId.Length > 0;
+        }
+        pluginId = "";
+        return false;
+    }
+
+    /// <summary>
+    /// 打开插件窗口。host 返回入口/窗口规格/授权，UI 侧建 WebView2 窗口。
+    /// 输入上下文取自主输入框：去掉 "<keyword> " 前缀后的剩余文本。
+    /// </summary>
+    private async Task OpenPluginPageAsync(string pluginId, CandidateDto item, string title)
+    {
+        Footer.Text = "打开插件：" + title;
+        var rawQuery = QueryBox.Text ?? "";
+        var (command, input) = SplitPluginQuery(rawQuery);
+        try
+        {
+            var info = await _host.PluginOpenAsync(pluginId, input, command);
+            if (info is null)
+            {
+                Footer.Text = "插件不可用：" + title;
+                return;
+            }
+            // 开发目录加载的插件开 DevTools，正式安装的关掉（规范 §9.2）。
+            var devMode = await IsDevPluginAsync(pluginId);
+            PluginWindowHost.OpenOrFocus(info, _host, input, command, rawQuery, devMode);
+            Footer.Text = "已打开：" + title;
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginOpen", ex);
+            Footer.Text = "插件打开失败：" + title;
+            return;
+        }
+        if (LocalState.Ui.HideAfterInvoke)
+        {
+            await Task.Delay(60);
+            HideLauncher();
+        }
+    }
+
+    /// <summary>
+    /// 拆 "tr hello world" → ("tr", "hello world")；无空格时输入为空。
+    /// 保留剩余部分的原样（不再 TrimStart），与 host 侧 find_keyword_match 的
+    /// <c>trimmed[kw.len()+1..]</c> 语义一致，避免同一次触发两边算出不同的 input。
+    /// </summary>
+    private static (string Command, string Input) SplitPluginQuery(string rawQuery)
+    {
+        var trimmed = rawQuery.Trim();
+        var sp = trimmed.IndexOf(' ');
+        return sp < 0 ? (trimmed, "") : (trimmed[..sp], trimmed[(sp + 1)..]);
+    }
+
+    private async Task<bool> IsDevPluginAsync(string pluginId)
+    {
+        try
+        {
+            var list = await _host.PluginListAsync();
+            return list.Any(p => p.Id == pluginId
+                                 && string.Equals(p.Source, "dev", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginDevProbe", ex);
+            return false;
         }
     }
 

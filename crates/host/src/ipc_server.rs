@@ -1,10 +1,13 @@
 //! Named Pipe JSON-RPC server (NDJSON) for Host ↔ UI.
 
 use crate::app::SharedHost;
+use crate::hotkey::Hotkey;
 use anyhow::{Context, Result};
 use spark_ipc::{
     decode_line, encode_line, HostMethod, InvokeParams, JsonRpcRequest, JsonRpcResponse,
-    QueryParams, QueryResult, SetConfigParams, PIPE_PATH,
+    PluginApiParams, PluginDevLoadParams, PluginGrantParams, PluginIdParams, PluginInstallParams,
+    PluginOpenParams, PluginSetDirParams, PluginToggleParams, QueryParams, QueryResult,
+    SetConfigParams, PIPE_PATH,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -196,6 +199,12 @@ fn client_read_loop(pipe: SendHandle, host: &SharedHost) -> Result<()> {
                     }
                     if let Err(e) = dispatch_line(line, raw, host) {
                         warn!(?e, "dispatch");
+                        let id = serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .and_then(|v| v.get("id").cloned());
+                        if id.is_some() {
+                            let _ = reply(raw, &JsonRpcResponse::error(id, -32603, e.to_string()));
+                        }
                     }
                 }
             }
@@ -214,8 +223,37 @@ fn client_read_loop(pipe: SendHandle, host: &SharedHost) -> Result<()> {
 }
 
 fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
-    let req: JsonRpcRequest = decode_line(line)?;
+    let req: JsonRpcRequest = match decode_line(line) {
+        Ok(req) => req,
+        Err(e) => {
+            let raw_id = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("id").cloned());
+            let resp = JsonRpcResponse::error(raw_id, -32700, e.to_string());
+            reply(pipe, &resp)?;
+            return Ok(());
+        }
+    };
+    if req.jsonrpc != "2.0" {
+        let resp = JsonRpcResponse::error(req.id.clone(), -32600, "jsonrpc must be 2.0");
+        reply(pipe, &resp)?;
+        return Ok(());
+    }
     let id = req.id.clone();
+
+    let no_params = |value: &serde_json::Value| value.is_null() || value == &serde_json::json!({});
+    if (req.method == HostMethod::Toggle.as_str()
+        || req.method == "ui.toggle"
+        || req.method == "ui.show"
+        || req.method == HostMethod::Show.as_str()
+        || req.method == "host.exit")
+        && !no_params(&req.params)
+    {
+        return reply(
+            pipe,
+            &JsonRpcResponse::error(id, -32602, "method does not accept params"),
+        );
+    }
 
     if req.method == HostMethod::Toggle.as_str()
         || req.method == "ui.toggle"
@@ -255,10 +293,16 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
 
     let resp = match req.method.as_str() {
         m if m == HostMethod::Query.as_str() => {
-            let params: QueryParams = serde_json::from_value(req.params).unwrap_or(QueryParams {
-                text: String::new(),
-                limit: 50,
-            });
+            let params: QueryParams = match serde_json::from_value(req.params) {
+                Ok(params) => params,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.text.len() > 4096 || params.limit > 500 {
+                return reply(
+                    pipe,
+                    &JsonRpcResponse::error(id, -32602, "invalid query parameters"),
+                );
+            }
             let items = {
                 let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
                 let mut hits = g.search(&params.text);
@@ -277,7 +321,21 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             JsonRpcResponse::result(id, serde_json::to_value(result)?)
         }
         m if m == HostMethod::Invoke.as_str() => {
-            let params: InvokeParams = serde_json::from_value(req.params)?;
+            let params: InvokeParams = match serde_json::from_value(req.params) {
+                Ok(params) => params,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.item_id.is_empty()
+                || params.action_id.is_empty()
+                || params.item_id.len() > 1024
+                || params.action_id.len() > 256
+                || params.text.len() > 4096
+            {
+                return reply(
+                    pipe,
+                    &JsonRpcResponse::error(id, -32602, "invalid invoke parameters"),
+                );
+            }
             let result = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
                 g.invoke(&params)?
@@ -289,23 +347,47 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             JsonRpcResponse::result(id, serde_json::to_value(&g.config)?)
         }
         m if m == HostMethod::SetConfig.as_str() => {
-            let params: SetConfigParams = serde_json::from_value(req.params).unwrap_or_default();
+            let params: SetConfigParams = match serde_json::from_value(req.params) {
+                Ok(params) => params,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if let Some(hk) = params.hotkey_toggle.as_deref() {
+                if let Err(e) = Hotkey::parse(hk) {
+                    return reply(
+                        pipe,
+                        &JsonRpcResponse::error(id, -32602, format!("invalid hotkey: {e}")),
+                    );
+                }
+            }
             let hotkey_changed = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-                let mut changed = false;
+                let old = g.config.clone();
                 if let Some(hk) = params.hotkey_toggle {
                     if hk != g.config.hotkey_toggle {
                         info!(old = %g.config.hotkey_toggle, new = %hk, "hotkey updated");
                         g.config.hotkey_toggle = hk;
-                        changed = true;
                     }
                 }
+                if let Some(value) = params.hide_on_focus_lost {
+                    g.config.hide_on_focus_lost = value;
+                }
+                if let Some(value) = params.hide_on_execute {
+                    g.config.hide_on_execute = value;
+                }
+                if let Some(value) = params.launch_on_startup {
+                    g.config.launch_on_startup = value;
+                }
+                let changed = g.config != old;
                 if changed {
                     if let Err(e) = g.config.save() {
-                        warn!(?e, "config save failed after set_config");
+                        g.config = old;
+                        return reply(
+                            pipe,
+                            &JsonRpcResponse::error(id, -32000, format!("config save failed: {e}")),
+                        );
                     }
                 }
-                changed
+                changed && g.config.hotkey_toggle != old.hotkey_toggle
             };
             if hotkey_changed {
                 // 重注册必须走主消息循环线程（与 HOTKEY_PAUSED/托盘开关同一路径）
@@ -325,6 +407,131 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
         m if m == HostMethod::GetBuiltins.as_str() => {
             // 内置命令清单（设置页展示用，无需锁 host）
             JsonRpcResponse::result(id, serde_json::to_value(spark_index::builtin::infos())?)
+        }
+        m if m == HostMethod::PluginList.as_str() => {
+            let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            JsonRpcResponse::result(id, serde_json::to_value(g.plugin_list())?)
+        }
+        m if m == HostMethod::PluginInstall.as_str() => {
+            let params: PluginInstallParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.path.is_empty() || params.path.len() > 4096 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid path"));
+            }
+            let installed_id = {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_install(&params.path)?
+            };
+            JsonRpcResponse::result(id, serde_json::json!({ "id": installed_id }))
+        }
+        m if m == HostMethod::PluginUninstall.as_str() => {
+            let params: PluginIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.id.is_empty() || params.id.len() > 256 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid id"));
+            }
+            {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_uninstall(&params.id)?;
+            }
+            JsonRpcResponse::result(id, serde_json::json!({ "ok": true }))
+        }
+        m if m == HostMethod::PluginToggle.as_str() => {
+            let params: PluginToggleParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.id.is_empty() || params.id.len() > 256 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid id"));
+            }
+            {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_toggle(&params.id, params.enabled)?;
+            }
+            JsonRpcResponse::result(id, serde_json::json!({ "ok": true }))
+        }
+        m if m == HostMethod::PluginGrant.as_str() => {
+            let params: PluginGrantParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.id.is_empty() || params.id.len() > 256 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid id"));
+            }
+            {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_grant(&params.id, params.permissions)?;
+            }
+            JsonRpcResponse::result(id, serde_json::json!({ "ok": true }))
+        }
+        m if m == HostMethod::PluginDevLoad.as_str() => {
+            let params: PluginDevLoadParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.dir.is_empty() || params.dir.len() > 4096 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid dir"));
+            }
+            let loaded_id = {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_devload(&params.dir)?
+            };
+            JsonRpcResponse::result(id, serde_json::json!({ "id": loaded_id }))
+        }
+        m if m == HostMethod::PluginOpen.as_str() => {
+            let params: PluginOpenParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.id.is_empty() || params.id.len() > 256 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid id"));
+            }
+            let info = {
+                let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_open(&params.id)?
+            };
+            JsonRpcResponse::result(id, serde_json::to_value(info)?)
+        }
+        m if m == HostMethod::PluginSetDir.as_str() => {
+            let params: PluginSetDirParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.path.is_empty() || params.path.len() > 4096 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid path"));
+            }
+            {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_set_dir(&params.path, params.migrate)?;
+            }
+            JsonRpcResponse::result(id, serde_json::json!({ "ok": true }))
+        }
+        m if m == HostMethod::PluginApi.as_str() => {
+            let params: PluginApiParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.plugin_id.is_empty()
+                || params.plugin_id.len() > 256
+                || params.capability.is_empty()
+                || params.method.is_empty()
+                || params.capability.len() > 64
+                || params.method.len() > 64
+            {
+                return reply(
+                    pipe,
+                    &JsonRpcResponse::error(id, -32602, "invalid api params"),
+                );
+            }
+            let data = {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_api(&params)?
+            };
+            JsonRpcResponse::result(id, serde_json::json!({ "ok": true, "data": data }))
         }
         other => JsonRpcResponse::error(id, -32601, format!("method not found: {other}")),
     };

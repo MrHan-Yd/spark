@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Spark.UI.Models;
 
 namespace Spark.UI.Services;
@@ -23,6 +24,7 @@ public sealed class HostIpcClient : IAsyncDisposable
     private int _connectGate;
     /// <summary>读循环已退出（连接假死/对端消失）。IsConnected 判假 → 下一次调用强制重连，
     /// 否则 _pipe.IsConnected 可能长期保持 true（管道句柄状态未刷新），请求写进死连接全部超时。</summary>
+    private long _connectionGeneration;
     private volatile bool _loopDead;
 
     public bool IsConnected => _pipe?.IsConnected == true && !_loopDead;
@@ -55,6 +57,7 @@ public sealed class HostIpcClient : IAsyncDisposable
                 try
                 {
                     await pipe.ConnectAsync(1500, ct);
+                    var generation = Interlocked.Increment(ref _connectionGeneration);
                     _pipe = pipe;
                     _writer = new StreamWriter(pipe, new UTF8Encoding(false), 64 * 1024, leaveOpen: true)
                     {
@@ -63,7 +66,7 @@ public sealed class HostIpcClient : IAsyncDisposable
                     };
                     _loopCts = new CancellationTokenSource();
                     _loopDead = false;
-                    _loopTask = Task.Run(() => ReadLoopAsync(_loopCts.Token));
+                    _loopTask = Task.Run(() => ReadLoopAsync(_loopCts.Token, generation));
                     last = null;
                     return;
                 }
@@ -83,11 +86,12 @@ public sealed class HostIpcClient : IAsyncDisposable
         }
     }
 
-    private async Task ReadLoopAsync(CancellationToken ct)
+    private async Task ReadLoopAsync(CancellationToken ct, long generation)
     {
-        if (_pipe is null) return;
+        var localPipe = _pipe;
+        if (localPipe is null) return;
         App.Log("Ipc", "read loop started");
-        var reader = new StreamReader(_pipe, Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
+        var reader = new StreamReader(localPipe, Encoding.UTF8, false, 64 * 1024, leaveOpen: true);
         // 单飞行读：同一时刻只挂一个 ReadLineAsync。空闲超时（Host 无保活）时绝不能
         // 放弃当前读另起新读——旧读仍挂在管道上成为"幽灵读"，后续到达的响应会被它
         // 消费掉而 UI 永远收不到（表现为连接"活着"但所有请求 8s 超时、回退 DemoData）。
@@ -97,7 +101,7 @@ public sealed class HostIpcClient : IAsyncDisposable
             TaskContinuationOptions.OnlyOnFaulted);
         try
         {
-            while (!ct.IsCancellationRequested && _pipe is not null && _pipe.IsConnected)
+            while (!ct.IsCancellationRequested && localPipe.IsConnected)
             {
                 string? line;
                 try
@@ -110,7 +114,7 @@ public sealed class HostIpcClient : IAsyncDisposable
                     // Host 会回 method-not-found 错误行，由同一个读消费，无副作用）。
                     try
                     {
-                        _writer?.WriteLine("{\"jsonrpc\":\"2.0\",\"id\":-1,\"method\":\"host.ping\"}");
+                        await WriteLineAsync("{\"jsonrpc\":\"2.0\",\"id\":-1,\"method\":\"host.ping\"}", ct);
                     }
                     catch
                     {
@@ -180,10 +184,13 @@ public sealed class HostIpcClient : IAsyncDisposable
         }
         finally
         {
-            _loopDead = true;
-            foreach (var kv in _pending)
-                kv.Value.TrySetCanceled();
-            _pending.Clear();
+            if (generation == Volatile.Read(ref _connectionGeneration))
+            {
+                _loopDead = true;
+                foreach (var kv in _pending)
+                    kv.Value.TrySetCanceled();
+                _pending.Clear();
+            }
         }
     }
 
@@ -252,19 +259,163 @@ public sealed class HostIpcClient : IAsyncDisposable
         return new List<BuiltinInfoDto>();
     }
 
-    /// <summary>把唤起热键预设推给 host（host 负责注册全局热键并持久化到 config.toml）。
-    /// host 不可达时静默放弃：连接建立/重建时会重新同步。</summary>
-    public async Task SetHotkeyAsync(string hotkey, CancellationToken ct = default)
+    public async Task<HostConfigDto?> GetConfigAsync(CancellationToken ct = default)
     {
         await EnsureConnectedAsync(ct);
-        if (!IsConnected) return;
+        if (!IsConnected) return null;
         try
         {
-            await CallAsync("host.set_config", new { hotkey_toggle = hotkey }, ct);
+            var el = await CallAsync("host.get_config", new { }, ct);
+            return el.ValueKind == JsonValueKind.Undefined
+                ? null
+                : JsonSerializer.Deserialize<HostConfigDto>(el.GetRawText());
         }
-        catch
+        catch (Exception ex)
         {
-            // 热键注册失败不影响设置页本地状态；重连时会再推
+            App.Log("GetHostConfig", ex);
+            return null;
+        }
+    }
+
+    public async Task<bool> SetConfigAsync(HostConfigUpdate update, CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) return false;
+        try
+        {
+            var result = await CallAsync("host.set_config", update, ct);
+            return result.ValueKind == JsonValueKind.Object
+                && result.TryGetProperty("ok", out var ok)
+                && ok.ValueKind == JsonValueKind.True;
+        }
+        catch (Exception ex)
+        {
+            App.Log("SetHostConfig", ex);
+            return false;
+        }
+    }
+
+    /// <summary>把唤起热键预设推给 host（兼容旧调用方）。</summary>
+    public Task SetHotkeyAsync(string hotkey, CancellationToken ct = default) =>
+        SetConfigAsync(new HostConfigUpdate { HotkeyToggle = hotkey }, ct);
+
+    // ─── 插件（host.plugin.*，见《插件开发规范》§15）──────────────────────
+
+    /// <summary>已装插件清单；host 不可达返回空列表。</summary>
+    public async Task<List<PluginInfoDto>> PluginListAsync(CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) return new List<PluginInfoDto>();
+        try
+        {
+            var el = await CallAsync("host.plugin.list", new { }, ct);
+            if (el.ValueKind == JsonValueKind.Array)
+                return JsonSerializer.Deserialize<List<PluginInfoDto>>(el.GetRawText()) ?? new();
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginList", ex);
+        }
+        return new List<PluginInfoDto>();
+    }
+
+    /// <summary>打开插件所需信息；不可用（未启用/非 webview/缺文件）时返回 null。</summary>
+    public async Task<PluginOpenInfoDto?> PluginOpenAsync(string id, string input, string command,
+        CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) return null;
+        try
+        {
+            var el = await CallAsync("host.plugin.open", new { id, input, command }, ct);
+            return el.ValueKind == JsonValueKind.Object
+                ? JsonSerializer.Deserialize<PluginOpenInfoDto>(el.GetRawText())
+                : null;
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginOpen", ex);
+            return null;
+        }
+    }
+
+    /// <summary>从本地目录导入安装，返回插件 id；失败抛出（调用方展示原因）。</summary>
+    public Task<string> PluginInstallAsync(string path, CancellationToken ct = default) =>
+        PluginIdCallAsync("host.plugin.install", new { path }, ct);
+
+    /// <summary>加载开发目录（不拷贝），返回插件 id；失败抛出。</summary>
+    public Task<string> PluginDevLoadAsync(string dir, CancellationToken ct = default) =>
+        PluginIdCallAsync("host.plugin.devload", new { dir }, ct);
+
+    public Task<bool> PluginUninstallAsync(string id, CancellationToken ct = default) =>
+        PluginOkCallAsync("host.plugin.uninstall", new { id }, ct);
+
+    public Task<bool> PluginToggleAsync(string id, bool enabled, CancellationToken ct = default) =>
+        PluginOkCallAsync("host.plugin.toggle", new { id, enabled }, ct);
+
+    public Task<bool> PluginGrantAsync(string id, IEnumerable<string> permissions,
+        CancellationToken ct = default) =>
+        PluginOkCallAsync("host.plugin.grant", new { id, permissions = permissions.ToArray() }, ct);
+
+    public Task<bool> PluginSetDirAsync(string path, bool migrate, CancellationToken ct = default) =>
+        PluginOkCallAsync("host.plugin.set_dir", new { path, migrate }, ct);
+
+    /// <summary>
+    /// spark.* 特权能力桥：把插件页的调用转给 host 执行，返回 <c>data</c> 字段。
+    /// host 侧鉴权（未授权返回 error），失败以异常抛出供 preload 转成 Promise reject。
+    /// </summary>
+    public async Task<JsonElement> PluginApiAsync(string pluginId, string capability, string method,
+        JsonElement args, CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) throw new InvalidOperationException("host unavailable");
+
+        var el = await CallAsync("host.plugin.api",
+            new { plugin_id = pluginId, capability, method, args }, ct);
+        if (el.ValueKind != JsonValueKind.Object)
+            throw new InvalidOperationException("host.plugin.api: unexpected result");
+        return el.TryGetProperty("data", out var data) ? data.Clone() : default;
+    }
+
+    private async Task<string> PluginIdCallAsync(string method, object paramsObj, CancellationToken ct)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) throw new InvalidOperationException("host unavailable");
+        var el = await CallAsync(method, paramsObj, ct);
+        if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("id", out var idEl))
+            return idEl.GetString() ?? "";
+        throw new InvalidOperationException($"{method}: unexpected result");
+    }
+
+    private async Task<bool> PluginOkCallAsync(string method, object paramsObj, CancellationToken ct)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) return false;
+        try
+        {
+            var el = await CallAsync(method, paramsObj, ct);
+            return el.ValueKind == JsonValueKind.Object
+                && el.TryGetProperty("ok", out var ok)
+                && ok.ValueKind == JsonValueKind.True;
+        }
+        catch (Exception ex)
+        {
+            App.Log(method, ex);
+            return false;
+        }
+    }
+
+    private async Task WriteLineAsync(string line, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            if (_writer is null) throw new IOException("pipe writer unavailable");
+            await _writer.WriteLineAsync(line.AsMemory(), ct);
+        }
+        finally
+        {
+            _writeLock.Release();
         }
     }
 
@@ -273,46 +424,47 @@ public sealed class HostIpcClient : IAsyncDisposable
         if (!IsConnected || _writer is null)
             return default;
 
-        var id = Interlocked.Increment(ref _nextId);
-        var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[id] = tcs;
-
-        var req = new Dictionary<string, object?>
-        {
-            ["jsonrpc"] = "2.0",
-            ["id"] = id,
-            ["method"] = method,
-            ["params"] = paramsObj
-        };
-        var json = JsonSerializer.Serialize(req);
-
-        await _writeLock.WaitAsync(ct);
+        var id = 0;
+        TaskCompletionSource<JsonElement>? tcs = null;
         try
         {
-            await _writer.WriteLineAsync(json.AsMemory(), ct);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+            id = Interlocked.Increment(ref _nextId);
+            tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pending[id] = tcs;
 
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(8));
-        await using var reg = timeout.Token.Register(() =>
-        {
-            if (_pending.TryRemove(id, out var p))
-                p.TrySetException(new TimeoutException("host ipc timeout"));
-        });
+            var req = new Dictionary<string, object?>
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = id,
+                ["method"] = method,
+                ["params"] = paramsObj
+            };
+            var json = JsonSerializer.Serialize(req);
 
-        try
-        {
-            return await tcs.Task;
+            await WriteLineAsync(json, ct);
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(8));
+            using var reg = timeout.Token.Register(() =>
+            {
+                if (_pending.TryRemove(id, out var p))
+                    p.TrySetException(new TimeoutException("host ipc timeout"));
+            });
+
+            try
+            {
+                return await tcs.Task;
+            }
+            catch (TimeoutException)
+            {
+                await TearDownAsync();
+                throw;
+            }
         }
-        catch (TimeoutException)
+        catch
         {
-            // 请求写出去但没有响应 = 连接假死（对端消失/半死）。主动断开，
-            // 让下一次 EnsureConnected 拿一条全新连接，而不是反复超时回退 DemoData。
-            await TearDownAsync();
+            if (id != 0 && tcs is not null && _pending.TryRemove(id, out var pending))
+                pending.TrySetCanceled();
             throw;
         }
     }
@@ -326,25 +478,78 @@ public sealed class HostIpcClient : IAsyncDisposable
                 await Task.WhenAny(_loopTask, Task.Delay(200));
         }
         catch { /* ignore */ }
-        _loopTask = null;
-        _loopCts?.Dispose();
-        _loopCts = null;
-        if (_writer is not null)
+
+        await _writeLock.WaitAsync();
+        try
         {
-            try { await _writer.DisposeAsync(); } catch { /* ignore */ }
+            _loopTask = null;
+            _loopCts?.Dispose();
+            _loopCts = null;
+            if (_writer is not null)
+            {
+                try { await _writer.DisposeAsync(); } catch { /* ignore */ }
+            }
+            _writer = null;
+            if (_pipe is not null)
+            {
+                try { await _pipe.DisposeAsync(); } catch { /* ignore */ }
+            }
+            _pipe = null;
+            foreach (var kv in _pending)
+                kv.Value.TrySetCanceled();
+            _pending.Clear();
         }
-        _writer = null;
-        if (_pipe is not null)
+        finally
         {
-            try { await _pipe.DisposeAsync(); } catch { /* ignore */ }
+            _writeLock.Release();
         }
-        _pipe = null;
-        foreach (var kv in _pending)
-            kv.Value.TrySetCanceled();
-        _pending.Clear();
     }
 
     public async ValueTask DisposeAsync() => await TearDownAsync();
+}
+
+public sealed class HostConfigDto
+{
+    [JsonPropertyName("hotkey_toggle")]
+    public string HotkeyToggle { get; set; } = "Alt+Space";
+    [JsonPropertyName("hide_on_focus_lost")]
+    public bool HideOnFocusLost { get; set; } = true;
+    [JsonPropertyName("hide_on_execute")]
+    public bool HideOnExecute { get; set; } = true;
+    [JsonPropertyName("max_results")]
+    public uint MaxResults { get; set; } = 50;
+    [JsonPropertyName("plugins_dir")]
+    public string? PluginsDir { get; set; }
+    [JsonPropertyName("hotkey_enabled")]
+    public bool HotkeyEnabled { get; set; } = true;
+    [JsonPropertyName("launch_on_startup")]
+    public bool LaunchOnStartup { get; set; }
+}
+
+public sealed class HostConfigUpdate
+{
+    [JsonPropertyName("hotkey_toggle")]
+    public string? HotkeyToggle { get; set; }
+    [JsonPropertyName("hide_on_focus_lost")]
+    public bool? HideOnFocusLost { get; set; }
+    [JsonPropertyName("hide_on_execute")]
+    public bool? HideOnExecute { get; set; }
+    [JsonPropertyName("launch_on_startup")]
+    public bool? LaunchOnStartup { get; set; }
+
+    public HostConfigUpdate Clone() => new()
+    {
+        HotkeyToggle = HotkeyToggle,
+        HideOnFocusLost = HideOnFocusLost,
+        HideOnExecute = HideOnExecute,
+        LaunchOnStartup = LaunchOnStartup,
+    };
+
+    public bool Equals(HostConfigUpdate? other) => other is not null
+        && HotkeyToggle == other.HotkeyToggle
+        && HideOnFocusLost == other.HideOnFocusLost
+        && HideOnExecute == other.HideOnExecute
+        && LaunchOnStartup == other.LaunchOnStartup;
 }
 
 public static class DemoData

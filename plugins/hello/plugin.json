@@ -1,0 +1,26 @@
+{
+  "id": "com.spark.hello",
+  "name": "Hello",
+  "version": "0.1.0",
+  "api_version": 2,
+  "runtime": "webview",
+  "main": "index.html",
+  "author": "Spark 示例",
+  "description": "输入 hello 打开示例插件页，演示 spark.* API",
+  "permissions": ["clipboard", "notify"],
+  "features": [
+    {
+      "type": "keyword",
+      "keyword": "hello",
+      "title": "Hello",
+      "subtitle": "示例插件：回显输入并演示 spark.* API",
+      "mode": "page",
+      "placeholder": "输入任意文本…"
+    }
+  ],
+  "window": {
+    "width": 480,
+    "height": 400,
+    "resizable": true
+  }
+}
