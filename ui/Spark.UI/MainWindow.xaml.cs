@@ -152,6 +152,7 @@ public sealed partial class MainWindow : Window
         ResultList.ItemsSource = _items;
         ResultGrid.ItemsSource = _items;
         LocalState.Load();
+        ApplyDevModeGate(LocalState.Ui.DeveloperMode);
         // 旧版 Run 项指向 Spark.exe（UI）→ 自动迁移到 spark-host.exe，修复开机热键失效
         MigrateStartupEntry();
 
@@ -2884,6 +2885,7 @@ public sealed partial class MainWindow : Window
             HideFocusSwitch.IsChecked = LocalState.Ui.HideOnFocusLost;
             HideInvokeSwitch.IsChecked = LocalState.Ui.HideAfterInvoke;
             BallSwitch.IsChecked = LocalState.Ui.FloatingBallEnabled;
+            DevModeSwitch.IsChecked = LocalState.Ui.DeveloperMode;
             ThemeCombo.SelectedIndex = LocalState.Ui.Theme switch { "light" => 2, "dark" => 1, _ => 0 };
             ViewCombo.SelectedIndex = LocalState.Ui.DefaultView == "grid" ? 1 : 0;
             UpdateHotkeyPresets(animate: false);
@@ -3064,6 +3066,37 @@ public sealed partial class MainWindow : Window
         else HideBall();
     }
 
+    // ==================== 开发者模式 ====================
+
+    /// <summary>开发者模式关闭时禁用的插件管理入口（灰显 + 提示，而非隐藏——让用户能发现功能存在）。
+    /// "加载开发目录"会绕过正式安装流程直接跑任意本地目录代码；"更换插件目录"会做实际的目录迁移，
+    /// 两者风险高于安装本地插件包/启停/卸载/权限授权，因此单独收编到开发者模式下。</summary>
+    private void ApplyDevModeGate(bool devMode)
+    {
+        DevLoadPluginBtn.IsEnabled = devMode;
+        ChangePluginDirBtn.IsEnabled = devMode;
+        var tip = devMode ? null : "需先开启「设置 → 通用 → 开发者模式」";
+        // 禁用按钮本身不接收 hover（IsHitTestVisible 随 IsEnabled=false 失效），tooltip 不弹；
+        // 把提示挂到可 hit-test 的外层包装上，灰显按钮 hover 时仍能显示引导。
+        ToolTipService.SetToolTip(DevLoadPluginWrap, tip);
+        ToolTipService.SetToolTip(ChangePluginDirWrap, tip);
+    }
+
+    /// <summary>通用设置-开发者模式开关：开启后插件页每行显示"调试"按钮，
+    /// 且解锁"加载开发目录""更换插件目录"两个高风险入口；关闭时二者灰显但不隐藏。
+    /// 立即重建插件列表刷新每行 DebugVisibility，不依赖切回插件页导航时重载。</summary>
+    private void OnToggleDevMode(object sender, RoutedEventArgs e)
+    {
+        var on = DevModeSwitch.IsChecked == true;
+        AnimateSwitchToggle(DevModeSwitch, on, animate: !_syncing);
+        ApplyDevModeGate(on);
+        if (_syncing) return;
+        LocalState.Ui.DeveloperMode = on;
+        LocalState.SaveUi();
+        App.Log("DevMode", $"toggled on={on}");
+        if (_pluginRows.Count > 0) _ = LoadPluginsAsync();
+    }
+
     /// <summary>创建并驻留悬浮球（独立置顶小窗）。失败时回弹开关与设置，避免
     /// 「开关开着但球不在」的假状态（用户可随时再开重试），不弹窗打断。</summary>
     private void ShowBall()
@@ -3223,8 +3256,35 @@ public sealed partial class MainWindow : Window
         if (dir is null) return;
         try
         {
-            var id = await _host.PluginInstallAsync(dir);
-            SetPluginStatus($"已安装：{id}");
+            var outcome = await _host.PluginInstallAsync(dir);
+            switch (outcome.Action)
+            {
+                case "installed":
+                    SetPluginStatus($"已安装：{outcome.Id}");
+                    break;
+                case "updated":
+                    PluginWindowHost.CloseIfOpen(outcome.Id);
+                    SetPluginStatus($"已更新到 v{outcome.Version}");
+                    break;
+                case "confirm_downgrade":
+                {
+                    var msg = $"检测到旧版本\n已装 v{outcome.PreviousVersion}，将安装 v{outcome.Version}\n是否继续覆盖安装？";
+                    if (!await ConfirmDestructiveAsync(msg))
+                    {
+                        SetPluginStatus("已取消");
+                        break;
+                    }
+                    PluginWindowHost.CloseIfOpen(outcome.Id);
+                    var forced = await _host.PluginInstallAsync(dir, force: true);
+                    SetPluginStatus(forced.Action == "updated"
+                        ? $"已降级安装到 v{forced.Version}"
+                        : $"已安装：{forced.Id}");
+                    break;
+                }
+                default:
+                    SetPluginStatus($"已安装：{outcome.Id}");
+                    break;
+            }
             await LoadPluginsAsync();
         }
         catch (Exception ex)
@@ -3337,6 +3397,32 @@ public sealed partial class MainWindow : Window
         else
         {
             SetPluginStatus($"卸载失败：{row.Name}");
+        }
+    }
+
+    /// <summary>插件卡片"调试"按钮：以 devMode=true 打开插件窗口（DevTools/右键菜单/加速键全开），
+    /// 与正式安装/dev 目录无关——只要开发者模式开着就能调试任意已启用插件。
+    /// 若该插件窗口已打开，先收掉再重开：OpenOrFocus 命中旧窗口时不会重应用 dev 设置，
+    /// 直接聚焦会拿到 DevTools 未启用的旧实例，必须重开才能保证调试生效。</summary>
+    private async void OnDebugPlugin(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
+        try
+        {
+            var info = await _host.PluginOpenAsync(row.Id, "", "");
+            if (info is null)
+            {
+                SetPluginStatus($"无法打开调试：{row.Name}（插件未启用或非 WebView 类型）");
+                return;
+            }
+            PluginWindowHost.CloseIfOpen(row.Id);
+            PluginWindowHost.OpenOrFocus(info, _host, "", "", "", devMode: true);
+            SetPluginStatus($"已打开调试窗口：{row.Name}");
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginDebug", ex);
+            SetPluginStatus($"调试打开失败：{row.Name}");
         }
     }
 
@@ -4167,8 +4253,9 @@ public sealed partial class MainWindow : Window
                 Footer.Text = "插件不可用：" + title;
                 return;
             }
-            // 开发目录加载的插件开 DevTools，正式安装的关掉（规范 §9.2）。
-            var devMode = await IsDevPluginAsync(pluginId);
+            // 开发目录加载的插件开 DevTools，正式安装的看通用设置的开发者模式总开关（规范 §9.2）。
+            // 注意：OpenOrFocus 命中旧窗口时不会重应用 dev 设置，开关切换后已开的窗口需重开才生效。
+            var devMode = LocalState.Ui.DeveloperMode || await IsDevPluginAsync(pluginId);
             PluginWindowHost.OpenOrFocus(info, _host, input, command, rawQuery, devMode);
             Footer.Text = "已打开：" + title;
         }

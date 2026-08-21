@@ -7,7 +7,9 @@ use anyhow::{bail, Result};
 use spark_core::{ensure_data_dir, Action, Candidate, Query, Source};
 use spark_index::{AppIndex, SearchIndex};
 use spark_ipc::{InvokeParams, InvokeResult, PluginApiParams};
-use spark_plugin_manager::{KeywordMatch, PluginInfo, PluginManager, PluginOpenInfo};
+use spark_plugin_manager::{
+    KeywordMatch, PluginInfo, PluginInstallOutcome, PluginManager, PluginOpenInfo,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -46,7 +48,7 @@ impl HostApp {
         })
     }
 
-    pub fn search(&self, text: &str) -> Vec<Candidate> {
+    pub fn search(&mut self, text: &str) -> Vec<Candidate> {
         let q = Query {
             text: text.into(),
             limit: self.config.max_results,
@@ -57,6 +59,25 @@ impl HostApp {
         if let Some(m) = self.plugins.find_keyword_match(text) {
             if let Some(cand) = self.build_plugin_candidate(&m) {
                 hits.insert(0, cand);
+            }
+        }
+        // native 插件（mode:list）：命中关键字前缀时，把插件返回的结果项并入列表。
+        // 注：native_query 是阻塞 RPC（带超时），在 host 锁内调用；native 插件为重型
+        // 组件，超时/崩溃自动降级为空结果，不阻断搜索主流程。
+        if let Some(m) = self.plugins.find_native_match(text) {
+            if self.plugins.native_plugin(&m.plugin_id).is_some() {
+                match self
+                    .plugins
+                    .native_query(&m.plugin_id, &m.input, self.config.max_results)
+                {
+                    Ok(result) if !result.items.is_empty() => {
+                        for item in result.items {
+                            hits.push(item);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(?e, id = %m.plugin_id, "native query returned error"),
+                }
             }
         }
         hits
@@ -147,6 +168,15 @@ impl HostApp {
             })
             .ok_or_else(|| anyhow::anyhow!("item not found: {}", params.item_id))?;
 
+        // native 插件结果项：plugin_id 命中 native 插件时走 native_invoke，
+        // 不经 shell/索引（native 项 target 通常为空）。
+        if let Some(pid) = item.plugin_id.as_deref() {
+            if self.plugins.native_plugin(pid).is_some() {
+                let result = self.plugins.native_invoke(pid, params.clone())?;
+                return Ok(result);
+            }
+        }
+
         let action = if params.action_id.is_empty() {
             "open"
         } else {
@@ -185,6 +215,11 @@ impl HostApp {
         self.index.len()
     }
 
+    /// 优雅关闭：向所有 native 插件进程发 shutdown。在主消息循环退出后调用。
+    pub fn shutdown(&mut self) {
+        self.plugins.native_shutdown_all();
+    }
+
     pub fn plugin_count(&self) -> usize {
         self.plugins.plugins().len()
     }
@@ -213,8 +248,8 @@ impl HostApp {
         self.plugins.list()
     }
 
-    pub fn plugin_install(&mut self, path: &str) -> Result<String> {
-        Ok(self.plugins.install_from_dir(Path::new(path))?)
+    pub fn plugin_install(&mut self, path: &str, force: bool) -> Result<PluginInstallOutcome> {
+        Ok(self.plugins.install_from_dir(Path::new(path), force)?)
     }
 
     pub fn plugin_uninstall(&mut self, id: &str) -> Result<()> {
@@ -300,6 +335,9 @@ impl HostApp {
                 clipboard::write_text(&a.text)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
+            // preload 已声明 readImage，但 host 端图片编码尚未实现；
+            // 返回明确 UNAVAILABLE 而非 INVALID_ARGS，避免开发者误判为参数错误。
+            "read_image" => bail!("UNAVAILABLE: clipboard.read_image 尚未实现"),
             other => bail!("INVALID_ARGS: clipboard method {other}"),
         }
     }

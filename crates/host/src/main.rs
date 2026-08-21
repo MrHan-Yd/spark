@@ -148,7 +148,13 @@ fn main() -> Result<()> {
     }
 
     let icon = cli.icon.or_else(find_default_icon);
-    win_loop::run(shared, hub, icon)?;
+    win_loop::run(shared.clone(), hub, icon)?;
+    // 消息循环退出后，优雅关闭 native 插件进程（发 shutdown + wait），再退出 host。
+    // 不依赖 Arc drop 时机：IPC 线程仍持有 shared 副本，drop 会延后。
+    // 即使 mutex 中毒（持锁线程曾 panic），也强制取出内部 host 调 shutdown，
+    // 避免静默跳过导致 native 子进程变僵尸。
+    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    guard.shutdown();
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 # Native 插件开发
 
-> 状态：**协议就绪，运行时待实现**（2026-08-20）
+> 状态：**运行时已实现**（2026-08-21）
 > Wire 协议版本：`API_VERSION = 1`（`spark-ipc`）
 > 清单版本：`api_version: 2`
 > 面向：Rust / 原生语言开发者
@@ -10,19 +10,20 @@
 
 ## 0. 实现现状（必读）
 
-**Native 插件运行时（host 侧 spawn + 插件侧 pipe loop）尚未实现。** 本文档描述的是**目标设计**，供提前了解协议与开发模型。
+**Native 插件运行时已落地**：host 侧 spawn 插件进程 + stdin/stdout 管道 RPC，SDK 侧 `run_loop` 阻塞分发。内置 `echo` 示例端到端可跑（编译 exe 放入插件目录即可触发 `echo <文本>` 体验回显+复制）。
 
 当前状态：
 
 | 部分 | 状态 |
 |------|------|
-| 通信协议数据结构（`QueryParams`/`InvokeParams`/`QueryResult`/`InvokeResult`/`PluginMethod`） | ✅ 已定义于 `crates/ipc/src/protocol.rs` |
-| 插件 SDK trait（`Plugin::query/invoke`） | ✅ 已定义于 `crates/sdk/src/lib.rs` |
-| host 侧 spawn native 进程 + 管道通信循环 | ❌ `plugin-manager` 注释："native 进程 spawn 仍是后续工作" |
-| SDK 侧 pipe loop 运行时（插件 main 监听 host 请求） | ❌ `sdk` 注释："stdio / pipe loop filled in later" |
-| `echo` 示例插件 | ❌ MVP 桩（main 只打印一次 query 结果），且未编译 exe |
+| 通信协议数据结构（`QueryParams`/`InvokeParams`/`QueryResult`/`InvokeResult`/`PluginMethod`） | ✅ `crates/ipc/src/protocol.rs` |
+| 帧编解码（4 字节小端长度前缀 + UTF-8 JSON） | ✅ `crates/ipc/src/frame.rs`（`read_frame`/`write_frame`，16 MiB 上限） |
+| 插件 SDK trait（`Plugin::query/invoke`） + `run_loop` | ✅ `crates/sdk/src/lib.rs`（`run_loop` + 可单测 `dispatch_request`） |
+| host 侧 spawn native 进程 + 管道通信循环 | ✅ `crates/plugin-manager/src/native.rs`（`NativeRuntime`：懒启动/常驻/崩溃重建/超时/shutdown） |
+| 关键字前缀路由（`mode:"list"`） | ✅ `PluginManager::find_native_match`（保留原大小写） |
+| `echo` 示例插件 | ✅ `plugins/echo/src/main.rs` 用 `run_loop`，编译产物 `spark-plugin-echo.exe` |
 
-也就是说：**协议和 trait 画好了，差的是运行时胶水。** 在 native runtime 落地前，native 插件无法被 Spark 真正加载运行；清单可被解析、可在设置页列表显示，但点不开。
+**已知 v1 权衡**：native query 是**阻塞 RPC（5s 超时）在 host 锁内**调用，重型插件超时/崩溃自动降级为空结果，不阻断搜索主流程。`mode: "page"`（native 自建窗口）仍属二期，未实现。
 
 ---
 
@@ -119,21 +120,21 @@ Native 插件用**旧清单格式**（`commands` + `keywords`），向后兼容�
 
 ## 4. 通信协议
 
-**传输层**：stdin/stdout，**length-prefixed JSON-RPC**（每帧 = 4 字节小端长度 + UTF-8 JSON 行）。host 与插件是 1:1 进程对，host 拥有管道读写两端。
+**传输层**：stdin/stdout，**length-prefixed JSON-RPC**（每帧 = 4 字节小端 uint32 长度 + UTF-8 JSON body）。host 与插件是 1:1 进程对，host 拥有管道读写两端。
 
-> 帧编解码细节随 runtime 实现落地；当前 `spark-ipc` 已定义消息结构与方法枚举。
+帧编解码实现见 `crates/ipc/src/frame.rs`（`read_frame`/`write_frame`，16 MiB 上限，干净 EOF 返 `Ok(None)`）。
 
 ### 4.1 方法（`PluginMethod`，`crates/ipc/src/protocol.rs`）
 
 | 方法 | 方向 | 说明 |
 |------|------|------|
-| `plugin.initialize` | host → 插件 | 启动握手，传插件 id/权限/运行环境 |
-| `plugin.shutdown` | host → 插件 | 优雅退出 |
+| `plugin.initialize` | host → 插件 | 启动握手，传插件 id/权限/运行环境；插件回 `PluginInitializeResult { plugin_id, sdk_version }` |
+| `plugin.shutdown` | host → 插件 | 优雅退出（可带 id 等 ack，或作 notification 直接退出） |
 | `plugin.query` | host → 插件 | 查询：根据用户输入返回候选结果项 |
 | `plugin.invoke` | host → 插件 | 执行：用户选中某结果项的动作 |
-| `plugin.cancel` | host → 插件 | 取消进行中的 query（通知，无响应） |
+| `plugin.cancel` | host → 插件 | 取消进行中的 query（notification，无 `id`，不回响应） |
 
-每条请求带 `id`，插件返回对应 `id` 的 `JsonRpcResponse`；`cancel` 为 notification（无 `id`）。
+每条请求带 `id`（host 侧递增 u64），插件返回对应 `id` 的 `JsonRpcResponse`；`cancel` 为 notification（无 `id`，不回帧）。host 侧**校验响应 id 与请求 id 一致**，不符即视为协议错误丢弃进程重建——故插件 stdout 必须纯净，不要回多余/自发帧。
 
 ### 4.2 数据结构
 
@@ -263,32 +264,20 @@ spark-ipc = { path = "../../crates/ipc" }
 serde_json = "1"
 ```
 
-### 5.4 main：运行时（待实现）
+### 5.4 main：运行时
 
-> ⚠️ **当前 `spark-sdk` 尚未提供 pipe loop 运行时。** 下面的 main 是 `plugins/echo` 现状——MVP 桩，只打印一次 query 结果，不监听管道：
-
-```rust
-fn main() {
-    // MVP: print one demo query result (full pipe loop comes with host IPC).
-    let mut plugin = Echo;
-    let result = plugin.query(QueryParams {
-        text: std::env::args().nth(1).unwrap_or_else(|| "hello".into()),
-        limit: 10,
-    });
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
-}
-```
-
-**目标形态**（runtime 落地后）：
+`run_loop` 由 `spark-sdk` 提供，负责：帧编解码、`plugin.initialize` 握手、`query`/`invoke`/`cancel` 分发、`shutdown` 退出。stdout 必须纯净协议帧，日志走 stderr。
 
 ```rust
 fn main() {
     let mut plugin = Echo;
-    spark_sdk::run_loop(&mut plugin);   // 阻塞：读 stdin 帧 → dispatch query/invoke → 写 stdout 帧
+    // 阻塞：读 stdin 帧 → dispatch query/invoke → 写 stdout 帧。
+    if let Err(e) = spark_sdk::run_loop(&mut plugin) {
+        eprintln!("spark-plugin-echo: run_loop exited: {e}");
+        std::process::exit(1);
+    }
 }
 ```
-
-`run_loop` 由 `spark-sdk` 提供（待实现），负责：帧编解码、`plugin.initialize` 握手、`query`/`invoke`/`cancel` 分发、`shutdown` 退出。
 
 ---
 
@@ -343,19 +332,16 @@ host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...�
 仓库内置 `plugins/echo`（Rust native 示例）。
 
 - 清单见 §3.2。
-- 源码 `plugins/echo/src/main.rs`（MVP 桩，见 §5.4）。
+- 源码 `plugins/echo/src/main.rs`（用 `spark_sdk::run_loop`，见 §5.4）。
 - `Cargo.toml` 见 §5.3，是 workspace 成员（`Cargo.toml` members 含 `plugins/echo`）。
 
-**当前无法运行**：native runtime 未实现 + exe 未编译。待 runtime 落地后，编译 exe 放入目录即可触发 `echo <文本>` 体验回显+复制。
-
----
+**可运行**：`cargo build --release -p spark-plugin-echo`，把产物 `target/release/spark-plugin-echo.exe` 复制进插件目录（与 `plugin.json` 同级，文件名与 `main` 字段一致）。开发模式启动 host 指向项目根 `plugins/`，输入 `echo <文本>` 即触发回显候选，回车复制。
 
 ## 10. 路线图
 
 | 阶段 | 内容 |
 |------|------|
-| 当前 | 协议结构 + SDK trait 已定义；运行时未实现 |
-| 近期 | host 侧 spawn + 管道循环；SDK `run_loop`；echo 编译可跑 |
+| 当前 | 协议结构 + SDK trait + 帧编解码 + `run_loop` + host spawn/管道循环；echo 可跑 |
 | 二期 | `mode: page` 自建顶层窗口（需 `window.create` 权限）；native 权限模型细化 |
 | 三期 | 插件市场支持 native 插件签名校验、跨平台产物声明 |
 

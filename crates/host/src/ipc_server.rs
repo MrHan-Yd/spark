@@ -304,7 +304,7 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                 );
             }
             let items = {
-                let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
                 let mut hits = g.search(&params.text);
                 let limit = if params.limit == 0 {
                     g.config.max_results
@@ -420,11 +420,11 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             if params.path.is_empty() || params.path.len() > 4096 {
                 return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid path"));
             }
-            let installed_id = {
+            let outcome = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-                g.plugin_install(&params.path)?
+                g.plugin_install(&params.path, params.force)?
             };
-            JsonRpcResponse::result(id, serde_json::json!({ "id": installed_id }))
+            JsonRpcResponse::result(id, serde_json::to_value(outcome)?)
         }
         m if m == HostMethod::PluginUninstall.as_str() => {
             let params: PluginIdParams = match serde_json::from_value(req.params) {

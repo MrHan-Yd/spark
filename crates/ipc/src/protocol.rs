@@ -199,6 +199,26 @@ pub enum InvokeResult {
 
 // ─── 插件管理参数（host.plugin.*）─────────────────────────────────────────
 
+/// `plugin.initialize` 请求参数（host → 插件握手）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginInitializeParams {
+    /// 插件清单 id（host 侧已校验）。
+    pub id: String,
+    /// 用户已授予的权限列表（与清单声明取交集后）。
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// host 侧 wire 协议版本（`API_VERSION`）。
+    pub api_version: u32,
+}
+
+/// `plugin.initialize` 响应：插件回报自身 SDK 版本与就绪状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginInitializeResult {
+    pub plugin_id: String,
+    pub sdk_version: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginIdParams {
@@ -210,6 +230,10 @@ pub struct PluginIdParams {
 pub struct PluginInstallParams {
     /// 待导入的源目录绝对路径（含 plugin.json）。
     pub path: String,
+    /// true 时强制覆盖（用于降级确认后重试）；默认 false。
+    /// false 且检测到旧版本时 host 返回 `confirm_downgrade` 而不写盘。
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

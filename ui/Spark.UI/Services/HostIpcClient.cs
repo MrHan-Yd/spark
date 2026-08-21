@@ -339,9 +339,19 @@ public sealed class HostIpcClient : IAsyncDisposable
         }
     }
 
-    /// <summary>从本地目录导入安装，返回插件 id；失败抛出（调用方展示原因）。</summary>
-    public Task<string> PluginInstallAsync(string path, CancellationToken ct = default) =>
-        PluginIdCallAsync("host.plugin.install", new { path }, ct);
+    /// <summary>从本地目录导入安装；返回安装结果（新装/更新/需确认降级）。
+    /// force=true 时强制覆盖（用于降级确认后重试）。失败抛出（调用方展示原因）。</summary>
+    public async Task<PluginInstallOutcomeDto> PluginInstallAsync(string path, bool force = false,
+        CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) throw new InvalidOperationException("host unavailable");
+        var el = await CallAsync("host.plugin.install", new { path, force }, ct);
+        if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("id", out _))
+            return JsonSerializer.Deserialize<PluginInstallOutcomeDto>(el.GetRawText())
+                ?? throw new InvalidOperationException("host.plugin.install: empty result");
+        throw new InvalidOperationException("host.plugin.install: unexpected result");
+    }
 
     /// <summary>加载开发目录（不拷贝），返回插件 id；失败抛出。</summary>
     public Task<string> PluginDevLoadAsync(string dir, CancellationToken ct = default) =>

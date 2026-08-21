@@ -35,11 +35,11 @@ impl Plugin for Echo {
 }
 
 fn main() {
-    // MVP: print one demo query result (full pipe loop comes with host IPC).
+    // 阻塞运行：从 stdin 读 JSON-RPC 帧 → query/invoke → 向 stdout 写响应。
+    // stdout 必须纯净协议帧，日志走 stderr。
     let mut plugin = Echo;
-    let result = plugin.query(QueryParams {
-        text: std::env::args().nth(1).unwrap_or_else(|| "hello".into()),
-        limit: 10,
-    });
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    if let Err(e) = spark_sdk::run_loop(&mut plugin) {
+        eprintln!("spark-plugin-echo: run_loop exited: {e}");
+        std::process::exit(1);
+    }
 }

@@ -4,6 +4,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Spark.UI.Models;
+using Spark.UI.Services;
 
 namespace Spark.UI.ViewModels;
 
@@ -57,6 +58,12 @@ public sealed class PluginRowVm : INotifyPropertyChanged
     public string IconLetter => Name.Length > 0 ? Name[..1].ToUpperInvariant() : "?";
 
     public Visibility DevBadgeVisibility => IsDev ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>调试按钮可见性：仅当通用设置开启开发者模式时显示。
+    /// 每次访问都读 LocalState 的实时值；开关在通用页切换，回到插件页导航时列表整体重建，
+    /// 因此无需 INotify，重建即重新求值。</summary>
+    public Visibility DebugVisibility =>
+        LocalState.Ui.DeveloperMode ? Visibility.Visible : Visibility.Collapsed;
 
     /// <summary>开发目录加载的插件不能"卸载"（文件不归 Spark 管），只能禁用。</summary>
     public Visibility UninstallVisibility => IsDev ? Visibility.Collapsed : Visibility.Visible;

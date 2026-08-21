@@ -137,6 +137,29 @@
       clear: function () { return call('db', 'clear'); }
     },
 
+    // 以下能力 host 端尚未实现：preload 提供 API 桩，调用统一返回 UNAVAILABLE。
+    // 这样开发者照规范写不会拿到 TypeError，而是清晰的“未实现”错误。
+    net: {
+      fetch: function (url, init) {
+        return guarded('net', 'net', 'fetch')({ url: String(url), init: init || null });
+      }
+    },
+
+    shell: {
+      openExternal: function (target) {
+        return guarded('shell.open', 'shell', 'open_external')({ target: String(target) });
+      }
+    },
+
+    fs: {
+      read: function (path) {
+        return guarded('fs.read', 'fs', 'read')({ path: String(path) });
+      },
+      write: function (path, text) {
+        return guarded('fs.write', 'fs', 'write')({ path: String(path), text: String(text) });
+      }
+    },
+
     onEnter: function (cb) { on('enter', cb); },
     onInput: function (cb) { on('input', cb); },
     onResize: function (cb) { on('resize', cb); },
