@@ -325,6 +325,15 @@ host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...�
 
 > 与 webview 不同：native 插件分发**必须**带上目标平台预编译 exe，Spark host 不负责编译，只负责 spawn 调用。
 
+### 8.1 通过插件市场发布
+
+1. 编译好 exe，在插件仓库中创建 `插件名/版本号/` 目录，放入 `plugin.json` + exe。
+2. 更新仓库根目录 `registry.json`，添加该插件条目（`runtime: "native"`）。
+3. 推送后用户即可在 Spark 设置 → 插件 → 插件市场浏览并一键安装。
+4. native 插件 exe 体积大时，建议在 `version.url` 填预打包 zip 地址（GitHub Release asset），避免每次下载整个仓库 zipball。
+
+详见 [插件市场与仓库.md](./插件市场与仓库.md) §6 发布流程。
+
 ---
 
 ## 9. 完整示例：echo
@@ -342,8 +351,11 @@ host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...�
 | 阶段 | 内容 |
 |------|------|
 | 当前 | 协议结构 + SDK trait + 帧编解码 + `run_loop` + host spawn/管道循环；echo 可跑 |
-| 二期 | `mode: page` 自建顶层窗口（需 `window.create` 权限）；native 权限模型细化 |
-| 三期 | 插件市场支持 native 插件签名校验、跨平台产物声明 |
+| 二期 | 插件市场支持（官方/自定义仓库、registry.json 索引、一键安装/更新）；`mode: page` 自建顶层窗口（需 `window.create` 权限）；native 权限模型细化 |
+| 三期 | 插件市场签名校验、自动检查更新、跨平台产物声明 |
+| 四期 | WASM 轻插件、多仓库源、插件依赖声明 |
+
+> 完整阶段划分见 [插件开发规范.md](./插件开发规范.md) §13 路线图。
 
 ---
 
