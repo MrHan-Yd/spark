@@ -170,6 +170,29 @@ pub struct SetConfigParams {
     pub hide_on_execute: Option<bool>,
     #[serde(default)]
     pub launch_on_startup: Option<bool>,
+    /// 严格模式（规范 §12.2 3.2）：开启后本地导入/市场安装均要求插件带有效签名，
+    /// 无签名拒装（`SignatureMissing`）。默认关。
+    #[serde(default)]
+    pub strict_mode: Option<bool>,
+    /// 全量替换"受信任开发者"三方公钥表（规范 §10 / §5.3）。缺省/null 不动。
+    /// host 侧逐条校验（base64 32 字节公钥等），任一条非法即整体拒绝本次更新。
+    #[serde(default)]
+    pub trusted_pubkeys: Option<Vec<TrustedPubkeyEntry>>,
+}
+
+/// 一条用户导入的受信任三方密钥（`HostConfig.trusted_pubkeys` 的元素）。
+/// 仅承载 key_id + 公钥 + 备注；验签时 `KeyKind` 恒为 `ThirdParty`（host 侧硬编码，
+/// 不从此结构解析种类——防配置被篡改把三方密钥抬升为官方）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedPubkeyEntry {
+    /// 开发者公钥标识（写入 signature.json 的 key_id；须全局唯一、非空）。
+    pub key_id: String,
+    /// base64 编码的 32 字节 Ed25519 公钥。
+    pub public_key: String,
+    /// 展示用备注（开发者名/主页等）。
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +257,10 @@ pub struct PluginInstallParams {
     /// false 且检测到旧版本时 host 返回 `confirm_downgrade` 而不写盘。
     #[serde(default)]
     pub force: bool,
+    /// true 时要求源目录带有效 `signature.json`：无签名拒装（`SignatureMissing`），
+    /// 签名破损一律拒装（`SignatureInvalid`）。默认 false，老 UI 不传仍兼容。
+    #[serde(default)]
+    pub require_signature: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -324,6 +324,7 @@ host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...�
 4. 用户在设置 → 插件 → 从本地安装；exe 随目录一起落盘到 `<安装目录>/plugins/<id>/`。
 
 > 与 webview 不同：native 插件分发**必须**带上目标平台预编译 exe，Spark host 不负责编译，只负责 spawn 调用。
+> native 插件 exe 同样走内容清单签名（Ed25519，随仓库 CI 自动签名），不叠加 Windows Authenticode。详见 [插件签名规范.md](./插件签名规范.md)。
 
 ### 8.1 通过插件市场发布
 

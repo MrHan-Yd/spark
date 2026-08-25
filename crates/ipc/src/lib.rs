@@ -15,8 +15,8 @@ pub use protocol::{
     HostMethod, InvokeParams, InvokeResult, JsonRpcNotification, PluginApiParams,
     PluginDevLoadParams, PluginGrantParams, PluginIdParams, PluginInitializeParams,
     PluginInitializeResult, PluginInstallParams, PluginMethod, PluginOpenParams,
-    PluginSetDirParams, PluginToggleParams, QueryParams, QueryResult, SetConfigParams, UiMethod,
-    API_VERSION, PIPE_NAME, PIPE_PATH,
+    PluginSetDirParams, PluginToggleParams, QueryParams, QueryResult, SetConfigParams,
+    TrustedPubkeyEntry, UiMethod, API_VERSION, PIPE_NAME, PIPE_PATH,
 };
 
 /// Encode one NDJSON line (without trailing newline applied by caller if needed).

@@ -38,6 +38,33 @@ jobs:
         shell: pwsh
         run: ./scripts/build_installer.ps1 -Version "$($env:GITHUB_REF_NAME.TrimStart('v'))" -Tag "$env:GITHUB_REF_NAME" -UiDir "dist-publish"
 
+      # ── 官方插件签名（三期 §9.3）─────────────────────────────────────────
+      # 仅在配置了 SPARK_SIGNING_KEY_V1 secret 且 plugins/dist/ 下有已打包的官方插件
+      # 目录时才签名；二者缺一即跳过（打包流水线就绪前为 no-op，不阻塞 release）。
+      # 私钥从 CI secret 注入，落盘为 keys/spark-official-v1.key（被 .gitignore 忽略）。
+      - name: Sign official plugins
+        shell: pwsh
+        env:
+          SPARK_SIGNING_KEY_V1: ${{ secrets.SPARK_SIGNING_KEY_V1 }}
+        run: |
+          cargo build --release -p spark-sign
+          if ([string]::IsNullOrEmpty($env:SPARK_SIGNING_KEY_V1)) {
+            Write-Host "SPARK_SIGNING_KEY_V1 secret 未配置，跳过签名。"
+            exit 0
+          }
+          $keyFile = "keys/spark-official-v1.key"
+          Set-Content -Path $keyFile -Value $env:SPARK_SIGNING_KEY_V1 -NoNewline
+          $dist = "plugins/dist"
+          if (-not (Test-Path $dist)) {
+            Write-Host "plugins/dist 不存在，无已打包插件可签名，跳过。"
+            exit 0
+          }
+          Get-ChildItem $dist -Directory | ForEach-Object {
+            $pluginDir = $_.FullName
+            Write-Host "Signing $pluginDir"
+            cargo run --release -p spark-sign -- sign --dir $pluginDir --key $keyFile --key-id spark-official-v1
+          }
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

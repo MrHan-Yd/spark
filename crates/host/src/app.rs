@@ -4,12 +4,15 @@ use crate::config::HostConfig;
 use crate::shell;
 use crate::tray::TrayIcon;
 use anyhow::{bail, Result};
+use base64::Engine;
 use spark_core::{ensure_data_dir, Action, Candidate, Query, Source};
 use spark_index::{AppIndex, SearchIndex};
-use spark_ipc::{InvokeParams, InvokeResult, PluginApiParams};
+use spark_ipc::{InvokeParams, InvokeResult, PluginApiParams, TrustedPubkeyEntry};
 use spark_plugin_manager::{
-    KeywordMatch, PluginInfo, PluginInstallOutcome, PluginManager, PluginOpenInfo,
+    KeyKind, KeywordMatch, PluginInfo, PluginInstallOutcome, PluginManager, PluginOpenInfo,
+    TrustedKey,
 };
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -35,6 +38,16 @@ impl HostApp {
         // 一期：内置与用户插件统一放此目录（安装器随包发的内置插件 + 用户导入的都在这）。
         let plugins_dir = resolve_plugins_dir(extra_plugins, config.plugins_dir.as_deref());
         let mut plugins = PluginManager::new(plugins_dir);
+        // 配置里用户导入的三方公钥并入运行时可信表（规范 §10）。单条非法仅跳过 +
+        // warn（配置手工损坏不应让 host 起不来）；SetConfig 路径则严格整体校验。
+        let mut user_keys = Vec::new();
+        for entry in &config.trusted_pubkeys {
+            match parse_trusted_pubkey(entry) {
+                Ok(k) => user_keys.push(k),
+                Err(msg) => warn!(key_id = %entry.key_id, "skip invalid trusted pubkey: {msg}"),
+            }
+        }
+        plugins.set_trusted_user_keys(user_keys);
         let n = plugins.scan_standard()?;
         if n > 0 {
             info!(count = n, "scanned plugins");
@@ -248,8 +261,29 @@ impl HostApp {
         self.plugins.list()
     }
 
-    pub fn plugin_install(&mut self, path: &str, force: bool) -> Result<PluginInstallOutcome> {
-        Ok(self.plugins.install_from_dir(Path::new(path), force)?)
+    pub fn plugin_install(
+        &mut self,
+        path: &str,
+        force: bool,
+        require_signature: bool,
+    ) -> Result<PluginInstallOutcome> {
+        // 严格模式（规范 §12.2 3.2，默认关）：仅安装带有效签名的插件——
+        // 无论调用方（UI）是否传 require_signature，host 侧强制要求。
+        let effective_require = require_signature || self.config.strict_mode;
+        Ok(self
+            .plugins
+            .install_from_dir(Path::new(path), force, effective_require)?)
+    }
+
+    /// 应用"受信任开发者"三方公钥表（`host.set_config` 变更后调用）。
+    /// 任一条目非法即返回 Err（整体拒绝更新），由 IPC 层转 -32602 让 UI 提示具体 key_id。
+    pub fn apply_trusted_pubkeys(&mut self, entries: &[TrustedPubkeyEntry]) -> Result<(), String> {
+        let mut keys = Vec::with_capacity(entries.len());
+        for e in entries {
+            keys.push(parse_trusted_pubkey(e)?);
+        }
+        self.plugins.set_trusted_user_keys(keys);
+        Ok(())
     }
 
     pub fn plugin_uninstall(&mut self, id: &str) -> Result<()> {
@@ -355,6 +389,39 @@ impl HostApp {
         }
         Ok(serde_json::json!({ "ok": true }))
     }
+}
+
+/// 解析配置中的一条用户三方公钥（规范 §10）。校验不通过返回带 key_id 的错误信息。
+///
+/// `KeyKind` 恒为 `ThirdParty`（硬编码，不随配置/网络解析）——"官方"判定只能来自
+/// host 内置 `TRUSTED_KEYS`，配置再怎么改都无法把用户密钥抬升为官方。
+fn parse_trusted_pubkey(e: &TrustedPubkeyEntry) -> Result<TrustedKey, String> {
+    let key_id = e.key_id.trim();
+    if key_id.is_empty() {
+        return Err("key_id 不能为空".into());
+    }
+    if key_id.len() > 128 {
+        return Err(format!("key_id 过长（>128）：{key_id}"));
+    }
+    if e.public_key.trim().is_empty() {
+        return Err(format!("{key_id}: public_key 不能为空"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(e.public_key.trim())
+        .map_err(|_| format!("{key_id}: public_key 不是合法 base64"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "{key_id}: public_key 必须解码为 32 字节（Ed25519 公钥），实际 {}",
+            bytes.len()
+        ));
+    }
+    Ok(TrustedKey {
+        key_id: Cow::Owned(key_id.to_string()),
+        algorithm: Cow::Borrowed("ed25519"),
+        public_key: Cow::Owned(e.public_key.trim().to_string()),
+        kind: KeyKind::ThirdParty,
+        note: Cow::Owned(e.note.trim().to_string()),
+    })
 }
 
 /// 解析插件目录：CLI > config > <exe_dir>/plugins；相对路径按 host 目录解析。

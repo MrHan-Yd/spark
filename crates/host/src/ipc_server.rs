@@ -359,6 +359,13 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                     );
                 }
             }
+            // 受信任三方公钥表：先整体校验再落 config（非法条目给 UI 明确错误）。
+            if let Some(entries) = &params.trusted_pubkeys {
+                let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                if let Err(msg) = g.apply_trusted_pubkeys(entries) {
+                    return reply(pipe, &JsonRpcResponse::error(id, -32602, msg));
+                }
+            }
             let hotkey_changed = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
                 let old = g.config.clone();
@@ -376,6 +383,13 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                 }
                 if let Some(value) = params.launch_on_startup {
                     g.config.launch_on_startup = value;
+                }
+                if let Some(value) = params.strict_mode {
+                    g.config.strict_mode = value;
+                }
+                if let Some(entries) = params.trusted_pubkeys {
+                    // apply_trusted_pubkeys 已在上面整体校验通过；这里只落盘。
+                    g.config.trusted_pubkeys = entries;
                 }
                 let changed = g.config != old;
                 if changed {
@@ -422,7 +436,7 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             }
             let outcome = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-                g.plugin_install(&params.path, params.force)?
+                g.plugin_install(&params.path, params.force, params.require_signature)?
             };
             JsonRpcResponse::result(id, serde_json::to_value(outcome)?)
         }

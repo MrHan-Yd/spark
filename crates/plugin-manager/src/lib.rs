@@ -7,6 +7,7 @@ mod db;
 mod error;
 mod manifest;
 mod native;
+mod signing;
 mod state;
 
 pub use error::PluginError;
@@ -15,6 +16,10 @@ pub use manifest::{
     PluginWindow,
 };
 pub use native::{NativeMatch, NativeRuntime, NativeSpawnInfo};
+pub use signing::{
+    canonical_bytes, collect_file_entries, verify_dir, verify_with_keys, FileEntry, KeyKind,
+    Revocation, SignState, TrustedKey, VerifyError, REVOKED, TRUSTED_KEYS,
+};
 pub use state::PluginState;
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +42,9 @@ pub struct LoadedPlugin {
     pub source: PluginSource,
     pub enabled: bool,
     pub granted: Vec<String>,
+    /// 签名状态：install 时全量验签写入；scan 时轻量验签写入。
+    /// dev 插件恒为 `Unsigned`（开发者本地目录，不参与签名体系）。
+    pub sign_state: SignState,
 }
 
 /// 设置页/IPC 返回的插件信息（序列化形状即 UI DTO）。
@@ -56,6 +64,8 @@ pub struct PluginInfo {
     pub enabled: bool,
     pub source: String,
     pub features: Vec<PluginFeature>,
+    /// 签名状态：`official` / `third_party` / `unsigned` / `invalid`（snake_case 序列化）。
+    pub sign_state: SignState,
 }
 
 /// `install_from_dir` 的执行结果：告知 UI 是新装、覆盖更新还是需要确认降级。
@@ -79,6 +89,8 @@ pub struct PluginInstallOutcome {
     /// 旧版本号；全新装为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_version: Option<String>,
+    /// 本次安装验签结果。UI 据此决定是否展示"官方"角标。
+    pub sign_state: SignState,
 }
 
 /// `host.plugin.open` 返回：UI 据此打开 WebView2 窗口。
@@ -132,6 +144,10 @@ pub struct PluginManager {
     state: PluginState,
     /// native 插件进程运行时（懒启动 + 常驻 + 崩溃重建）。
     native: NativeRuntime,
+    /// 运行时可信密钥表 = 内置官方表（`TRUSTED_KEYS`）+ 用户导入的三方密钥。
+    /// 验签一律走此合并表：官方判定只看内置 `KeyKind::Official` 条目，
+    /// 用户表恒为 `KeyKind::ThirdParty`（"已签名"角标），无法伪冒官方。
+    trusted_keys: Vec<TrustedKey>,
 }
 
 impl PluginManager {
@@ -148,7 +164,38 @@ impl PluginManager {
             data_dir,
             state,
             native: NativeRuntime::default(),
+            trusted_keys: crate::signing::TRUSTED_KEYS.to_vec(),
         }
+    }
+
+    /// 替换用户导入的三方密钥表（`HostConfig.trusted_pubkeys` 变更时调用）。
+    /// 内置官方表恒定保留：与传入 key_id 冲突的用户条目被丢弃（官方 key_id 不可被
+    /// 用户覆盖，否则官方插件会被降级展示为"已签名"）。入参条目若被错误构造为
+    /// `KeyKind::Official` 同样丢弃——用户导入的公钥在 host 侧**恒为 ThirdParty**，
+    /// 防配置解析/构造失误把用户密钥抬升为"官方"。
+    pub fn set_trusted_user_keys(&mut self, user_keys: Vec<TrustedKey>) {
+        let builtin = crate::signing::TRUSTED_KEYS;
+        let mut merged: Vec<TrustedKey> = builtin.to_vec();
+        for k in user_keys {
+            if k.kind == KeyKind::ThirdParty
+                && !merged
+                    .iter()
+                    .any(|m| m.key_id.as_ref() == k.key_id.as_ref())
+            {
+                merged.push(k);
+            }
+        }
+        let prev_user = self.trusted_keys.len().saturating_sub(builtin.len());
+        let new_user = merged.len() - builtin.len();
+        if prev_user != new_user {
+            info!(user_keys = new_user, "trusted user keys table updated");
+        }
+        self.trusted_keys = merged;
+    }
+
+    /// 当前生效的可信密钥表（内置 + 用户导入）。
+    pub fn trusted_keys(&self) -> &[TrustedKey] {
+        &self.trusted_keys
     }
 
     fn state_path(&self) -> PathBuf {
@@ -164,6 +211,19 @@ impl PluginManager {
             .map(|ic| p.root.join(ic))
             .filter(|path| path.is_file())
             .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    /// 扫描/启动期验签（3.2 起**全量重算**）：校验 signature.json schema + 重算目录内
+    /// 每个文件的哈希与清单双向比对 + Ed25519 验签（用运行时合并的可信表）。
+    /// io 错误降级为 `Unsigned`（best-effort，不阻塞插件加载，与既有隔离原则一致）。
+    fn sign_state_scanned(root: &Path, id: &str, version: &str, keys: &[TrustedKey]) -> SignState {
+        match verify_with_keys(root, id, version, keys, crate::signing::REVOKED) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(?e, id, "sign verify io error, treating as unsigned");
+                SignState::Unsigned
+            }
+        }
     }
 
     pub fn plugins(&self) -> &[LoadedPlugin] {
@@ -218,12 +278,15 @@ impl PluginManager {
             .retain(|p| !(p.manifest.id == id && p.source == PluginSource::Dev));
         let enabled = self.state.enabled_of(&id);
         let granted = self.state.granted_of(&id);
+        // dev 插件恒为 Unsigned：开发目录是开发者本地产物，不参与签名体系，
+        // 即便内含 signature.json 也不展示官方/失效角标（避免误导）。
         self.plugins.push(LoadedPlugin {
             manifest,
             root: dir.to_path_buf(),
             source: PluginSource::Dev,
             enabled,
             granted,
+            sign_state: SignState::Unsigned,
         });
         info!(id = %id, dev_dir = %dir.display(), "loaded dev plugin");
         self.warn_keyword_conflicts();
@@ -272,6 +335,9 @@ impl PluginManager {
                     }
                     let enabled = self.state.enabled_of(&id);
                     let granted = self.state.granted_of(&id);
+                    // 全量重验（3.2）：磁盘文件被改 → Invalid，UI 红色提示 + 禁用开关。
+                    let sign_state =
+                        Self::sign_state_scanned(&path, &id, &manifest.version, &self.trusted_keys);
                     info!(id = %id, path = %path.display(), "loaded plugin manifest");
                     self.plugins.push(LoadedPlugin {
                         manifest,
@@ -279,6 +345,7 @@ impl PluginManager {
                         source,
                         enabled,
                         granted,
+                        sign_state,
                     });
                     n += 1;
                 }
@@ -291,6 +358,14 @@ impl PluginManager {
 
     /// 从本地目录导入安装：拷贝到 `<plugins_dir>/<id>/` 并登记。
     ///
+    /// `require_signature` 控制签名策略（规范 §6.2）：
+    /// - 源目录有 `signature.json` 且验签失败（哈希不匹配/签名错/key_id 不可信）
+    ///   → 一律 `Err(SignatureInvalid)`，无论 `require_signature` 取值（破损签名拒装）。
+    /// - 无 `signature.json`：`require_signature=true` → `Err(SignatureMissing)`；
+    ///   `require_signature=false` → 记 `Unsigned`，继续安装。
+    /// - 验过 → 记 `Official`/`ThirdParty`。
+    /// 验签在拷贝前对**源目录**做全量重算（`verify_dir`），防止把破损签名写盘。
+    ///
     /// 若插件 id 已存在则按版本号决定行为（本地覆盖更新机制）：
     /// - 新版 >= 旧版（或 `force=true`）：关 native 进程 → 暂存拷贝 + 备份交换
     ///   （先拷到 `.<id>.staging`，成功后旧目录改名 `.<id>.bak` 再换入目标，任一步失败
@@ -302,11 +377,22 @@ impl PluginManager {
         &mut self,
         src: &Path,
         force: bool,
+        require_signature: bool,
     ) -> Result<PluginInstallOutcome, PluginError> {
         let manifest = PluginManifest::load(&src.join("plugin.json"))?;
         let id = manifest.id.clone();
         let new_version = manifest.version.clone();
         let dest = self.plugins_dir.join(&id);
+
+        // 拷贝前对源目录全量验签（用运行时合并可信表）：破损签名拒装，无签名按策略决定。
+        let verify_result = verify_with_keys(
+            src,
+            &id,
+            &new_version,
+            &self.trusted_keys,
+            crate::signing::REVOKED,
+        )?;
+        let sign_state = enforce_install_signature(&id, verify_result, require_signature)?;
 
         if !dest.exists() {
             // 全新安装。
@@ -323,6 +409,7 @@ impl PluginManager {
                 source: PluginSource::Standard,
                 enabled,
                 granted,
+                sign_state,
             });
             info!(id = %id, "installed plugin");
             self.warn_keyword_conflicts();
@@ -331,6 +418,7 @@ impl PluginManager {
                 action: InstallAction::Installed,
                 version: new_version,
                 previous_version: None,
+                sign_state,
             });
         }
 
@@ -350,6 +438,7 @@ impl PluginManager {
                 action: InstallAction::ConfirmDowngrade,
                 version: new_version,
                 previous_version: Some(old_version),
+                sign_state,
             });
         }
 
@@ -404,6 +493,7 @@ impl PluginManager {
             source: PluginSource::Standard,
             enabled,
             granted,
+            sign_state,
         });
         info!(id = %id, new = %new_version, old = %old_version, "updated plugin");
         self.warn_keyword_conflicts();
@@ -412,6 +502,7 @@ impl PluginManager {
             action: InstallAction::Updated,
             version: new_version,
             previous_version: Some(old_version),
+            sign_state,
         })
     }
 
@@ -477,6 +568,7 @@ impl PluginManager {
                     PluginSource::Dev => "dev".into(),
                 },
                 features: p.manifest.features.clone(),
+                sign_state: p.sign_state,
             })
             .collect()
     }
@@ -729,6 +821,24 @@ impl PluginManager {
     }
 }
 
+/// §6.2 安装签名策略（独立成函数便于单测固定；install_from_dir 内部引用）：
+/// - `Invalid` 一律拒装（破损签名=可能被篡改，不分 `require_signature`，永不装）。
+/// - `Unsigned` + `require_signature=true` → 拒装（`SignatureMissing`）。
+/// - 其余（官方/三方验过、或不要求时的无签名）放行。
+pub(crate) fn enforce_install_signature(
+    id: &str,
+    state: SignState,
+    require_signature: bool,
+) -> Result<SignState, PluginError> {
+    match state {
+        SignState::Invalid => Err(PluginError::SignatureInvalid(id.to_string())),
+        SignState::Unsigned if require_signature => {
+            Err(PluginError::SignatureMissing(id.to_string()))
+        }
+        s => Ok(s),
+    }
+}
+
 fn runtime_str(r: &PluginRuntime) -> String {
     match r {
         PluginRuntime::Native => "native".into(),
@@ -757,6 +867,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), PluginError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::borrow::Cow;
     use std::fs;
 
     fn make_webview_plugin(dir: &Path, id: &str, keyword: &str) {
@@ -817,7 +930,7 @@ mod tests {
         let plugins_dir = tmp.join("plugins");
         let mut pm = PluginManager::with_dirs(plugins_dir.clone(), tmp.join("data"));
         let outcome = pm
-            .install_from_dir(&tmp.join("src").join("com.spark.hello"), false)
+            .install_from_dir(&tmp.join("src").join("com.spark.hello"), false, false)
             .unwrap();
         assert_eq!(outcome.id, "com.spark.hello");
         assert_eq!(outcome.action, InstallAction::Installed);
@@ -957,7 +1070,7 @@ mod tests {
         );
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
         let o = pm
-            .install_from_dir(&tmp.join("v1").join("com.spark.h"), false)
+            .install_from_dir(&tmp.join("v1").join("com.spark.h"), false, false)
             .unwrap();
         assert_eq!(o.action, InstallAction::Installed);
         assert_eq!(o.version, "0.1.0");
@@ -970,7 +1083,7 @@ mod tests {
             "0.2.0",
         );
         let o = pm
-            .install_from_dir(&tmp.join("v2").join("com.spark.h"), false)
+            .install_from_dir(&tmp.join("v2").join("com.spark.h"), false, false)
             .unwrap();
         assert_eq!(o.action, InstallAction::Updated);
         assert_eq!(o.version, "0.2.0");
@@ -990,7 +1103,7 @@ mod tests {
             "0.1.0",
         );
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
-        pm.install_from_dir(&tmp.join("v1").join("com.spark.h"), false)
+        pm.install_from_dir(&tmp.join("v1").join("com.spark.h"), false, false)
             .unwrap();
         make_webview_plugin_ver(
             &tmp.join("v2").join("com.spark.h"),
@@ -998,7 +1111,7 @@ mod tests {
             "h",
             "0.2.0",
         );
-        pm.install_from_dir(&tmp.join("v2").join("com.spark.h"), false)
+        pm.install_from_dir(&tmp.join("v2").join("com.spark.h"), false, false)
             .unwrap();
         // 暂存/备份目录应已清理，不残留。
         let plugins = tmp.join("plugins");
@@ -1018,7 +1131,7 @@ mod tests {
             "0.1.0",
         );
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
-        pm.install_from_dir(&tmp.join("v1").join("com.spark.h"), false)
+        pm.install_from_dir(&tmp.join("v1").join("com.spark.h"), false, false)
             .unwrap();
 
         // 同版重装：Updated，不报错。
@@ -1029,7 +1142,7 @@ mod tests {
             "0.1.0",
         );
         let o = pm
-            .install_from_dir(&tmp.join("v2").join("com.spark.h"), false)
+            .install_from_dir(&tmp.join("v2").join("com.spark.h"), false, false)
             .unwrap();
         assert_eq!(o.action, InstallAction::Updated);
         assert_eq!(o.previous_version.as_deref(), Some("0.1.0"));
@@ -1047,7 +1160,7 @@ mod tests {
             "0.2.0",
         );
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
-        pm.install_from_dir(&tmp.join("v2").join("com.spark.h"), false)
+        pm.install_from_dir(&tmp.join("v2").join("com.spark.h"), false, false)
             .unwrap();
         let installed_json = tmp.join("plugins").join("com.spark.h").join("plugin.json");
         let installed_before = fs::read_to_string(&installed_json).unwrap();
@@ -1060,7 +1173,7 @@ mod tests {
             "0.1.0",
         );
         let o = pm
-            .install_from_dir(&tmp.join("v1").join("com.spark.h"), false)
+            .install_from_dir(&tmp.join("v1").join("com.spark.h"), false, false)
             .unwrap();
         assert_eq!(o.action, InstallAction::ConfirmDowngrade);
         assert_eq!(o.version, "0.1.0");
@@ -1074,7 +1187,7 @@ mod tests {
 
         // force=true 强制覆盖：Updated，版本变 0.1.0。
         let o = pm
-            .install_from_dir(&tmp.join("v1").join("com.spark.h"), true)
+            .install_from_dir(&tmp.join("v1").join("com.spark.h"), true, false)
             .unwrap();
         assert_eq!(o.action, InstallAction::Updated);
         assert_eq!(o.version, "0.1.0");
@@ -1097,7 +1210,7 @@ mod tests {
         fs::write(dir1.join("plugin.json"), json1).unwrap();
         fs::write(dir1.join("index.html"), "<html></html>").unwrap();
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
-        pm.install_from_dir(&dir1, false).unwrap();
+        pm.install_from_dir(&dir1, false, false).unwrap();
         pm.grant("com.spark.h", vec!["clipboard".into(), "notify".into()])
             .unwrap();
         pm.set_enabled("com.spark.h", false).unwrap();
@@ -1113,7 +1226,7 @@ mod tests {
         }"#;
         fs::write(dir2.join("plugin.json"), json2).unwrap();
         fs::write(dir2.join("index.html"), "<html></html>").unwrap();
-        pm.install_from_dir(&dir2, false).unwrap();
+        pm.install_from_dir(&dir2, false, false).unwrap();
 
         // enabled 保持禁用；granted 保留 clipboard，裁剪掉不再声明的 notify。
         let p = pm
@@ -1161,5 +1274,242 @@ mod tests {
         // 残留已被启动清理删除。
         assert!(!plugins.join(".com.spark.h.staging").exists());
         assert!(!plugins.join(".com.spark.h.bak").exists());
+    }
+
+    // ─── 签名策略（Phase 3）─────────────────────────────────────────────────
+
+    #[test]
+    fn install_unsigned_without_require_allows() {
+        let tmp = std::env::temp_dir().join("spark_pm_sig_unsigned_ok");
+        let _ = fs::remove_dir_all(&tmp);
+        make_webview_plugin(&tmp.join("src").join("com.spark.h"), "com.spark.h", "h");
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        // require_signature=false：无 signature.json 仍可装，sign_state=Unsigned。
+        let o = pm
+            .install_from_dir(&tmp.join("src").join("com.spark.h"), false, false)
+            .unwrap();
+        assert_eq!(o.sign_state, SignState::Unsigned);
+        assert_eq!(pm.list()[0].sign_state, SignState::Unsigned);
+    }
+
+    #[test]
+    fn install_unsigned_with_require_rejects() {
+        let tmp = std::env::temp_dir().join("spark_pm_sig_unsigned_req");
+        let _ = fs::remove_dir_all(&tmp);
+        make_webview_plugin(&tmp.join("src").join("com.spark.h"), "com.spark.h", "h");
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        // require_signature=true 且无 signature.json → SignatureMissing，不写盘。
+        let err = pm
+            .install_from_dir(&tmp.join("src").join("com.spark.h"), false, true)
+            .unwrap_err();
+        assert!(matches!(err, PluginError::SignatureMissing(_)));
+        assert!(pm.list().is_empty());
+        assert!(!tmp.join("plugins").join("com.spark.h").exists());
+    }
+
+    #[test]
+    fn install_broken_signature_rejects() {
+        let tmp = std::env::temp_dir().join("spark_pm_sig_broken");
+        let _ = fs::remove_dir_all(&tmp);
+        let src = tmp.join("src").join("com.spark.h");
+        make_webview_plugin(&src, "com.spark.h", "h");
+        // 写一份 schema 合法但签名不可信的 signature.json：key_id 不在内置表 → Invalid。
+        let sig_json = serde_json::json!({
+            "schema": 1,
+            "plugin_id": "com.spark.h",
+            "version": "0.1.0",
+            "algorithm": "ed25519",
+            "key_id": "nonexistent-key",
+            "files": [{"path": "plugin.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}],
+            "signature": "AAAA"
+        });
+        fs::write(src.join("signature.json"), sig_json.to_string()).unwrap();
+
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        // 破损签名一律拒装，无论 require_signature 取值。
+        let err = pm.install_from_dir(&src, false, false).unwrap_err();
+        assert!(matches!(err, PluginError::SignatureInvalid(_)));
+        assert!(pm.list().is_empty());
+    }
+
+    #[test]
+    fn scan_reports_invalid_signature_state() {
+        let tmp = std::env::temp_dir().join("spark_pm_sig_scan_invalid");
+        let _ = fs::remove_dir_all(&tmp);
+        let plugins = tmp.join("plugins");
+        let dir = plugins.join("com.spark.h");
+        make_webview_plugin(&dir, "com.spark.h", "h");
+        // 放一份不可信的 signature.json：scan 轻量验签记 Invalid，但不拦截加载。
+        let sig_json = serde_json::json!({
+            "schema": 1,
+            "plugin_id": "com.spark.h",
+            "version": "0.1.0",
+            "algorithm": "ed25519",
+            "key_id": "nonexistent-key",
+            "files": [{"path": "plugin.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}],
+            "signature": "AAAA"
+        });
+        fs::write(dir.join("signature.json"), sig_json.to_string()).unwrap();
+
+        let mut pm = PluginManager::with_dirs(plugins, tmp.join("data"));
+        pm.scan_standard().unwrap();
+        assert_eq!(pm.list().len(), 1);
+        assert_eq!(pm.list()[0].sign_state, SignState::Invalid);
+    }
+
+    #[test]
+    fn scan_reports_unsigned_when_no_signature() {
+        let tmp = std::env::temp_dir().join("spark_pm_sig_scan_unsigned");
+        let _ = fs::remove_dir_all(&tmp);
+        let plugins = tmp.join("plugins");
+        make_webview_plugin(&plugins.join("com.spark.h"), "com.spark.h", "h");
+        let mut pm = PluginManager::with_dirs(plugins, tmp.join("data"));
+        pm.scan_standard().unwrap();
+        assert_eq!(pm.list()[0].sign_state, SignState::Unsigned);
+    }
+
+    // ─── Phase 5：三方密钥 / 合并可信表 / 签名策略（规范 §5.3、§10、§6.2）────
+
+    /// 测试辅助：给插件目录写一份用给定私钥签的 signature.json。
+    fn sign_plugin_dir(dir: &Path, id: &str, version: &str, key_id: &str, sk: &SigningKey) {
+        let entries: Vec<FileEntry> = collect_file_entries(dir).unwrap();
+        let canon = canonical_bytes(id, version, "ed25519", key_id, &entries);
+        let sig = sk.sign(&canon);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        let files_json: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| serde_json::json!({"path": e.path, "sha256": e.sha256}))
+            .collect();
+        let sig_json = serde_json::json!({
+            "schema": 1,
+            "plugin_id": id,
+            "version": version,
+            "algorithm": "ed25519",
+            "key_id": key_id,
+            "signed_at": "2026-08-25T10:00:00Z",
+            "files": files_json,
+            "signature": sig_b64,
+        });
+        fs::write(
+            dir.join("signature.json"),
+            serde_json::to_string_pretty(&sig_json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// 测试辅助：构造一条用户导入的三方密钥（KeyKind::ThirdParty）。
+    fn user_key_for(key_id: &str, sk: &SigningKey) -> TrustedKey {
+        let pubkey =
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        TrustedKey {
+            key_id: Cow::Owned(key_id.to_string()),
+            algorithm: Cow::Borrowed("ed25519"),
+            public_key: Cow::Owned(pubkey),
+            kind: KeyKind::ThirdParty,
+            note: Cow::Borrowed("test user key"),
+        }
+    }
+
+    #[test]
+    fn install_signature_policy_is_stable() {
+        // §6.2 策略矩阵的映射函数：破损签名一律拒；Unsigned+require 拒；其余放行。
+        assert!(matches!(
+            enforce_install_signature("p", SignState::Invalid, false),
+            Err(PluginError::SignatureInvalid(_))
+        ));
+        assert!(matches!(
+            enforce_install_signature("p", SignState::Invalid, true),
+            Err(PluginError::SignatureInvalid(_))
+        ));
+        assert!(matches!(
+            enforce_install_signature("p", SignState::Unsigned, true),
+            Err(PluginError::SignatureMissing(_))
+        ));
+        assert_eq!(
+            enforce_install_signature("p", SignState::Unsigned, false).unwrap(),
+            SignState::Unsigned
+        );
+        assert_eq!(
+            enforce_install_signature("p", SignState::Official, false).unwrap(),
+            SignState::Official
+        );
+        assert_eq!(
+            enforce_install_signature("p", SignState::ThirdParty, true).unwrap(),
+            SignState::ThirdParty
+        );
+    }
+
+    #[test]
+    fn scan_shows_third_party_only_after_trusting_user_key() {
+        // 三方密钥签的插件：未信任时 scan 全量验签记 Invalid（key_id 不在可信表）；
+        // 导入该公钥后重建 manager → ThirdParty（"已签名"角标）。
+        let tmp = std::env::temp_dir().join("spark_pm_sig_thirdparty_scan");
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = tmp.join("plugins").join("com.dev.tool");
+        make_webview_plugin(&dir, "com.dev.tool", "t");
+        let sk = SigningKey::from_bytes(&[11; 32]);
+        sign_plugin_dir(&dir, "com.dev.tool", "0.1.0", "dev-v1", &sk);
+
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.scan_standard().unwrap();
+        assert_eq!(pm.list()[0].sign_state, SignState::Invalid);
+
+        let mut pm2 = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data2"));
+        pm2.set_trusted_user_keys(vec![user_key_for("dev-v1", &sk)]);
+        pm2.scan_standard().unwrap();
+        assert_eq!(pm2.list()[0].sign_state, SignState::ThirdParty);
+    }
+
+    #[test]
+    fn install_user_key_signed_plugin_requires_trust() {
+        // 用户密钥签的插件：未信任 → 拒装（SignatureInvalid，破损签名语义）；
+        // 导入公钥后 → 装成功且 sign_state=ThirdParty。
+        let tmp = std::env::temp_dir().join("spark_pm_sig_thirdparty_install");
+        let _ = fs::remove_dir_all(&tmp);
+        let src = tmp.join("src").join("com.dev.tool");
+        make_webview_plugin(&src, "com.dev.tool", "t");
+        let sk = SigningKey::from_bytes(&[13; 32]);
+        sign_plugin_dir(&src, "com.dev.tool", "0.1.0", "dev-v1", &sk);
+
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        let err = pm.install_from_dir(&src, false, false).unwrap_err();
+        assert!(matches!(err, PluginError::SignatureInvalid(_)));
+        assert!(pm.list().is_empty());
+        assert!(!tmp.join("plugins").join("com.dev.tool").exists());
+
+        let mut pm2 = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm2.set_trusted_user_keys(vec![user_key_for("dev-v1", &sk)]);
+        let o = pm2.install_from_dir(&src, false, false).unwrap();
+        assert_eq!(o.sign_state, SignState::ThirdParty);
+        assert_eq!(pm2.list()[0].sign_state, SignState::ThirdParty);
+    }
+
+    #[test]
+    fn merged_key_table_drops_conflicting_user_entries() {
+        // 用户表与内置官方 key_id 冲突 → 丢弃（官方 key_id 不可被用户覆盖）。
+        // 重复 key_id 去重；非 ThirdParty 条目（构造失误）同样丢弃。
+        let sk = SigningKey::from_bytes(&[17; 32]);
+        let mut pm = PluginManager::with_dirs(
+            std::env::temp_dir().join("spark_pm_sig_keymerge_plugins"),
+            std::env::temp_dir().join("spark_pm_sig_keymerge_data"),
+        );
+        let mut forged_official = user_key_for("spark-official-v1", &sk);
+        forged_official.kind = KeyKind::Official; // 模拟构造失误/恶意配置
+        pm.set_trusted_user_keys(vec![
+            forged_official,
+            user_key_for("dev-v1", &sk),
+            user_key_for("dev-v1", &sk),
+            user_key_for("dev-v2", &sk),
+        ]);
+        // 内置官方 + dev-v1 + dev-v2；用户表里不允许出现官方 key_id 的副本。
+        assert_eq!(pm.trusted_keys().len(), 3);
+        assert!(!pm.trusted_keys().iter().any(|k| {
+            k.key_id.as_ref() == "spark-official-v1" && k.kind == KeyKind::ThirdParty
+        }));
+        assert!(pm
+            .trusted_keys()
+            .iter()
+            .filter(|k| k.kind == KeyKind::ThirdParty)
+            .all(|k| k.key_id.as_ref() == "dev-v1" || k.key_id.as_ref() == "dev-v2"));
     }
 }

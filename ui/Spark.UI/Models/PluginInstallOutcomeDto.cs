@@ -21,4 +21,9 @@ public sealed class PluginInstallOutcomeDto
     /// <summary>旧版本号；全新装为 null。</summary>
     [JsonPropertyName("previous_version")]
     public string? PreviousVersion { get; set; }
+
+    /// <summary>本次安装验签结果（与 <see cref="PluginInfoDto.SignState"/> 同形状）。
+    /// UI 据此即时判定是否展示"官方"角标；列表刷新后以 PluginInfo 为准。</summary>
+    [JsonPropertyName("sign_state")]
+    public string SignState { get; set; } = "unsigned";
 }

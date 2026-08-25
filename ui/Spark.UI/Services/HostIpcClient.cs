@@ -534,6 +534,25 @@ public sealed class HostConfigDto
     public bool HotkeyEnabled { get; set; } = true;
     [JsonPropertyName("launch_on_startup")]
     public bool LaunchOnStartup { get; set; }
+    /// <summary>严格模式（3.2）：仅安装带有效签名的插件，默认关。</summary>
+    [JsonPropertyName("strict_mode")]
+    public bool StrictMode { get; set; }
+    /// <summary>用户导入的"受信任开发者"三方公钥表（3.3）。</summary>
+    [JsonPropertyName("trusted_pubkeys")]
+    public List<TrustedPubkeyDto> TrustedPubkeys { get; set; } = new();
+}
+
+public sealed class TrustedPubkeyDto
+{
+    /// <summary>开发者公钥标识（signature.json 的 key_id）。</summary>
+    [JsonPropertyName("key_id")]
+    public string KeyId { get; set; } = "";
+    /// <summary>base64 编码的 32 字节 Ed25519 公钥。</summary>
+    [JsonPropertyName("public_key")]
+    public string PublicKey { get; set; } = "";
+    /// <summary>展示用备注。</summary>
+    [JsonPropertyName("note")]
+    public string Note { get; set; } = "";
 }
 
 public sealed class HostConfigUpdate
@@ -546,6 +565,11 @@ public sealed class HostConfigUpdate
     public bool? HideOnExecute { get; set; }
     [JsonPropertyName("launch_on_startup")]
     public bool? LaunchOnStartup { get; set; }
+    [JsonPropertyName("strict_mode")]
+    public bool? StrictMode { get; set; }
+    /// <summary>全量替换受信任开发者表；null 表示不动。</summary>
+    [JsonPropertyName("trusted_pubkeys")]
+    public List<TrustedPubkeyDto>? TrustedPubkeys { get; set; }
 
     public HostConfigUpdate Clone() => new()
     {
@@ -553,13 +577,17 @@ public sealed class HostConfigUpdate
         HideOnFocusLost = HideOnFocusLost,
         HideOnExecute = HideOnExecute,
         LaunchOnStartup = LaunchOnStartup,
+        StrictMode = StrictMode,
+        TrustedPubkeys = TrustedPubkeys,
     };
 
     public bool Equals(HostConfigUpdate? other) => other is not null
         && HotkeyToggle == other.HotkeyToggle
         && HideOnFocusLost == other.HideOnFocusLost
         && HideOnExecute == other.HideOnExecute
-        && LaunchOnStartup == other.LaunchOnStartup;
+        && LaunchOnStartup == other.LaunchOnStartup
+        && StrictMode == other.StrictMode
+        && TrustedPubkeys == other.TrustedPubkeys;
 }
 
 public static class DemoData

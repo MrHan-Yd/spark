@@ -13,3 +13,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# 插件签名三期：Ed25519 验签 + SHA-256 内容清单。纯 Rust 无 C 依赖。
+# 规范见 插件开发/插件签名规范.md。host 只用验签（VerifyingKey/Verifier），
+# sign-tool（Phase 2）共用本 crate 的 canon 模块做签名。
+ed25519-dalek = "2"
+sha2 = "0.10"
+base64 = "0.22"

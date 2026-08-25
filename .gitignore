@@ -11,6 +11,8 @@
 /dist-publish/
 /build/
 /release/
+# 官方插件打包产物（CI 签名步骤产出 signature.json 后的待发布插件目录）
+/plugins/dist/
 *.exe
 *.dll
 *.pdb
@@ -74,6 +76,9 @@ logs/
 *.pfx
 secrets/
 credentials/
+# 插件签名私钥（规范 §5.2：绝不提交仓库；keys/README.md 说明保管流程）
+keys/*.key
+!keys/README.md
 
 # ===== 测试 / 覆盖率 =====
 /coverage/

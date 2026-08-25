@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use spark_core::{config_path, ensure_data_dir};
+use spark_ipc::TrustedPubkeyEntry;
 use std::path::PathBuf;
 use std::{fs, io};
 use tracing::info;
@@ -21,6 +22,14 @@ pub struct HostConfig {
     pub launch_on_startup: bool,
     #[serde(default = "default_true")]
     pub hotkey_enabled: bool,
+    /// 严格模式（规范 §12.2 3.2，默认关）：开启后仅安装带有效签名的插件
+    /// （官方或用户已信任的三方签名），无签名拒装。
+    #[serde(default)]
+    pub strict_mode: bool,
+    /// 用户导入的"受信任开发者"三方公钥表（规范 §10）。host 验签时合并进
+    /// 运行时可信表，命中即 `SignState::ThirdParty`；恒不能产生"官方"。
+    #[serde(default)]
+    pub trusted_pubkeys: Vec<TrustedPubkeyEntry>,
 }
 
 fn default_hotkey() -> String {
@@ -43,6 +52,8 @@ impl Default for HostConfig {
             hide_on_execute: true,
             launch_on_startup: false,
             hotkey_enabled: true,
+            strict_mode: false,
+            trusted_pubkeys: Vec::new(),
         }
     }
 }

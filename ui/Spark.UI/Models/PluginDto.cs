@@ -54,6 +54,31 @@ public sealed class PluginInfoDto
 
     [JsonPropertyName("features")]
     public List<PluginFeatureDto> Features { get; set; } = new();
+
+    /// <summary>
+    /// 签名状态：host <c>PluginInfo.sign_state</c> 的 snake_case 形状。
+    /// <c>official</c> / <c>third_party</c> / <c>unsigned</c> / <c>invalid</c>。
+    /// 用字符串承接反序列化（与 <see cref="Runtime"/>/<see cref="Source"/> 一致），
+    /// 由 <see cref="ViewModels.PluginRowVm"/> 解析为 <see cref="PluginSignState"/>。
+    /// </summary>
+    [JsonPropertyName("sign_state")]
+    public string SignState { get; set; } = "unsigned";
+}
+
+/// <summary>
+/// 插件签名状态（纯展示用枚举，不直接参与 JSON 反序列化）。
+/// 对应 host <c>spark_plugin_manager::SignState</c>。
+/// </summary>
+public enum PluginSignState
+{
+    /// <summary>官方密钥验签通过。</summary>
+    Official,
+    /// <summary>三方密钥验签通过（v1 暂不产生）。</summary>
+    ThirdParty,
+    /// <summary>无 signature.json（host 老版本未返回 sign_state 时亦回落此值）。</summary>
+    Unsigned,
+    /// <summary>有 signature.json 但验签失败。</summary>
+    Invalid,
 }
 
 public sealed class PluginFeatureDto

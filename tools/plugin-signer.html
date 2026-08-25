@@ -1,0 +1,998 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spark 官方插件签名工具</title>
+<!--
+  Spark 插件签名工具（Web 版）— 三期
+  
+  产出与 crates/sign-tool (spark-sign CLI) 字节级一致的 signature.json：
+    - canonical bytes 逐字节移植自 crates/plugin-manager/src/signing/canon.rs
+    - Ed25519 用 @noble/ed25519（与 ed25519-dalek 同为 RFC 8032，签名一致）
+    - SHA-256 用浏览器 Web Crypto
+    - 私钥 = base64(32 字节 seed)，与 spark-sign keygen 写出的 .key 文件同格式
+  
+  两种取文件方式：
+    1) GitHub 官方仓库（硬编码 MrHan-Yd/spark-plugins）：填分支 + 插件版本目录路径，
+       页面经 GitHub API 抓文件（CORS 已开），签完可下载或用 PAT 直接 commit 回该仓库。
+    2) 本地目录：用文件夹选择器选插件目录，完全离线（仅需 CDN 加载一次 ed25519 库）。
+ 
+  仅供官方签名者本机自用。私钥只在浏览器内存，签完不落盘（除非勾“记住”）。
+-->
+<script type="importmap">
+{
+  "imports": {
+    "@noble/ed25519": "https://esm.sh/@noble/ed25519@2.1.0"
+  }
+}
+</script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --font-mono: "Cascadia Code", "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Consolas, monospace;
+    
+    /* Light Theme (Modern Glass & Vibrant Accent) */
+    --bg-page: #f6f8fc;
+    --bg-card: rgba(255, 255, 255, 0.85);
+    --bg-card-subtle: #f0f4f9;
+    --bg-input: #ffffff;
+    --border-color: rgba(203, 213, 225, 0.8);
+    --border-hover: #94a3b8;
+    --border-focus: #3b82f6;
+    --text-main: #0f172a;
+    --text-muted: #64748b;
+    --text-subtle: #94a3b8;
+    
+    --primary-bg: linear-gradient(135deg, #2563eb 0%, #4f46e5 100%);
+    --primary-hover: linear-gradient(135deg, #1d4ed8 0%, #4338ca 100%);
+    --primary-text: #ffffff;
+    --primary-shadow: 0 4px 18px 0 rgba(37, 99, 235, 0.28);
+    
+    --card-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.05), 0 2px 6px -1px rgba(15, 23, 42, 0.03);
+    --card-shadow-hover: 0 12px 30px -4px rgba(15, 23, 42, 0.09), 0 4px 10px -2px rgba(15, 23, 42, 0.04);
+    
+    --terminal-bg: #0b1120;
+    --terminal-border: #1e293b;
+    --terminal-text: #f8fafc;
+    
+    --color-ok: #10b981;
+    --color-err: #ef4444;
+    --color-warn: #f59e0b;
+    --badge-bg: #eff6ff;
+    --badge-border: #bfdbfe;
+    --badge-text: #1d4ed8;
+    --glass-blur: blur(16px);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg-page: #090d16;
+      --bg-card: rgba(18, 24, 38, 0.78);
+      --bg-card-subtle: #172033;
+      --bg-input: #0f1726;
+      --border-color: rgba(36, 49, 77, 0.7);
+      --border-hover: #3b507d;
+      --border-focus: #60a5fa;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-subtle: #64748b;
+      
+      --primary-bg: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+      --primary-hover: linear-gradient(135deg, #60a5fa 0%, #818cf8 100%);
+      --primary-text: #ffffff;
+      --primary-shadow: 0 4px 24px 0 rgba(99, 102, 241, 0.4);
+      
+      --card-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.4), 0 2px 6px -1px rgba(0, 0, 0, 0.3);
+      --card-shadow-hover: 0 16px 36px -4px rgba(0, 0, 0, 0.6);
+      
+      --terminal-bg: #050811;
+      --terminal-border: #151d30;
+      --terminal-text: #e2e8f0;
+      
+      --color-ok: #34d399;
+      --color-err: #f87171;
+      --color-warn: #fbbf24;
+      --badge-bg: rgba(30, 58, 138, 0.3);
+      --badge-border: rgba(59, 130, 246, 0.3);
+      --badge-text: #93c5fd;
+      --glass-blur: blur(20px);
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  /* Keyframe Animations */
+  @keyframes pageFadeIn {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes cardSlideUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes glowPulse {
+    0%, 100% { opacity: 0.4; transform: scale(1); }
+    50% { opacity: 0.7; transform: scale(1.08); }
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  @keyframes terminalLine {
+    from { opacity: 0; transform: translateX(-4px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+
+  body {
+    font: 14px/1.6 var(--font-sans);
+    background-color: var(--bg-page);
+    color: var(--text-main);
+    min-height: 100vh;
+    padding: 48px 20px 80px;
+    background-image: 
+      radial-gradient(circle at 10% 10%, rgba(37, 99, 235, 0.1) 0%, transparent 40%),
+      radial-gradient(circle at 90% 20%, rgba(99, 102, 241, 0.08) 0%, transparent 45%),
+      radial-gradient(circle at 50% 90%, rgba(16, 185, 129, 0.05) 0%, transparent 50%);
+    background-attachment: fixed;
+    transition: background-color 0.4s ease, color 0.4s ease;
+  }
+
+  .container {
+    max-width: 860px;
+    margin: 0 auto;
+    animation: pageFadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  /* Header Section */
+  .header {
+    margin-bottom: 28px;
+    position: relative;
+  }
+  .header-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 4px 12px;
+    border-radius: 9999px;
+    background: var(--badge-bg);
+    border: 1px solid var(--badge-border);
+    color: var(--badge-text);
+    margin-bottom: 12px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 2px 8px rgba(37, 99, 235, 0.1);
+    transition: all 0.3s ease;
+  }
+  .header-badge:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.18);
+  }
+  .header-badge::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 6px currentColor;
+    animation: glowPulse 2s infinite ease-in-out;
+  }
+  h1 {
+    font-size: 26px;
+    font-weight: 750;
+    letter-spacing: -0.03em;
+    color: var(--text-main);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, var(--text-main) 60%, var(--text-muted) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .sub {
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.65;
+  }
+  .sub code, .hint code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--bg-card-subtle);
+    border: 1px solid var(--border-color);
+    color: var(--text-main);
+  }
+
+  /* Modern Glass Cards */
+  .card {
+    background: var(--bg-card);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--border-color);
+    border-radius: 16px;
+    padding: 22px 24px;
+    margin-bottom: 20px;
+    box-shadow: var(--card-shadow);
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+                box-shadow 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+                border-color 0.25s ease;
+    animation: cardSlideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  .card:hover {
+    box-shadow: var(--card-shadow-hover);
+    border-color: var(--border-hover);
+    transform: translateY(-2px);
+  }
+  .card-title {
+    font-size: 14px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    color: var(--text-main);
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card-title::before {
+    content: "";
+    display: inline-block;
+    width: 3px;
+    height: 14px;
+    border-radius: 3px;
+    background: #3b82f6;
+  }
+
+  /* Segmented Controls (Tabs) */
+  .seg {
+    display: inline-flex;
+    background: var(--bg-card-subtle);
+    padding: 4px;
+    border-radius: 12px;
+    gap: 4px;
+    margin-bottom: 18px;
+    border: 1px solid var(--border-color);
+  }
+  .seg button {
+    flex: 0 0 auto;
+    padding: 7px 20px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 550;
+    cursor: pointer;
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .seg button:hover {
+    color: var(--text-main);
+  }
+  .seg button.active {
+    background: var(--bg-input);
+    color: var(--text-main);
+    font-weight: 600;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.08);
+    transform: scale(1.02);
+  }
+  @media (prefers-color-scheme: dark) {
+    .seg button.active {
+      box-shadow: 0 3px 12px rgba(0, 0, 0, 0.45);
+    }
+  }
+
+  /* Form Elements */
+  .row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 600px) {
+    .row { grid-template-columns: 1fr; gap: 0; }
+  }
+
+  label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin: 14px 0 6px;
+    letter-spacing: 0.01em;
+  }
+  .row > div > label:first-child,
+  #githubPane > .row:first-child > div > label,
+  .card > .row:first-child > div > label {
+    margin-top: 2px;
+  }
+
+  input, textarea, select {
+    width: 100%;
+    padding: 10px 14px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text-main);
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    outline: none;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  input::placeholder, textarea::placeholder {
+    color: var(--text-subtle);
+  }
+  input:focus, textarea:focus, select:focus {
+    border-color: var(--border-focus);
+    box-shadow: 0 0 0 3.5px rgba(59, 130, 246, 0.18);
+    transform: translateY(-1px);
+  }
+  input[readonly] {
+    opacity: 0.75;
+    background: var(--bg-card-subtle);
+    cursor: default;
+    border-style: dashed;
+  }
+  input[readonly]:focus {
+    box-shadow: none;
+    transform: none;
+  }
+  input[type="file"] {
+    padding: 8px 12px;
+    cursor: pointer;
+  }
+  textarea {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    resize: vertical;
+  }
+
+  .hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 8px;
+    line-height: 1.55;
+    background: var(--bg-card-subtle);
+    padding: 10px 14px;
+    border-radius: 8px;
+    border-left: 3px solid #3b82f6;
+  }
+
+  .checkrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 14px;
+    cursor: pointer;
+    user-select: none;
+    transition: color 0.2s ease;
+  }
+  .checkrow:hover {
+    color: var(--text-main);
+  }
+  .checkrow input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: #2563eb;
+    transition: transform 0.2s ease;
+  }
+  .checkrow input[type="checkbox"]:hover {
+    transform: scale(1.1);
+  }
+
+  /* Action Buttons */
+  .actions {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 26px 0 20px;
+  }
+  button {
+    font-family: var(--font-sans);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .primary {
+    padding: 11px 26px;
+    border: none;
+    border-radius: 10px;
+    background: var(--primary-bg);
+    color: var(--primary-text);
+    font-weight: 600;
+    font-size: 13px;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    box-shadow: var(--primary-shadow);
+    position: relative;
+    overflow: hidden;
+  }
+  .primary::after {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: linear-gradient(rgba(255,255,255,0.15), rgba(255,255,255,0));
+    opacity: 0;
+    transition: opacity 0.2s ease;
+  }
+  .primary:hover:not(:disabled) {
+    background: var(--primary-hover);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px 0 rgba(37, 99, 235, 0.38);
+  }
+  .primary:hover:not(:disabled)::after {
+    opacity: 1;
+  }
+  .primary:active:not(:disabled) {
+    transform: translateY(0);
+    box-shadow: var(--primary-shadow);
+  }
+  .primary:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    box-shadow: none;
+    transform: none;
+  }
+
+  .ghost {
+    padding: 10px 18px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--bg-card);
+    color: var(--text-main);
+    font-weight: 550;
+    font-size: 13px;
+    cursor: pointer;
+    box-shadow: var(--card-shadow);
+    backdrop-filter: var(--glass-blur);
+  }
+  .ghost:hover:not(:disabled) {
+    background: var(--bg-card-subtle);
+    border-color: var(--border-hover);
+    transform: translateY(-2px);
+    box-shadow: var(--card-shadow-hover);
+  }
+  .ghost:active:not(:disabled) {
+    transform: translateY(0);
+  }
+  .ghost:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+
+  /* Terminal Log Window */
+  .terminal-card {
+    background: var(--terminal-bg);
+    border: 1px solid var(--terminal-border);
+    border-radius: 14px;
+    margin-bottom: 20px;
+    overflow: hidden;
+    box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.55);
+    animation: cardSlideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  .terminal-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 9px 16px;
+    background: rgba(255, 255, 255, 0.03);
+    border-bottom: 1px solid var(--terminal-border);
+  }
+  .terminal-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    transition: transform 0.2s ease;
+  }
+  .terminal-card:hover .terminal-dot {
+    transform: scale(1.15);
+  }
+  .dot-red { background: #ef4444; }
+  .dot-yellow { background: #f59e0b; }
+  .dot-green { background: #10b981; }
+  .terminal-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #64748b;
+    font-family: var(--font-mono);
+    margin-left: 8px;
+    letter-spacing: 0.05em;
+  }
+  #log {
+    font: 12px/1.6 var(--font-mono);
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: transparent;
+    color: var(--terminal-text);
+    padding: 14px 16px;
+    max-height: 240px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+  }
+  #log span {
+    display: block;
+    animation: terminalLine 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+  #log:empty::before {
+    content: "等待操作...";
+    color: #475569;
+  }
+  .ok { color: var(--color-ok); font-weight: 500; }
+  .err { color: var(--color-err); font-weight: 600; }
+  .warn { color: var(--color-warn); font-weight: 500; }
+
+  /* Table styling */
+  .table-wrapper {
+    overflow-x: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    margin-top: 8px;
+    background: var(--bg-input);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    text-align: left;
+  }
+  thead {
+    background: var(--bg-card-subtle);
+  }
+  th {
+    padding: 10px 14px;
+    font-weight: 650;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-color);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  td {
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border-color);
+    color: var(--text-main);
+    transition: background-color 0.15s ease;
+  }
+  tr:last-child td {
+    border-bottom: none;
+  }
+  tbody tr:hover td {
+    background: var(--bg-card-subtle);
+  }
+  td code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <div class="header">
+    <div class="header-badge">Spark Toolkit</div>
+    <h1>Spark 官方插件签名工具</h1>
+    <div class="sub">对插件目录的内容清单做 Ed25519 签名，产出与 <code>spark-sign</code> CLI 字节级一致的 <code>signature.json</code>。规范详见 <code>插件开发/插件签名规范.md</code>。</div>
+  </div>
+
+  <div class="card">
+    <div class="seg" role="tablist" aria-label="文件来源">
+      <button type="button" id="srcGithub" class="active" data-src="github">GitHub 仓库</button>
+      <button type="button" id="srcLocal" data-src="local">本地目录</button>
+    </div>
+
+    <!-- GitHub 模式（官方仓库硬编码） -->
+    <div id="githubPane">
+      <div class="row">
+        <div>
+          <label for="branch">分支 (Branch)</label>
+          <input id="branch" value="main" autocomplete="off">
+        </div>
+        <div>
+          <label for="path">插件版本目录路径 (Path)</label>
+          <input id="path" placeholder="translate/0.2.0" autocomplete="off">
+        </div>
+      </div>
+      <div class="hint">仅签官方仓库 <code>MrHan-Yd/spark-plugins</code>（工具已硬编码，不签其他仓库）。路径指到包含 <code>plugin.json</code> 的那一层。签的是该目录下所有文件（<code>signature.json</code> 自身除外），路径以该目录为根的 POSIX 相对路径。签名对象 = 仓库内字节，请确保发布/安装的插件文件与所签仓库字节逐字节一致（勿在发布流程里做换行/编码转换，否则 host 重算哈希会判 Invalid）。</div>
+      <label for="token">GitHub Token（可选：提高 API 限额 + 允许签完直接 commit 回官方仓库）</label>
+      <input id="token" type="password" placeholder="ghp_...（留空走匿名限额 60 次/小时）" autocomplete="off">
+    </div>
+
+    <!-- 本地模式 -->
+    <div id="localPane" class="hidden">
+      <label for="folder">选择插件目录（含 plugin.json）</label>
+      <input id="folder" type="file" webkitdirectory directory multiple>
+      <div class="hint">浏览器把所选目录所有文件读入内存计算哈希，纯离线计算，不上传任何文件。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">密钥与元数据配置</div>
+    <div class="row">
+      <div>
+        <label for="keyId">key_id</label>
+        <input id="keyId" value="spark-official-v1" autocomplete="off">
+      </div>
+      <div>
+        <label for="algorithm">algorithm</label>
+        <input id="algorithm" value="ed25519" readonly>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="pluginId">plugin_id（从 plugin.json 自动读取）</label>
+        <input id="pluginId" placeholder="自动填充" autocomplete="off">
+      </div>
+      <div>
+        <label for="version">version（从 plugin.json 自动读取）</label>
+        <input id="version" placeholder="自动填充" autocomplete="off">
+      </div>
+    </div>
+    <label for="privKey">官方私钥（base64 32 字节 seed，与 spark-sign 的 .key 文件同格式）</label>
+    <textarea id="privKey" rows="2" placeholder="粘贴 keys/spark-official-v1.key 的内容" autocomplete="off"></textarea>
+    <label class="checkrow">
+      <input type="checkbox" id="remember">
+      <span>记住私钥到 localStorage（本机自用才勾；不勾则仅保存在当前页面内存）</span>
+    </label>
+  </div>
+
+  <div class="actions">
+    <button class="primary" id="signBtn" disabled>拉取文件并签名</button>
+    <button class="ghost" id="downloadBtn" disabled>下载 signature.json</button>
+    <button class="ghost" id="commitBtn" disabled>commit 回仓库</button>
+    <button class="ghost" id="copyBtn" disabled>复制 JSON</button>
+  </div>
+
+  <div class="terminal-card">
+    <div class="terminal-header">
+      <div class="terminal-dot dot-red"></div>
+      <div class="terminal-dot dot-yellow"></div>
+      <div class="terminal-dot dot-green"></div>
+      <div class="terminal-title">SIGNING CONSOLE</div>
+    </div>
+    <div id="log" aria-live="polite"></div>
+  </div>
+
+  <div class="card hidden" id="filesCard">
+    <div class="card-title">已签名文件清单（<span id="fileCount">0</span>）</div>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>path</th><th>sha256</th><th>size (bytes)</th></tr></thead>
+        <tbody id="fileBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card hidden" id="outCard">
+    <div class="card-title">生成结果：signature.json</div>
+    <textarea id="output" rows="14" readonly></textarea>
+  </div>
+</div>
+
+<script type="module">
+import * as ed from "@noble/ed25519";
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+let state = { files: [], sigJson: "", sigPath: "" }; // sigPath: 仓库内目标路径（github 模式）
+
+function log(msg, cls) {
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = msg + "\n";
+  logEl.appendChild(span);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+const ok = m => log("✓ " + m, "ok");
+const warn = m => log("! " + m, "warn");
+const fail = m => log("✗ " + m, "err");
+function clearLog(){ logEl.innerHTML = ""; }
+
+// ── base64 ↔ bytes（standard 字母表 + padding，与 base64::STANDARD 一致）──────
+function bytesToB64(bytes){
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function b64ToBytes(str){
+  const bin = atob(str.trim().replace(/\s+/g, ""));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// ── SHA-256 hex（Web Crypto）────────────────────────────────────────────────
+async function sha256Hex(bytes){
+  const h = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ── canonical bytes（逐字节移植 canon.rs::canonical_bytes）────────────────
+function canonicalBytes(pluginId, version, algorithm, keyId, files){
+  const enc = new TextEncoder();
+  const sorted = [...files].sort((a, b) => {
+    const ea = enc.encode(a.path), eb = enc.encode(b.path);
+    const n = Math.min(ea.length, eb.length);
+    for (let i = 0; i < n; i++) if (ea[i] !== eb[i]) return ea[i] - eb[i];
+    return ea.length - eb.length;
+  });
+  let s = "spark-plugin-signature-v1\n";
+  s += pluginId + "\n";
+  s += version + "\n";
+  s += algorithm + "\n";
+  s += keyId + "\n";
+  for (const f of sorted) s += f.sha256 + "  " + f.path + "\n";
+  return enc.encode(s);
+}
+
+// ── signature.json 组装（字段顺序与 sign-tool::SignatureFile 一致，2 空格缩进）──
+function buildSigJson(pluginId, version, keyId, files, sigB64){
+  const obj = {
+    schema: 1,
+    plugin_id: pluginId,
+    version: version,
+    algorithm: "ed25519",
+    key_id: keyId,
+    signed_at: new Date().toISOString().slice(0, 19) + "Z",
+    files: files.map(f => ({ path: f.path, sha256: f.sha256 })),
+    signature: sigB64,
+  };
+  return JSON.stringify(obj, null, 2);
+}
+
+// ── ISO 8601 UTC（秒精度，与 spark-sign now_iso8601_utc 一致）───────────────
+//   已在 buildSigJson 内用 toISOString().slice(0,19)+"Z" 实现。
+
+// ── 官方仓库常量：签名对象恒为 spark-plugins，不签其他仓库 ────────────────
+const OFFICIAL_OWNER = "MrHan-Yd";
+const OFFICIAL_REPO = "spark-plugins";
+
+// ── 取文件：GitHub 官方仓库 ─────────────────────────────────────────────────
+async function listGithubTree(branch, token){
+  const headers = { "Accept": "application/vnd.github+json" };
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const url = `https://api.github.com/repos/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
+  const r = await fetch(url, { headers });
+  if (r.status === 404) throw new Error(`仓库或分支不存在：${OFFICIAL_OWNER}/${OFFICIAL_REPO}@${branch}`);
+  if (!r.ok) throw new Error(`GitHub trees API ${r.status}: ${(await r.text()).slice(0,200)}`);
+  const data = await r.json();
+  // truncated=true 表示树过大被截断，缺文件会让签出的签名在 host 侧判 Invalid。直接失败而非静默继续。
+  if (data.truncated) throw new Error("仓库树过大被 GitHub 截断（truncated），本工具暂只支持中小仓库；请缩小路径范围或拆分仓库");
+  return data.tree || [];
+}
+
+async function fetchGithubFiles(){
+  const branch = $("branch").value.trim() || "main";
+  const path = $("path").value.trim().replace(/^\/+|\/+$/g, "");
+  const token = $("token").value.trim();
+  if (!path) throw new Error("请填插件版本目录路径");
+  log(`拉取 ${OFFICIAL_OWNER}/${OFFICIAL_REPO} @ ${branch} 下 ${path}/ …`);
+  const tree = await listGithubTree(branch, token);
+  const prefix = path + "/";
+  const blobs = tree.filter(e => e.type === "blob" && e.path.startsWith(prefix));
+  if (!blobs.length) throw new Error(`目录 ${path}/ 下没有文件，确认路径与分支`);
+  const files = [];
+  for (const b of blobs){
+    const rel = b.path.slice(prefix.length); // POSIX 相对路径
+    if (rel === "signature.json") continue;  // 签名不含自身
+    // raw.githubusercontent.com 发 access-control-allow-origin: *。
+    // 必须检查状态码：非 2xx 的错误页字节若混入哈希，自验仍过但 host 重算磁盘文件会判 Invalid。
+    const raw = `https://raw.githubusercontent.com/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/${branch}/${encodeURIComponent(b.path).replace(/%2F/g, "/")}`;
+    const resp = await fetch(raw);
+    if (!resp.ok) throw new Error(`拉取文件失败 ${resp.status}：${rel}（${b.path}）`);
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    files.push({ path: rel, bytes, sha256: await sha256Hex(bytes), size: bytes.length });
+  }
+  state.sigPath = path + "/signature.json";
+  return files;
+}
+
+// ── 取文件：本地目录 ─────────────────────────────────────────────────────────
+async function fetchLocalFiles(){
+  const filesInput = $("folder");
+  if (!filesInput.files.length) throw new Error("请选择插件目录");
+  const all = Array.from(filesInput.files);
+  // webkitRelativePath 形如 "plugin名/index.html"；去掉第一段目录名得插件根内相对路径
+  const rootSeg = all[0].webkitRelativePath.split("/")[0];
+  const files = [];
+  for (const f of all){
+    const rel = f.webkitRelativePath.slice(rootSeg.length + 1); // 去掉 "根目录/"
+    if (!rel || rel === "signature.json") continue;
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    files.push({ path: rel.replace(/\\/g, "/"), bytes, sha256: await sha256Hex(bytes), size: bytes.length });
+  }
+  state.sigPath = "";
+  return files;
+}
+
+// ── 读 plugin.json 填充 id/version ──────────────────────────────────────────
+function fillManifest(files){
+  const pj = files.find(f => f.path === "plugin.json");
+  if (!pj){ warn("目录下没有 plugin.json，请手动填 plugin_id / version"); return; }
+  try{
+    const m = JSON.parse(new TextDecoder().decode(pj.bytes));
+    if (m.id) $("pluginId").value = m.id;
+    if (m.version) $("version").value = m.version;
+    ok(`读取 plugin.json：id=${m.id} version=${m.version}`);
+  }catch(e){ fail("plugin.json 解析失败：" + e.message + "（请手动填）"); }
+}
+
+// ── 渲染文件清单表 ─────────────────────────────────────────────────────────
+function renderFiles(files){
+  $("fileCount").textContent = files.length;
+  const body = $("fileBody");
+  body.replaceChildren();
+  // 按路径排序展示（仅展示，签名用 canonicalBytes 内部再排）。
+  // 路径来自不可信输入（git 允许恶意文件名），一律用 textContent 纯文本写入，禁用 innerHTML，避免注入窃取私钥/token。
+  const sorted = [...files].sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
+  for (const f of sorted){
+    const tr = document.createElement("tr");
+    const td1 = tr.appendChild(document.createElement("td"));
+    td1.appendChild(document.createElement("code")).textContent = f.path;
+    const td2 = tr.appendChild(document.createElement("td"));
+    td2.appendChild(document.createElement("code")).textContent = f.sha256;
+    const td3 = tr.appendChild(document.createElement("td"));
+    td3.textContent = String(f.size);
+    body.appendChild(tr);
+  }
+  $("filesCard").classList.remove("hidden");
+}
+
+// ── 主流程：取文件 → 算哈希 → 签名 → 自验 ────────────────────────────────
+async function doSign(){
+  clearLog();
+  $("signBtn").disabled = true;
+  try{
+    const privB64 = $("privKey").value.trim();
+    if (!privB64) throw new Error("请粘贴官方私钥");
+    const seed = b64ToBytes(privB64);
+    if (seed.length !== 32) throw new Error(`私钥应解码为 32 字节，实际 ${seed.length}（确认是 spark-sign keygen 产出的 .key）`);
+
+    const src = document.querySelector(".seg button.active").dataset.src;
+    const files = src === "github" ? await fetchGithubFiles() : await fetchLocalFiles();
+    if (!files.length) throw new Error("没有可签名的文件");
+    // host 验签要求 files[] 含 plugin.json 且与磁盘双向校验；缺 plugin.json 签出来必判 Invalid，直接阻断。
+    if (!files.some(f => f.path === "plugin.json")) throw new Error("目录下必须有 plugin.json（host 验签要求清单含 plugin.json）");
+    fillManifest(files);
+    renderFiles(files);
+
+    const pluginId = $("pluginId").value.trim();
+    const version = $("version").value.trim();
+    const keyId = $("keyId").value.trim();
+    const algorithm = $("algorithm").value;
+    if (!pluginId || !version) throw new Error("plugin_id / version 不能为空");
+
+    log(`对 ${files.length} 个文件拼 canonical bytes 并签名 …`);
+    const canon = canonicalBytes(pluginId, version, algorithm, keyId, files);
+    const sig = await ed.signAsync(canon, seed);           // 64 字节，与 ed25519-dalek 一致
+    const sigB64 = bytesToB64(sig);
+    const json = buildSigJson(pluginId, version, keyId, files, sigB64);
+
+    // 自验：用私钥派生公钥验自己的签名，确保 signature.json 自洽
+    const pub = await ed.getPublicKeyAsync(seed);
+    const good = await ed.verifyAsync(sig, canon, pub);
+    if (!good) throw new Error("自验失败（不应发生），请勿使用本次签名");
+    ok("自验通过：派生公钥验证签名 OK");
+
+    state.files = files;
+    state.sigJson = json;
+    $("output").value = json;
+    $("outCard").classList.remove("hidden");
+    $("downloadBtn").disabled = false;
+    $("copyBtn").disabled = false;
+    if (src === "github" && $("token").value.trim()) $("commitBtn").disabled = false;
+
+    ok(`签名完成：${pluginId} @ ${version}，key_id=${keyId}，${files.length} 个文件，签名 ${sigB64.slice(0,16)}…`);
+    log(`signature.json 目标路径：${state.sigPath || "（本地模式，请自行放入插件目录）"}`);
+    // 同步写一次 audit 线索到控制台，便于追溯
+    console.log("[spark-sign-web]", { plugin_id: pluginId, version, key_id: keyId, files: files.length, sig_prefix: sigB64.slice(0,16), at: new Date().toISOString() });
+  }catch(e){
+    fail(e.message || String(e));
+    console.error(e);
+  }finally{
+    $("signBtn").disabled = false;
+  }
+}
+
+// ── 下载 signature.json ────────────────────────────────────────────────────
+function download(){
+  if (!state.sigJson) return;
+  const blob = new Blob([state.sigJson], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "signature.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  ok("已下载 signature.json，放到插件目录根（与 plugin.json 同级）");
+}
+
+// ── commit 回官方仓库 ──────────────────────────────────────────────────────
+async function commitBack(){
+  clearLog();
+  try{
+    const token = $("token").value.trim();
+    if (!token) throw new Error("commit 需要 GitHub Token");
+    const branch = $("branch").value.trim() || "main";
+    const path = $("path").value.trim().replace(/^\/+|\/+$/g, "");
+    const fullPath = `${path}/signature.json`;
+    const headers = { "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json" };
+
+    // 取已存在文件的 sha（覆盖更新需要）；404 视为新增
+    let sha = null;
+    const exist = await fetch(`https://api.github.com/repos/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/contents/${encodeURIComponent(fullPath)}?ref=${encodeURIComponent(branch)}`, { headers });
+    if (exist.ok){ const j = await exist.json(); sha = j.sha; }
+    else if (exist.status !== 404) warn(`查询已有文件返回 ${exist.status}，尝试按新增提交`);
+
+    const body = {
+      message: `sign: ${$("pluginId").value}@${$("version").value} (${$("keyId").value})`,
+      content: btoa(unescape(encodeURIComponent(state.sigJson))), // UTF-8 安全 base64
+      branch,
+    };
+    if (sha) body.sha = sha;
+    const r = await fetch(`https://api.github.com/repos/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/contents/${encodeURIComponent(fullPath)}`, {
+      method: "PUT", headers, body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`commit ${r.status}: ${(await r.text()).slice(0,300)}`);
+    const j = await r.json();
+    ok(`已 commit 到 ${fullPath}`);
+    log(`commit: ${j.commit.html_url || j.content?.html_url || "(见仓库)"}`);
+  }catch(e){ fail(e.message || String(e)); console.error(e); }
+}
+
+// ── 切换来源 / 记忆私钥 / 事件绑定 ─────────────────────────────────────────
+function switchSrc(src){
+  document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("active", b.dataset.src === src));
+  $("githubPane").classList.toggle("hidden", src !== "github");
+  $("localPane").classList.toggle("hidden", src !== "local");
+  $("commitBtn").disabled = true;
+  refreshSignBtn();
+}
+function refreshSignBtn(){
+  const src = document.querySelector(".seg button.active").dataset.src;
+  const ready = src === "github"
+    ? $("path").value.trim()
+    : $("folder").files.length > 0;
+  $("signBtn").disabled = !ready || !$("privKey").value.trim();
+}
+document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => switchSrc(b.dataset.src)));
+["path","privKey"].forEach(id => $(id).addEventListener("input", refreshSignBtn));
+$("folder").addEventListener("change", refreshSignBtn);
+$("signBtn").addEventListener("click", doSign);
+$("downloadBtn").addEventListener("click", download);
+$("copyBtn").addEventListener("click", () => { navigator.clipboard.writeText(state.sigJson); ok("已复制到剪贴板"); });
+$("commitBtn").addEventListener("click", commitBack);
+
+// 私钥记忆（默认不存，勾选才存 localStorage）
+const KEY_STORE = "spark_sign_privkey";
+if (localStorage.getItem(KEY_STORE)){ $("privKey").value = localStorage.getItem(KEY_STORE); $("remember").checked = true; }
+$("remember").addEventListener("change", () => {
+  if ($("remember").checked) localStorage.setItem(KEY_STORE, $("privKey").value);
+  else localStorage.removeItem(KEY_STORE);
+});
+$("privKey").addEventListener("input", () => { if ($("remember").checked) localStorage.setItem(KEY_STORE, $("privKey").value); refreshSignBtn(); });
+
+// 就绪提示
+log("就绪。填路径 / 分支 / 私钥后点「拉取文件并签名」（官方仓库已固定为 MrHan-Yd/spark-plugins）。");
+if (!crypto.subtle) fail("当前页面不是安全上下文（需 file:// 或 https://localhost），Web Crypto 不可用。");
+</script>
+</body>
+</html>

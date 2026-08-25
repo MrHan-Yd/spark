@@ -20,6 +20,7 @@ spark-ipc = { workspace = true }
 spark-index = { workspace = true }
 spark-plugin-manager = { workspace = true }
 anyhow = { workspace = true }
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

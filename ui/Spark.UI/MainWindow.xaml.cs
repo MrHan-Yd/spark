@@ -3228,6 +3228,7 @@ public sealed partial class MainWindow : Window
             PluginDirText.Text = string.IsNullOrWhiteSpace(cfg?.PluginsDir)
                 ? "默认（安装目录 / plugins）"
                 : cfg!.PluginsDir!;
+            if (cfg is not null) RefreshTrustedDevUi(cfg);
         }
         catch (Exception ex)
         {
@@ -3260,11 +3261,11 @@ public sealed partial class MainWindow : Window
             switch (outcome.Action)
             {
                 case "installed":
-                    SetPluginStatus($"已安装：{outcome.Id}");
+                    SetPluginStatus($"已安装{SignSuffix(outcome.SignState)}：{outcome.Id}");
                     break;
                 case "updated":
                     PluginWindowHost.CloseIfOpen(outcome.Id);
-                    SetPluginStatus($"已更新到 v{outcome.Version}");
+                    SetPluginStatus($"已更新到 v{outcome.Version}{SignSuffix(outcome.SignState)}");
                     break;
                 case "confirm_downgrade":
                 {
@@ -3277,12 +3278,12 @@ public sealed partial class MainWindow : Window
                     PluginWindowHost.CloseIfOpen(outcome.Id);
                     var forced = await _host.PluginInstallAsync(dir, force: true);
                     SetPluginStatus(forced.Action == "updated"
-                        ? $"已降级安装到 v{forced.Version}"
-                        : $"已安装：{forced.Id}");
+                        ? $"已降级安装到 v{forced.Version}{SignSuffix(forced.SignState)}"
+                        : $"已安装{SignSuffix(forced.SignState)}：{forced.Id}");
                     break;
                 }
                 default:
-                    SetPluginStatus($"已安装：{outcome.Id}");
+                    SetPluginStatus($"已安装{SignSuffix(outcome.SignState)}：{outcome.Id}");
                     break;
             }
             await LoadPluginsAsync();
@@ -3291,6 +3292,152 @@ public sealed partial class MainWindow : Window
         {
             App.Log("PluginInstall", ex);
             SetPluginStatus("安装失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>安装成功提示后的签名状态后缀。Invalid 在 install 阶段已被 host 拒装（抛错），不会走到这里；仍兜底返回空。</summary>
+    private static string SignSuffix(string? signState) => signState?.ToLowerInvariant() switch
+    {
+        "official" => "（官方）",
+        "third_party" => "（已签名）",
+        _ => "",
+    };
+
+    // ─── 签名安全：严格模式 + 受信任开发者（3.2/3.3）────────────────────────
+
+    private readonly ObservableCollection<TrustedDevVm> _trustedDevs = new();
+    /// <summary>回写守卫：RefreshTrustedDevUi 填充控件 + OnToggleStrictMode 失败回滚时，
+    /// 避免 IsChecked/ItemsSource 赋值触发事件回推 host（与 OnToggleBall 的 _syncing 同范式）。</summary>
+    private bool _loadingPluginConfig;
+
+    /// <summary>设置页展示用：一条受信任第三方公钥。</summary>
+    private sealed class TrustedDevVm
+    {
+        public TrustedDevVm(TrustedPubkeyDto dto)
+        {
+            KeyId = dto.KeyId;
+            Note = string.IsNullOrWhiteSpace(dto.Note) ? "（无备注）" : dto.Note;
+            PublicKeyPreview = dto.PublicKey.Length > 24
+                ? dto.PublicKey[..12] + "…" + dto.PublicKey[^12..]
+                : dto.PublicKey;
+            _dto = dto;
+        }
+
+        public string KeyId { get; }
+        public string Note { get; }
+        public string PublicKeyPreview { get; }
+        public TrustedPubkeyDto Dto => _dto;
+        private readonly TrustedPubkeyDto _dto;
+    }
+
+    /// <summary>从 host config 刷新严格模式开关与受信任开发者列表（host 为权威，UI 只展示）。</summary>
+    private void RefreshTrustedDevUi(HostConfigDto cfg)
+    {
+        _loadingPluginConfig = true;
+        try
+        {
+            StrictModeSwitch.IsChecked = cfg.StrictMode;
+            _trustedDevs.Clear();
+            foreach (var dto in cfg.TrustedPubkeys)
+                _trustedDevs.Add(new TrustedDevVm(dto));
+            TrustedDevList.ItemsSource = null;
+            TrustedDevList.ItemsSource = _trustedDevs;
+        }
+        finally { _loadingPluginConfig = false; }
+    }
+
+    private async void OnToggleStrictMode(object sender, RoutedEventArgs e)
+    {
+        if (_loadingPluginConfig) return;
+        var on = StrictModeSwitch.IsChecked == true;
+        if (!await _host.SetConfigAsync(new HostConfigUpdate { StrictMode = on }))
+        {
+            // 程序化回滚 IsChecked 会重入 Checked/Unchecked 事件（与 OnToggleBall 的
+            // _syncing 守卫同范式），用 _loadingPluginConfig 挡住重入避免无限乒乓。
+            _loadingPluginConfig = true;
+            try { StrictModeSwitch.IsChecked = !on; }
+            finally { _loadingPluginConfig = false; }
+            SetPluginStatus("严格模式设置失败（host 未接受），请重试");
+            return;
+        }
+        SetPluginStatus(on ? "严格模式已开启：仅安装带有效签名的插件" : "严格模式已关闭");
+    }
+
+    private async void OnAddTrustedDev(object sender, RoutedEventArgs e)
+    {
+        var keyId = TrustedDevKeyId.Text.Trim();
+        var pubkey = TrustedDevPubkey.Text.Trim();
+        var note = "";
+        string? err = null;
+        if (keyId.Length == 0) err = "请填 key_id（开发者公钥标识）";
+        else if (keyId.Length > 128) err = "key_id 过长（>128 字符）";
+        else if (keyId.Any(char.IsWhiteSpace)) err = "key_id 不能含空白字符";
+        else if (keyId == "spark-official-v1") err = "该 key_id 与内置官方密钥冲突，不可导入";
+        else if (_trustedDevs.Any(t => t.KeyId == keyId)) err = $"key_id「{keyId}」已存在";
+        if (err is null)
+        {
+            if (pubkey.Length == 0) err = "请粘贴 base64 公钥";
+            else
+            {
+                var compact = pubkey.Replace(" ", "").Replace("\t", "").Replace("\r", "").Replace("\n", "");
+                try
+                {
+                    var bytes = Convert.FromBase64String(compact);
+                    if (bytes.Length != 32) err = $"公钥必须解码为 32 字节（Ed25519），实际 {bytes.Length} 字节";
+                    else pubkey = compact; // 规整后回写，避免 host 侧 trim 语义差异
+                }
+                catch (FormatException) { err = "公钥不是合法 base64"; }
+            }
+        }
+        if (err is not null)
+        {
+            TrustedDevStatus.Text = err;
+            TrustedDevStatus.Visibility = Visibility.Visible;
+            return;
+        }
+
+        var dto = new TrustedPubkeyDto { KeyId = keyId, PublicKey = pubkey, Note = note };
+        var next = _trustedDevs.Select(t => t.Dto).Append(dto).ToList();
+        if (!await PushTrustedDevsAsync(next))
+        {
+            TrustedDevStatus.Text = "添加失败（host 拒绝该公钥，请检查格式）";
+            TrustedDevStatus.Visibility = Visibility.Visible;
+            return;
+        }
+        _trustedDevs.Add(new TrustedDevVm(dto));
+        TrustedDevKeyId.Text = "";
+        TrustedDevPubkey.Text = "";
+        TrustedDevStatus.Text = $"已信任开发者「{keyId}」：其签名的插件将显示\"已签名\"";
+        TrustedDevStatus.Visibility = Visibility.Visible;
+    }
+
+    private async void OnRemoveTrustedDev(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { DataContext: TrustedDevVm vm }) return;
+        var next = _trustedDevs.Where(t => t != vm).Select(t => t.Dto).ToList();
+        if (!await PushTrustedDevsAsync(next))
+        {
+            TrustedDevStatus.Text = $"移除「{vm.KeyId}」失败，请重试";
+            TrustedDevStatus.Visibility = Visibility.Visible;
+            return;
+        }
+        _trustedDevs.Remove(vm);
+        TrustedDevStatus.Text = $"已移除受信任开发者「{vm.KeyId}」";
+        TrustedDevStatus.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>整表推送受信任开发者到 host（host.set_config 全量替换并整体校验）。</summary>
+    private async Task<bool> PushTrustedDevsAsync(List<TrustedPubkeyDto> list)
+    {
+        try
+        {
+            return await _host.SetConfigAsync(new HostConfigUpdate { TrustedPubkeys = list });
+        }
+        catch (Exception ex)
+        {
+            App.Log("SetTrustedDevs", ex);
+            SetPluginStatus("受信任开发者设置失败：" + ex.Message);
+            return false;
         }
     }
 
@@ -3344,6 +3491,16 @@ public sealed partial class MainWindow : Window
         if (row.Enabled == row.SyncedEnabled) return;
 
         var target = row.Enabled;
+
+        // 签名失效的插件只允许"关闭"，不允许"启用"：阻止 Off→On 的拨动并回滚，
+        // 但保留 On→Off（用户停用失效插件是最直接的处置，不能被锁死）。
+        if (target && row.SignState == PluginSignState.Invalid)
+        {
+            row.Enabled = row.SyncedEnabled;
+            SetPluginStatus($"{row.Name} 签名校验失败，无法启用");
+            return;
+        }
+
         if (await _host.PluginToggleAsync(row.Id, target))
         {
             row.SyncedEnabled = target;
