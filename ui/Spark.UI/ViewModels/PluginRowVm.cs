@@ -125,6 +125,27 @@ public sealed class PluginRowVm : INotifyPropertyChanged
     public Visibility PermissionsVisibility =>
         Permissions.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
 
+    /// <summary>卡片是否展开显示详情（权限/关键字/调试/卸载）。默认收起。</summary>
+    public bool IsExpanded
+    {
+        get => _isExpanded;
+        set
+        {
+            if (_isExpanded == value) return;
+            _isExpanded = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(DetailVisibility));
+            OnPropertyChanged(nameof(ExpandGlyph));
+        }
+    }
+    private bool _isExpanded;
+
+    /// <summary>详情区可见性，绑定到 XAML 的 Visibility（IsExpanded → Visible/Collapsed）。</summary>
+    public Visibility DetailVisibility => IsExpanded ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>展开/收起箭头字形；展开时朝上，收起时朝下。</summary>
+    public string ExpandGlyph => IsExpanded ? "\uE70E" : "\uE70D";
+
     private bool _enabled;
     public bool Enabled
     {

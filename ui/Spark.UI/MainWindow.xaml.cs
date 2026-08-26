@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
@@ -3237,6 +3238,31 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>ListView 容器上屏：SwitchStyle 的 ON 态颜色靠代码驱动，
+    /// 容器回收/滚动复用时需把开关刷到正确初始态（无动画）。</summary>
+    private void OnPluginItemRealized(ListViewBase sender, ContainerContentChangingEventArgs args)
+    {
+        if (args.ItemContainer is not ListViewItem container) return;
+        if (args.Item is not PluginRowVm row) return;
+        if (FindToggleInContainer(container) is not { } toggle) return;
+        // 容器复用时 IsChecked 绑定已是正确值，但轨道颜色/滑块位置需手动同步
+        AnimateSwitchToggle(toggle, row.Enabled, animate: false);
+    }
+
+    /// <summary>在 ListViewItem 视觉树里找 ToggleButton（FindDescendant 在 1.6 不可用，手写遍历）。</summary>
+    private static ToggleButton? FindToggleInContainer(FrameworkElement root)
+    {
+        var count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is ToggleButton tb) return tb;
+            if (child is FrameworkElement fe && FindToggleInContainer(fe) is { } nested)
+                return nested;
+        }
+        return null;
+    }
+
     private void SetPluginStatus(string? text)
     {
         PluginStatus.Text = text ?? "";
@@ -3344,6 +3370,21 @@ public sealed partial class MainWindow : Window
             TrustedDevList.ItemsSource = _trustedDevs;
         }
         finally { _loadingPluginConfig = false; }
+    }
+
+    /// <summary>进入"插件安全"tab 时拉取 host 配置刷新严格模式开关与受信任开发者列表。</summary>
+    private async Task RefreshPluginSecurityAsync()
+    {
+        try
+        {
+            var cfg = await _host.GetConfigAsync();
+            if (cfg is not null) RefreshTrustedDevUi(cfg);
+        }
+        catch (Exception ex)
+        {
+            App.Log("RefreshPluginSecurity", ex);
+            SetPluginStatus("加载安全设置失败：" + ex.Message);
+        }
     }
 
     private async void OnToggleStrictMode(object sender, RoutedEventArgs e)
@@ -3484,10 +3525,95 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void OnPluginToggled(object sender, RoutedEventArgs e)
+    /// <summary>卡片点击：切换展开/收起，展开时对详情区播 Opacity+位移动画、箭头旋转 180°。</summary>
+    private void OnTogglePluginExpand(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
-        // 容器虚拟化：ToggleSwitch 上屏时绑定会补触发一次 Toggled，值与 host 一致就是回声。
+        row.IsExpanded = !row.IsExpanded;
+
+        if (sender is not FrameworkElement fe) return;
+
+        // 箭头旋转过渡：展开 180°、收起 0°
+        var rotate = FindNamed<RotateTransform>(fe, "ExpandArrowRotate");
+        if (rotate is not null) AnimateArrowRotate(rotate, row.IsExpanded ? 180 : 0);
+
+        // 展开时播详情区淡入动画（收起时 Visibility 瞬时消失，无动画）
+        if (!row.IsExpanded) return;
+        // 从 sender 逐级向上，在每个祖先子树里找命名详情区 PluginDetailPanel，
+        // 找到即播动画。逐级向上避免误停在中间容器（标题行右侧 StackPanel 等也继承同一 DataContext）。
+        var cur = fe;
+        while (cur is not null)
+        {
+            var detail = FindNamed<StackPanel>(cur, "PluginDetailPanel");
+            if (detail is not null && detail.Visibility == Visibility.Visible)
+            {
+                AnimateDetailExpand(detail);
+                return;
+            }
+            cur = VisualTreeHelper.GetParent(cur) as FrameworkElement;
+        }
+    }
+
+    /// <summary>箭头旋转：180ms EaseOut。</summary>
+    private static void AnimateArrowRotate(RotateTransform rotate, double toAngle)
+    {
+        var sb = new Storyboard();
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        var a = new DoubleAnimation { From = rotate.Angle, To = toAngle, Duration = new Duration(TimeSpan.FromMilliseconds(180)), EasingFunction = ease };
+        Storyboard.SetTarget(a, rotate);
+        Storyboard.SetTargetProperty(a, "Angle");
+        sb.Children.Add(a);
+        sb.Begin();
+    }
+
+    /// <summary>在元素子树里按 x:Name 查找命名元素（模板内 x:Name 在模板作用域，需遍历视觉树）。</summary>
+    private static T? FindNamed<T>(FrameworkElement root, string name) where T : DependencyObject
+    {
+        var count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is T t && child is FrameworkElement fe && fe.Name == name) return t;
+            if (child is FrameworkElement feChild && FindNamed<T>(feChild, name) is { } nested) return nested;
+        }
+        return null;
+    }
+
+    /// <summary>详情区淡入：Opacity 0→1 + Y 8→0，180ms。</summary>
+    private static void AnimateDetailExpand(FrameworkElement detail)
+    {
+        detail.Opacity = 0;
+        var shift = detail.RenderTransform as TranslateTransform;
+        if (shift is null)
+        {
+            shift = new TranslateTransform();
+            detail.RenderTransform = shift;
+        }
+        shift.Y = 8;
+
+        var sb = new Storyboard();
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        var d = new Duration(TimeSpan.FromMilliseconds(180));
+        var op = new DoubleAnimation { From = 0, To = 1, Duration = d, EasingFunction = ease };
+        Storyboard.SetTarget(op, detail);
+        Storyboard.SetTargetProperty(op, "Opacity");
+        sb.Children.Add(op);
+        var y = new DoubleAnimation { From = 8, To = 0, Duration = d, EasingFunction = ease };
+        Storyboard.SetTarget(y, shift);
+        Storyboard.SetTargetProperty(y, "Y");
+        sb.Children.Add(y);
+        sb.Begin();
+    }
+
+    private async void OnPluginToggled(object sender, RoutedEventArgs e)
+    {
+        if (sender is not ToggleButton toggle) return;
+        if (toggle.DataContext is not PluginRowVm row) return;
+        var on = toggle.IsChecked == true;
+        // 驱动 SwitchStyle 的滑块位移 + 轨道颜色（与通用页开关同一动画路径）
+        AnimateSwitchToggle(toggle, on, animate: true);
+
+        // 容器虚拟化：ToggleButton 上屏时绑定会补触发一次 Checked/Unchecked，值与 host 一致就是回声。
         if (row.Enabled == row.SyncedEnabled) return;
 
         var target = row.Enabled;
@@ -3497,6 +3623,7 @@ public sealed partial class MainWindow : Window
         if (target && row.SignState == PluginSignState.Invalid)
         {
             row.Enabled = row.SyncedEnabled;
+            AnimateSwitchToggle(toggle, row.SyncedEnabled, animate: true);
             SetPluginStatus($"{row.Name} 签名校验失败，无法启用");
             return;
         }
@@ -3506,11 +3633,11 @@ public sealed partial class MainWindow : Window
             row.SyncedEnabled = target;
             // 禁用后旧窗口若还开着，页面仍能调 spark.*（host 只按 granted 鉴权，不看 enabled），必须关掉。
             if (!target) PluginWindowHost.CloseIfOpen(row.Id);
-            SetPluginStatus($"{row.Name} 已{(target ? "启用" : "禁用")}");
         }
         else
         {
             row.Enabled = row.SyncedEnabled;   // 回滚开关，避免 UI 与 host 不一致
+            AnimateSwitchToggle(toggle, row.SyncedEnabled, animate: true);
             SetPluginStatus($"{row.Name} 状态更新失败");
         }
     }
@@ -3603,6 +3730,443 @@ public sealed partial class MainWindow : Window
             App.Log("PickFolder", ex);
             SetPluginStatus("打开文件夹选择器失败：" + ex.Message);
             return null;
+        }
+    }
+
+    // ==================== 插件市场 ====================
+
+    private readonly List<RegistryPluginViewDto> _marketPlugins = new();
+    private readonly ObservableCollection<CustomRepoUrlVm> _customRepoUrls = new();
+    private bool _marketLoaded;
+    private bool _loadingMarket;
+    /// <summary>当前仓库索引（zipball_url 等元数据来源），供安装时复用。</summary>
+    private RegistryIndexDto? _currentRegistry;
+
+    private sealed class CustomRepoUrlVm : INotifyPropertyChanged
+    {
+        private string _url = "";
+        public string Url
+        {
+            get => _url;
+            set { if (_url != value) { _url = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Url))); } }
+        }
+        public event PropertyChangedEventHandler? PropertyChanged;
+    }
+
+    private void OnSelectInstalledPluginsTab(object sender, RoutedEventArgs e)
+    {
+        ActivatePluginsSubPane(SubPaneInstalledPlugins, TabInstalledPluginsBtn);
+    }
+
+    private async void OnSelectPluginSecurityTab(object sender, RoutedEventArgs e)
+    {
+        ActivatePluginsSubPane(SubPanePluginSecurity, TabPluginSecurityBtn);
+        // 安全页数据不依赖已安装 tab；进入即拉一次 host config 刷新开关与公钥列表
+        await RefreshPluginSecurityAsync();
+    }
+
+    private async void OnSelectMarketplaceTab(object sender, RoutedEventArgs e)
+    {
+        ActivatePluginsSubPane(SubPaneMarketplace, TabMarketplaceBtn);
+
+        if (!_marketLoaded)
+        {
+            await InitMarketplaceAsync();
+        }
+    }
+
+    private bool _subPaneAnimating;
+    private int _subPaneAnimGen;
+
+    /// <summary>三个插件子 tab 共用的面板切换：旧面板淡出上移 → 新面板淡入升起，加过渡动画。</summary>
+    private void ActivatePluginsSubPane(StackPanel paneToShow, Button tabToActivate)
+    {
+        // 按钮态先切换（无动画开销）
+        SetPluginsTabButtonState(TabInstalledPluginsBtn, tabToActivate == TabInstalledPluginsBtn);
+        SetPluginsTabButtonState(TabPluginSecurityBtn, tabToActivate == TabPluginSecurityBtn);
+        SetPluginsTabButtonState(TabMarketplaceBtn, tabToActivate == TabMarketplaceBtn);
+
+        var current = CurrentSubPane();
+        if (current == paneToShow) return;  // 重复点当前项，不动画
+
+        if (current is null || _subPaneAnimating)
+        {
+            // 无当前面板或动画中 → 瞬时落定
+            ApplySubPaneInstant(paneToShow);
+            return;
+        }
+
+        StartSubPaneTransition(current, paneToShow);
+    }
+
+    private StackPanel? CurrentSubPane()
+    {
+        if (SubPaneInstalledPlugins.Visibility == Visibility.Visible) return SubPaneInstalledPlugins;
+        if (SubPanePluginSecurity.Visibility == Visibility.Visible) return SubPanePluginSecurity;
+        if (SubPaneMarketplace.Visibility == Visibility.Visible) return SubPaneMarketplace;
+        return null;
+    }
+
+    private TranslateTransform SubPaneShiftOf(StackPanel p) => p switch
+    {
+        _ when p == SubPaneInstalledPlugins => SubPaneInstalledPluginsShift,
+        _ when p == SubPanePluginSecurity => SubPanePluginSecurityShift,
+        _ when p == SubPaneMarketplace => SubPaneMarketplaceShift,
+        _ => throw new ArgumentException("unknown subpane", nameof(p)),
+    };
+
+    private void ApplySubPaneInstant(StackPanel target)
+    {
+        _subPaneAnimGen++;
+        _subPaneAnimating = false;
+        foreach (var p in new[] { SubPaneInstalledPlugins, SubPanePluginSecurity, SubPaneMarketplace })
+        {
+            p.Visibility = p == target ? Visibility.Visible : Visibility.Collapsed;
+            p.Opacity = 1;
+            SubPaneShiftOf(p).Y = 0;
+        }
+    }
+
+    /// <summary>旧子面板淡出（120ms 上移 4px）→ 新子面板淡入（160ms 从下方 8px 升起）。</summary>
+    private void StartSubPaneTransition(StackPanel current, StackPanel target)
+    {
+        var gen = ++_subPaneAnimGen;
+        _subPaneAnimating = true;
+        var curShift = SubPaneShiftOf(current);
+        var tgtShift = SubPaneShiftOf(target);
+
+        current.Opacity = 1;
+        curShift.Y = 0;
+        var outSb = new Storyboard();
+        SubPaneFade(outSb, current, curShift, 1, 0, 0, -4, 120, new CubicEase { EasingMode = EasingMode.EaseIn });
+        outSb.Completed += (_, _) =>
+        {
+            if (gen != _subPaneAnimGen) return;
+            current.Visibility = Visibility.Collapsed;
+            curShift.Y = 0;
+
+            target.Visibility = Visibility.Visible;
+            target.Opacity = 0;
+            tgtShift.Y = 8;
+            var inSb = new Storyboard();
+            SubPaneFade(inSb, target, tgtShift, 0, 1, 8, 0, 160, new CubicEase { EasingMode = EasingMode.EaseOut });
+            inSb.Completed += (_, _) =>
+            {
+                if (gen != _subPaneAnimGen) return;
+                target.Opacity = 1;
+                tgtShift.Y = 0;
+                _subPaneAnimating = false;
+            };
+            inSb.Begin();
+        };
+        outSb.Begin();
+    }
+
+    private static void SubPaneFade(Storyboard sb, DependencyObject panel, DependencyObject shift,
+        double op0, double op1, double y0, double y1, int ms, EasingFunctionBase ease)
+    {
+        var d = new Duration(TimeSpan.FromMilliseconds(ms));
+        var aOp = new DoubleAnimation { From = op0, To = op1, Duration = d, EasingFunction = ease };
+        Storyboard.SetTarget(aOp, panel);
+        Storyboard.SetTargetProperty(aOp, "Opacity");
+        sb.Children.Add(aOp);
+        var aY = new DoubleAnimation { From = y0, To = y1, Duration = d, EasingFunction = ease };
+        Storyboard.SetTarget(aY, shift);
+        Storyboard.SetTargetProperty(aY, "Y");
+        sb.Children.Add(aY);
+    }
+
+    private void SetPluginsTabButtonState(Button btn, bool active)
+    {
+        btn.Background = active
+            ? (Brush)Root.Resources["AccentSoftBrush"]
+            : new SolidColorBrush(Colors.Transparent);
+        btn.Foreground = active
+            ? (Brush)Root.Resources["TextPrimaryBrush"]
+            : (Brush)Root.Resources["TextSecondaryBrush"];
+        // 不加粗：SemiBold ↔ Normal 切换会让文字宽度变化抖动，统一用 Normal
+        btn.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
+    }
+
+    private async Task InitMarketplaceAsync()
+    {
+        try
+        {
+            var cfg = await _host.GetConfigAsync();
+            PopulateMarketSourceCombo(cfg?.PluginRegistryUrls ?? new List<string>());
+            _marketLoaded = true;
+            await LoadMarketplaceAsync();
+        }
+        catch (Exception ex)
+        {
+            App.Log("InitMarketplace", ex);
+            SetMarketStatus("初始化市场失败：" + ex.Message, isError: true);
+        }
+    }
+
+    private void PopulateMarketSourceCombo(List<string> customUrls)
+    {
+        MarketSourceCombo.Items.Clear();
+        MarketSourceCombo.Items.Add("官方仓库 (GitHub)");
+
+        _customRepoUrls.Clear();
+        foreach (var url in customUrls)
+        {
+            if (!string.IsNullOrWhiteSpace(url))
+            {
+                MarketSourceCombo.Items.Add(url.Trim());
+                _customRepoUrls.Add(new CustomRepoUrlVm { Url = url.Trim() });
+            }
+        }
+        MarketCustomUrlList.ItemsSource = _customRepoUrls;
+        MarketSourceCombo.SelectedIndex = 0;
+    }
+
+    private void OnToggleManageCustomRepos(object sender, RoutedEventArgs e)
+    {
+        var vis = MarketCustomReposPanel.Visibility == Visibility.Visible;
+        MarketCustomReposPanel.Visibility = vis ? Visibility.Collapsed : Visibility.Visible;
+        MarketCustomManageBtn.Content = vis ? "管理仓库…" : "收起配置";
+    }
+
+    private void OnAddCustomRepoUrl(object sender, RoutedEventArgs e)
+    {
+        _customRepoUrls.Add(new CustomRepoUrlVm { Url = "https://" });
+    }
+
+    private void OnRemoveCustomRepoUrl(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is CustomRepoUrlVm item)
+        {
+            _customRepoUrls.Remove(item);
+        }
+    }
+
+    private async void OnSaveCustomRepoUrls(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var urls = _customRepoUrls
+                .Select(x => x.Url.Trim())
+                .Where(u => !string.IsNullOrEmpty(u) && (u.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || u.StartsWith("https://", StringComparison.OrdinalIgnoreCase)))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var update = new HostConfigUpdate { PluginRegistryUrls = urls };
+            if (await _host.SetConfigAsync(update))
+            {
+                PopulateMarketSourceCombo(urls);
+                MarketCustomReposPanel.Visibility = Visibility.Collapsed;
+                MarketCustomManageBtn.Content = "管理仓库…";
+                SetMarketStatus("仓库地址配置已保存", isError: false);
+            }
+            else
+            {
+                SetMarketStatus("保存仓库配置失败", isError: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log("SaveCustomRepoUrls", ex);
+            SetMarketStatus("保存异常：" + ex.Message, isError: true);
+        }
+    }
+
+    private async void OnMarketSourceChanged(object sender, SelectionChangedEventArgs e)
+    {
+        var idx = MarketSourceCombo.SelectedIndex;
+        if (idx < 0) return;
+
+        MarketCustomWarning.Visibility = idx > 0 ? Visibility.Visible : Visibility.Collapsed;
+        await LoadMarketplaceAsync();
+    }
+
+    private async void OnMarketRefresh(object sender, RoutedEventArgs e)
+    {
+        await LoadMarketplaceAsync();
+    }
+
+    private void SetMarketStatus(string? text, bool isError = false)
+    {
+        MarketStatusText.Text = text ?? "";
+        MarketStatusText.Foreground = isError
+            ? new SolidColorBrush(Color.FromArgb(255, 255, 69, 58))
+            : (Brush)Root.Resources["TextSecondaryBrush"];
+        MarketStatusText.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private async Task LoadMarketplaceAsync()
+    {
+        if (_loadingMarket) return;
+        _loadingMarket = true;
+
+        MarketLoadingWrap.Visibility = Visibility.Visible;
+        MarketEmpty.Visibility = Visibility.Collapsed;
+        MarketList.Visibility = Visibility.Collapsed;
+        SetMarketStatus(null);
+
+        var idx = MarketSourceCombo.SelectedIndex;
+        var url = (idx > 0 && idx < MarketSourceCombo.Items.Count)
+            ? MarketSourceCombo.Items[idx]?.ToString() ?? RegistryService.OfficialRegistryUrl
+            : RegistryService.OfficialRegistryUrl;
+
+        try
+        {
+            var index = await RegistryService.FetchIndexAsync(url);
+            _currentRegistry = index;
+            var installed = await _host.PluginListAsync();
+
+            _marketPlugins.Clear();
+
+            foreach (var plugin in index.Plugins)
+            {
+                var targetVer = plugin.Versions.FirstOrDefault(v => v.Version == plugin.Latest)
+                    ?? new RegistryVersionDto { Version = plugin.Latest, Path = $"{plugin.Id}/{plugin.Latest}" };
+
+                var local = installed.FirstOrDefault(p => string.Equals(p.Id, plugin.Id, StringComparison.OrdinalIgnoreCase));
+                var localVer = local?.Version;
+
+                var canUpdate = false;
+                var canDowngrade = false;
+                if (!string.IsNullOrEmpty(localVer))
+                {
+                    var cmp = RegistryService.CompareVersion(targetVer.Version, localVer);
+                    canUpdate = cmp > 0;
+                    canDowngrade = cmp < 0;
+                }
+
+                _marketPlugins.Add(new RegistryPluginViewDto
+                {
+                    Plugin = plugin,
+                    TargetVersion = targetVer,
+                    InstalledVersion = localVer,
+                    CanUpdate = canUpdate,
+                    CanDowngrade = canDowngrade,
+                });
+            }
+
+            MarketList.ItemsSource = null;
+            MarketList.ItemsSource = _marketPlugins;
+
+            var empty = _marketPlugins.Count == 0;
+            MarketEmpty.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
+            MarketList.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
+        }
+        catch (Exception ex)
+        {
+            App.Log("LoadMarketplace", ex);
+            SetMarketStatus("无法连接仓库或解析索引：" + ex.Message, isError: true);
+            // 抓取失败：清空残留索引与列表，避免用旧仓库元数据安装新仓库插件
+            _currentRegistry = null;
+            _marketPlugins.Clear();
+            MarketList.ItemsSource = null;
+            MarketList.ItemsSource = _marketPlugins;
+            MarketEmpty.Visibility = Visibility.Visible;
+        }
+        finally
+        {
+            MarketLoadingWrap.Visibility = Visibility.Collapsed;
+            _loadingMarket = false;
+        }
+    }
+
+    private async void OnInstallFromMarketplace(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not RegistryPluginViewDto item) return;
+        if (item.IsInstalling) return;
+
+        if (item.IsNative)
+        {
+            var confirmNative = await ConfirmDestructiveAsync(
+                $"插件「{item.Name}」为原生插件 (Native)\n拥有操作系统完整执行权限。确认安装？");
+            if (!confirmNative) return;
+        }
+
+        item.IsInstalling = true;
+        SetMarketStatus($"正在下载 {item.Name} v{item.TargetVersion.Version}…", isError: false);
+        MarketList.ItemsSource = null;
+        MarketList.ItemsSource = _marketPlugins;
+
+        string? tempDir = null;
+        try
+        {
+            if (!string.IsNullOrEmpty(item.TargetVersion.Url))
+            {
+                // 直链下载预打包 zip
+                tempDir = await RegistryService.DownloadDirectZipAsync(
+                    item.TargetVersion.Url,
+                    item.TargetVersion.Sha256);
+            }
+            else
+            {
+                // GitHub 仓库 zipball 提取模式：优先读索引声明的 zipball_url，回退官方地址。
+                // 第三方仓库的 zipball_url 可能过期/写错，下载失败时自动回退官方常量重试一次。
+                var zipballUrl = !string.IsNullOrWhiteSpace(_currentRegistry?.ZipballUrl)
+                    ? _currentRegistry.ZipballUrl
+                    : RegistryService.OfficialZipballUrl;
+                var verPath = item.TargetVersion.Path ?? $"{item.Id}/{item.TargetVersion.Version}";
+
+                try
+                {
+                    tempDir = await RegistryService.DownloadAndExtractZipballAsync(
+                        zipballUrl,
+                        verPath,
+                        expectedSha256: null);
+                }
+                catch (HttpRequestException ex) when (zipballUrl != RegistryService.OfficialZipballUrl)
+                {
+                    App.Log("InstallZipballFallback", ex);
+                    tempDir = await RegistryService.DownloadAndExtractZipballAsync(
+                        RegistryService.OfficialZipballUrl,
+                        verPath,
+                        expectedSha256: null);
+                }
+            }
+
+            var outcome = await _host.PluginInstallAsync(tempDir);
+            switch (outcome.Action)
+            {
+                case "installed":
+                    SetMarketStatus($"已安装{SignSuffix(outcome.SignState)}：{item.Name} v{outcome.Version}");
+                    break;
+                case "updated":
+                    PluginWindowHost.CloseIfOpen(outcome.Id);
+                    SetMarketStatus($"已更新到 v{outcome.Version}{SignSuffix(outcome.SignState)}");
+                    break;
+                case "confirm_downgrade":
+                {
+                    var msg = $"检测到已安装较新版本\n当前已装 v{outcome.PreviousVersion}，是否覆盖降级安装 v{outcome.Version}？";
+                    if (!await ConfirmDestructiveAsync(msg))
+                    {
+                        SetMarketStatus("已取消覆盖");
+                        break;
+                    }
+                    PluginWindowHost.CloseIfOpen(outcome.Id);
+                    var forced = await _host.PluginInstallAsync(tempDir, force: true);
+                    SetMarketStatus(forced.Action == "updated"
+                        ? $"已降级安装到 v{forced.Version}{SignSuffix(forced.SignState)}"
+                        : $"已安装{SignSuffix(forced.SignState)}：{item.Name}");
+                    break;
+                }
+                default:
+                    SetMarketStatus($"安装完成：{item.Name}");
+                    break;
+            }
+
+            await LoadPluginsAsync();
+            await LoadMarketplaceAsync();
+        }
+        catch (Exception ex)
+        {
+            App.Log("InstallFromMarketplace", ex);
+            SetMarketStatus($"安装 {item.Name} 失败：" + ex.Message, isError: true);
+        }
+        finally
+        {
+            RegistryService.CleanupTemp(tempDir);
+            item.IsInstalling = false;
+            MarketList.ItemsSource = null;
+            MarketList.ItemsSource = _marketPlugins;
         }
     }
 

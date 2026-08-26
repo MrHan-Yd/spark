@@ -69,6 +69,7 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
     };
 
     let hub = Arc::new(hub);
+    #[allow(static_mut_refs)]
     unsafe {
         HOST_ARC = Some(host.clone());
         HUB_ARC = Some(hub.clone());
@@ -117,6 +118,7 @@ pub fn run(host: SharedHost, hub: UiHub, icon_path: Option<PathBuf>) -> Result<(
         let _ = KillTimer(Some(hwnd), INDEX_TIMER_ID);
     };
     Hotkey::unregister(hwnd, HOTKEY_ID_TOGGLE);
+    #[allow(static_mut_refs)]
     unsafe {
         HOST_ARC = None;
         HUB_ARC = None;
@@ -179,6 +181,8 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_TIMER => {
             if wparam.0 as usize == INDEX_TIMER_ID {
+                // HOST_ARC 仅在 run() 头尾写入，此处与消息循环同线程，无并发改写。
+                #[allow(static_mut_refs)]
                 if let Some(host) = unsafe { HOST_ARC.as_ref() } {
                     crate::index_watch::poll(host);
                 }
@@ -203,6 +207,7 @@ fn on_toggle() {
     // 只在 UI 进程完全不存在时才拉起，避免每次热键都重复 spawn。
     // 若 UI 在运行但没连 pipe（演示模式），client_count 为 0 —— 此时
     // 再 spawn 会产生多个 UI 实例抢同一个 auto-reset 事件，热键时灵时不灵。
+    #[allow(static_mut_refs)]
     if let Some(hub) = unsafe { HUB_ARC.as_ref() } {
         let n = hub.client_count();
         info!(ui_clients = n, "toggle → event");
@@ -233,6 +238,7 @@ fn try_spawn_ui() {
 fn toggle_hotkey_pause(hwnd: HWND) {
     let paused = HOTKEY_PAUSED.fetch_xor(true, Ordering::SeqCst);
     let now_paused = !paused;
+    #[allow(static_mut_refs)]
     if let Some(host) = unsafe { HOST_ARC.as_ref() } {
         if let Ok(mut g) = host.lock() {
             g.set_hotkey_enabled(!now_paused);
@@ -262,6 +268,7 @@ fn rehook_hotkey(hwnd: HWND) {
         info!("hotkey paused; re-register deferred until resumed");
         return;
     }
+    #[allow(static_mut_refs)]
     let Some(host) = (unsafe { HOST_ARC.as_ref() }) else {
         return;
     };

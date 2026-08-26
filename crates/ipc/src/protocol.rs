@@ -178,6 +178,9 @@ pub struct SetConfigParams {
     /// host 侧逐条校验（base64 32 字节公钥等），任一条非法即整体拒绝本次更新。
     #[serde(default)]
     pub trusted_pubkeys: Option<Vec<TrustedPubkeyEntry>>,
+    /// 全量替换插件市场仓库 URL 列表（规范 §6 / §7）。缺省/null 不动。
+    #[serde(default)]
+    pub plugin_registry_urls: Option<Vec<String>>,
 }
 
 /// 一条用户导入的受信任三方密钥（`HostConfig.trusted_pubkeys` 的元素）。

@@ -77,6 +77,8 @@ impl UiHub {
     /// 注意：host 的管道句柄是同步的（CreateNamedPipeW 未带 FILE_FLAG_OVERLAPPED），
     /// 若 client_read_loop 的 ReadFile 正挂起，同句柄 WriteFile 会被阻塞到读方向返回
     /// （实测 11-30s），因此热路径（如退出通知）应改用命名事件而非此广播。
+    /// 当前无调用方，保留备用（未来若 pipe 改异步可重新启用）。
+    #[allow(dead_code)]
     pub fn broadcast(&self, method: &str) {
         let line = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\"}}\n");
         if let Ok(mut g) = self.inner.lock() {
@@ -278,6 +280,7 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             let resp = JsonRpcResponse::result(id, serde_json::json!({"ok": true}));
             reply(pipe, &resp)?;
         }
+        #[allow(static_mut_refs)]
         unsafe {
             if let Some(hwnd) = crate::win_loop::EXIT_HWND {
                 let _ = PostMessageW(
@@ -391,6 +394,9 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                     // apply_trusted_pubkeys 已在上面整体校验通过；这里只落盘。
                     g.config.trusted_pubkeys = entries;
                 }
+                if let Some(urls) = params.plugin_registry_urls {
+                    g.config.plugin_registry_urls = urls;
+                }
                 let changed = g.config != old;
                 if changed {
                     if let Err(e) = g.config.save() {
@@ -405,6 +411,7 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             };
             if hotkey_changed {
                 // 重注册必须走主消息循环线程（与 HOTKEY_PAUSED/托盘开关同一路径）
+                #[allow(static_mut_refs)]
                 unsafe {
                     if let Some(hwnd) = crate::win_loop::EXIT_HWND {
                         let _ = PostMessageW(

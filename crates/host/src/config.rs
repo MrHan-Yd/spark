@@ -30,6 +30,9 @@ pub struct HostConfig {
     /// 运行时可信表，命中即 `SignState::ThirdParty`；恒不能产生"官方"。
     #[serde(default)]
     pub trusted_pubkeys: Vec<TrustedPubkeyEntry>,
+    /// 插件市场仓库 URL 列表（规范 §6 / §7）。空列表 = 仅官方仓库。
+    #[serde(default)]
+    pub plugin_registry_urls: Vec<String>,
 }
 
 fn default_hotkey() -> String {
@@ -54,6 +57,7 @@ impl Default for HostConfig {
             hotkey_enabled: true,
             strict_mode: false,
             trusted_pubkeys: Vec::new(),
+            plugin_registry_urls: Vec::new(),
         }
     }
 }

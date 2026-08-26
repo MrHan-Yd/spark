@@ -540,6 +540,9 @@ public sealed class HostConfigDto
     /// <summary>用户导入的"受信任开发者"三方公钥表（3.3）。</summary>
     [JsonPropertyName("trusted_pubkeys")]
     public List<TrustedPubkeyDto> TrustedPubkeys { get; set; } = new();
+    /// <summary>插件市场仓库 URL 列表（空列表 = 仅官方仓库）。</summary>
+    [JsonPropertyName("plugin_registry_urls")]
+    public List<string> PluginRegistryUrls { get; set; } = new();
 }
 
 public sealed class TrustedPubkeyDto
@@ -570,6 +573,9 @@ public sealed class HostConfigUpdate
     /// <summary>全量替换受信任开发者表；null 表示不动。</summary>
     [JsonPropertyName("trusted_pubkeys")]
     public List<TrustedPubkeyDto>? TrustedPubkeys { get; set; }
+    /// <summary>全量替换插件市场仓库 URL 列表；null 表示不动。</summary>
+    [JsonPropertyName("plugin_registry_urls")]
+    public List<string>? PluginRegistryUrls { get; set; }
 
     public HostConfigUpdate Clone() => new()
     {
@@ -579,6 +585,7 @@ public sealed class HostConfigUpdate
         LaunchOnStartup = LaunchOnStartup,
         StrictMode = StrictMode,
         TrustedPubkeys = TrustedPubkeys,
+        PluginRegistryUrls = PluginRegistryUrls,
     };
 
     public bool Equals(HostConfigUpdate? other) => other is not null
@@ -587,7 +594,8 @@ public sealed class HostConfigUpdate
         && HideOnExecute == other.HideOnExecute
         && LaunchOnStartup == other.LaunchOnStartup
         && StrictMode == other.StrictMode
-        && TrustedPubkeys == other.TrustedPubkeys;
+        && TrustedPubkeys == other.TrustedPubkeys
+        && PluginRegistryUrls == other.PluginRegistryUrls;
 }
 
 public static class DemoData

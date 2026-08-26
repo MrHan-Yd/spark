@@ -315,6 +315,8 @@ impl HostApp {
         Ok(())
     }
 
+    /// 公共 API：当前无 IPC 调用方，保留供未来 host.plugins_dir 查询使用。
+    #[allow(dead_code)]
     pub fn plugins_dir(&self) -> &Path {
         self.plugins.plugins_dir()
     }

@@ -1019,258 +1019,216 @@
                 <TranslateTransform x:Name="PanePluginsShift"/>
               </StackPanel.RenderTransform>
 
-              <!-- 顶部操作区：工具栏卡片，收拢 安装/开发目录/刷新 + 插件目录 -->
+              <!-- 顶部 Tab：已安装 / 插件市场 -->
               <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
-                      BorderThickness="1" CornerRadius="12" Padding="14,12">
-                <StackPanel Spacing="10">
-                  <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Click="OnInstallPlugin" Padding="10,6"
-                            Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
-                            BorderThickness="1" CornerRadius="8" FontSize="12"
-                            Foreground="{StaticResource TextPrimaryBrush}">
-                      <StackPanel Orientation="Horizontal" Spacing="6">
-                        <FontIcon Glyph="&#xE710;" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
-                        <TextBlock Text="安装本地插件"/>
-                      </StackPanel>
-                    </Button>
-                    <Grid x:Name="DevLoadPluginWrap" Background="Transparent">
-                      <Button x:Name="DevLoadPluginBtn" Click="OnDevLoadPlugin" Padding="10,6"
+                      BorderThickness="1" CornerRadius="12" Padding="4" Margin="0,0,0,12" HorizontalAlignment="Left">
+                <StackPanel Orientation="Horizontal" Spacing="4">
+                  <Button x:Name="TabInstalledPluginsBtn" Content="已安装插件" Click="OnSelectInstalledPluginsTab"
+                          Padding="14,6" CornerRadius="8" FontSize="12" FontWeight="SemiBold"
+                          Background="{StaticResource AccentSoftBrush}" Foreground="{StaticResource TextPrimaryBrush}"
+                          BorderThickness="0"/>
+                  <Button x:Name="TabPluginSecurityBtn" Content="插件安全" Click="OnSelectPluginSecurityTab"
+                          Padding="14,6" CornerRadius="8" FontSize="12"
+                          Background="Transparent" Foreground="{StaticResource TextSecondaryBrush}"
+                          BorderThickness="0"/>
+                  <Button x:Name="TabMarketplaceBtn" Content="插件市场" Click="OnSelectMarketplaceTab"
+                          Padding="14,6" CornerRadius="8" FontSize="12"
+                          Background="Transparent" Foreground="{StaticResource TextSecondaryBrush}"
+                          BorderThickness="0"/>
+                </StackPanel>
+              </Border>
+
+              <!-- 子面板 1：已安装插件管理 -->
+              <StackPanel x:Name="SubPaneInstalledPlugins" Visibility="Visible"
+                          RenderTransformOrigin="0.5,0.5">
+                <StackPanel.RenderTransform>
+                  <TranslateTransform x:Name="SubPaneInstalledPluginsShift"/>
+                </StackPanel.RenderTransform>
+                <!-- 顶部操作区：工具栏卡片，收拢 安装/开发目录/刷新 + 插件目录 -->
+                <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                        BorderThickness="1" CornerRadius="12" Padding="14,12">
+                  <StackPanel Spacing="10">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                      <Button Click="OnInstallPlugin" Padding="10,6"
                               Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
                               BorderThickness="1" CornerRadius="8" FontSize="12"
                               Foreground="{StaticResource TextPrimaryBrush}">
                         <StackPanel Orientation="Horizontal" Spacing="6">
-                          <FontIcon Glyph="&#xE8DA;" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
-                          <TextBlock Text="加载开发目录"/>
+                          <FontIcon Glyph="&#xE710;" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
+                          <TextBlock Text="安装本地插件"/>
                         </StackPanel>
                       </Button>
-                    </Grid>
-                    <Button Click="OnRefreshPlugins" Padding="10,6"
-                            Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
-                            BorderThickness="1" CornerRadius="8" FontSize="12"
-                            Foreground="{StaticResource TextPrimaryBrush}">
-                      <StackPanel Orientation="Horizontal" Spacing="6">
-                        <FontIcon Glyph="&#xE72C;" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
-                        <TextBlock Text="刷新"/>
-                      </StackPanel>
-                    </Button>
-                  </StackPanel>
-                  <Grid ColumnSpacing="12">
-                    <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="*"/>
-                      <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Spacing="2" VerticalAlignment="Center">
-                      <TextBlock Text="插件目录" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
-                      <TextBlock x:Name="PluginDirText" FontSize="11" TextTrimming="CharacterEllipsis"
-                                 Foreground="{StaticResource TextTertiaryBrush}"/>
-                    </StackPanel>
-                    <Grid x:Name="ChangePluginDirWrap" Grid.Column="1" Background="Transparent">
-                      <Button x:Name="ChangePluginDirBtn" Content="更换…" Click="OnChangePluginDir" Padding="10,5"
+                      <Grid x:Name="DevLoadPluginWrap" Background="Transparent">
+                        <Button x:Name="DevLoadPluginBtn" Click="OnDevLoadPlugin" Padding="10,6"
+                                Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                BorderThickness="1" CornerRadius="8" FontSize="12"
+                                Foreground="{StaticResource TextPrimaryBrush}">
+                          <StackPanel Orientation="Horizontal" Spacing="6">
+                            <FontIcon Glyph="&#xE8DA;" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
+                            <TextBlock Text="加载开发目录"/>
+                          </StackPanel>
+                        </Button>
+                      </Grid>
+                      <Button Click="OnRefreshPlugins" Padding="10,6"
                               Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
                               BorderThickness="1" CornerRadius="8" FontSize="12"
-                              Foreground="{StaticResource TextPrimaryBrush}"/>
-                    </Grid>
-                  </Grid>
-                </StackPanel>
-              </Border>
-
-              <!-- 签名安全：严格模式 + 受信任开发者（3.2/3.3） -->
-              <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
-                      BorderThickness="1" CornerRadius="12" Padding="14,12" Margin="0,10,0,0">
-                <StackPanel Spacing="10">
-                  <Grid ColumnSpacing="16">
-                    <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="*"/>
-                      <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Spacing="3">
-                      <TextBlock Text="严格模式" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
-                      <TextBlock Text="开启后仅安装带有效签名的插件（官方或已信任的三方），无签名插件拒装。默认关闭。" FontSize="11"
-                                 Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" LineHeight="16"/>
+                              Foreground="{StaticResource TextPrimaryBrush}">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                          <FontIcon Glyph="&#xE72C;" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
+                          <TextBlock Text="刷新"/>
+                        </StackPanel>
+                      </Button>
                     </StackPanel>
-                    <ToggleButton x:Name="StrictModeSwitch" Grid.Column="1" VerticalAlignment="Center"
-                                  Style="{StaticResource SwitchStyle}" Checked="OnToggleStrictMode" Unchecked="OnToggleStrictMode"/>
-                  </Grid>
-                </StackPanel>
-              </Border>
-
-              <!-- 受信任开发者（3.3）：导入三方公钥，其签名的插件显"已签名"角标 -->
-              <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
-                      BorderThickness="1" CornerRadius="12" Padding="14,12" Margin="0,10,0,0">
-                <StackPanel Spacing="10">
-                  <StackPanel Spacing="3">
-                    <TextBlock Text="受信任开发者" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <TextBlock Text="导入第三方开发者的 Ed25519 公钥后，其签名的插件将显示&quot;已签名&quot;角标（不会变成&quot;官方&quot;）。" FontSize="11"
-                               Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" LineHeight="16"/>
+                    <Grid ColumnSpacing="12">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel Spacing="2" VerticalAlignment="Center">
+                        <TextBlock Text="插件目录" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
+                        <TextBlock x:Name="PluginDirText" FontSize="11" TextTrimming="CharacterEllipsis"
+                                   Foreground="{StaticResource TextTertiaryBrush}"/>
+                      </StackPanel>
+                      <Grid x:Name="ChangePluginDirWrap" Grid.Column="1" Background="Transparent">
+                        <Button x:Name="ChangePluginDirBtn" Content="更换…" Click="OnChangePluginDir" Padding="10,5"
+                                Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                BorderThickness="1" CornerRadius="8" FontSize="12"
+                                Foreground="{StaticResource TextPrimaryBrush}"/>
+                      </Grid>
+                    </Grid>
                   </StackPanel>
+                </Border>
 
-                  <!-- 已导入的公钥列表 -->
-                  <ItemsControl x:Name="TrustedDevList">
-                    <ItemsControl.ItemTemplate>
-                      <DataTemplate>
-                        <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
-                                BorderThickness="1" CornerRadius="8" Padding="10,6" Margin="0,0,0,6">
-                          <Grid ColumnSpacing="8">
+                <TextBlock x:Name="PluginStatus" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                           Margin="0,8,0,0" TextWrapping="Wrap" LineHeight="18"
+                           Visibility="Collapsed"/>
+
+                <!-- 空态：没有任何插件时替代列表 -->
+                <Grid x:Name="PluginEmpty" MinHeight="320" Visibility="Collapsed">
+                  <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="6">
+                    <FontIcon Glyph="&#xE712;" FontSize="26"
+                              Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+                    <TextBlock Text="暂无插件" FontSize="14" Foreground="{StaticResource TextSecondaryBrush}"
+                               HorizontalAlignment="Center"/>
+                    <TextBlock Text="用上面的按钮安装插件包，或加载本地开发目录" FontSize="11"
+                               Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+                  </StackPanel>
+                </Grid>
+
+                <ListView x:Name="PluginList" SelectionMode="None" IsItemClickEnabled="False"
+                          Padding="0" Background="Transparent" BorderThickness="0" Margin="0,4,0,0"
+                          ContainerContentChanging="OnPluginItemRealized">
+                  <ListView.ItemContainerStyle>
+                    <Style TargetType="ListViewItem">
+                      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                      <Setter Property="VerticalContentAlignment" Value="Stretch"/>
+                      <Setter Property="Padding" Value="0"/>
+                      <Setter Property="Margin" Value="0,0,0,8"/>
+                      <!-- 容器不获焦，焦点落在内部按钮/ToggleSwitch/CheckBox（自带系统焦点视觉） -->
+                      <Setter Property="IsTabStop" Value="False"/>
+                      <Setter Property="UseSystemFocusVisuals" Value="True"/>
+                      <!-- 去掉默认 ListViewItemPresenter 的方角 hover/选中背景，只保留 DataTemplate 内的圆角卡片；
+                           ContentPresenter 显式绑定容器的内容对齐与边距，确保 Stretch 可靠撑满 -->
+                      <Setter Property="Template">
+                        <Setter.Value>
+                          <ControlTemplate TargetType="ListViewItem">
+                            <ContentPresenter Content="{TemplateBinding Content}"
+                                              ContentTemplate="{TemplateBinding ContentTemplate}"
+                                              HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              Padding="{TemplateBinding Padding}"
+                                              HorizontalAlignment="Stretch"
+                                              VerticalAlignment="Stretch"/>
+                          </ControlTemplate>
+                        </Setter.Value>
+                      </Setter>
+                    </Style>
+                  </ListView.ItemContainerStyle>
+                  <ListView.ItemTemplate>
+                    <DataTemplate>
+                      <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                              BorderThickness="1" CornerRadius="12" Padding="14,12">
+                        <StackPanel Spacing="0">
+                          <!-- 标题行：图标 + 名称/角标（左）+ 展开按钮 + 开关（右） -->
+                          <Grid ColumnSpacing="10">
                             <Grid.ColumnDefinitions>
+                              <ColumnDefinition Width="Auto"/>
                               <ColumnDefinition Width="*"/>
                               <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <StackPanel Spacing="2" VerticalAlignment="Center">
-                              <TextBlock Text="{Binding KeyId}" FontSize="12" FontWeight="SemiBold"
-                                         Foreground="{StaticResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis"/>
-                              <TextBlock Text="{Binding PublicKeyPreview}" FontSize="10"
-                                         Foreground="{StaticResource TextTertiaryBrush}" FontFamily="Consolas"
-                                         TextTrimming="CharacterEllipsis"/>
-                              <TextBlock Text="{Binding Note}" FontSize="10"
-                                         Foreground="{StaticResource TextSecondaryBrush}" TextTrimming="CharacterEllipsis"/>
+
+                            <!-- 图标 -->
+                            <Grid Width="34" Height="34" VerticalAlignment="Center">
+                              <Image Source="{Binding IconImage}" Width="34" Height="34" Stretch="Uniform"
+                                     Visibility="{Binding IconImageVisibility}"/>
+                              <Border CornerRadius="9" Background="{StaticResource ChipBgBrush}"
+                                      Visibility="{Binding IconTextVisibility}">
+                                <TextBlock Text="{Binding IconLetter}" FontSize="16" FontWeight="SemiBold"
+                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                              </Border>
+                            </Grid>
+
+                            <!-- 名称 + 版本 + 角标 + 一句话描述 -->
+                            <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
+                              <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="SemiBold"
+                                           Foreground="{StaticResource TextPrimaryBrush}"
+                                           TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+                                <TextBlock Text="{Binding Version}" FontSize="10" VerticalAlignment="Center"
+                                           Foreground="{StaticResource TextTertiaryBrush}"/>
+                                <Border Background="#3330D158" CornerRadius="4" Padding="5,1"
+                                        Visibility="{Binding DevBadgeVisibility}" VerticalAlignment="Center">
+                                  <TextBlock Text="开发" FontSize="9" Foreground="#FF30D158"/>
+                                </Border>
+                                <Border Background="{Binding SignBadgeBackground}" CornerRadius="4" Padding="5,1"
+                                        Visibility="{Binding SignBadgeVisibility}" VerticalAlignment="Center">
+                                  <TextBlock Text="{Binding SignBadgeText}" FontSize="9"
+                                             Foreground="{Binding SignBadgeForeground}"/>
+                                </Border>
+                              </StackPanel>
+                              <TextBlock Text="{Binding Description}" FontSize="11"
+                                         Foreground="{StaticResource TextTertiaryBrush}"
+                                         TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
                             </StackPanel>
-                            <Button Grid.Column="1" Click="OnRemoveTrustedDev" Padding="8,4"
-                                    Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
-                                    BorderThickness="1" CornerRadius="6" FontSize="11"
-                                    Foreground="{StaticResource TextSecondaryBrush}"
-                                    VerticalAlignment="Center">
-                              <FontIcon Glyph="&#xE74D;" FontSize="11"/>
-                            </Button>
-                          </Grid>
-                        </Border>
-                      </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                  </ItemsControl>
 
-                  <!-- 添加新公钥：key_id + base64 公钥 + 添加按钮 -->
-                  <Grid ColumnSpacing="8">
-                    <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="Auto"/>
-                      <ColumnDefinition Width="*"/>
-                      <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBox x:Name="TrustedDevKeyId" PlaceholderText="key_id" Width="140"
-                             FontSize="12" Padding="8,5" CornerRadius="6"
-                             BorderBrush="{StaticResource GlassBorderBrush}"
-                             Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <TextBox x:Name="TrustedDevPubkey" Grid.Column="1" PlaceholderText="base64 公钥（32 字节 Ed25519）"
-                             FontSize="12" Padding="8,5" CornerRadius="6"
-                             BorderBrush="{StaticResource GlassBorderBrush}"
-                             Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <Button Grid.Column="2" Click="OnAddTrustedDev" Content="添加" Padding="12,5"
-                            Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
-                            BorderThickness="1" CornerRadius="8" FontSize="12"
-                            Foreground="{StaticResource TextPrimaryBrush}"
-                            VerticalAlignment="Center"/>
-                  </Grid>
-
-                  <TextBlock x:Name="TrustedDevStatus" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"
-                             TextWrapping="Wrap" LineHeight="16" Visibility="Collapsed"/>
-                </StackPanel>
-              </Border>
-
-              <TextBlock x:Name="PluginStatus" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
-                         Margin="0,8,0,0" TextWrapping="Wrap" LineHeight="18"
-                         Visibility="Collapsed"/>
-
-              <!-- 空态：没有任何插件时替代列表 -->
-              <Grid x:Name="PluginEmpty" MinHeight="320" Visibility="Collapsed">
-                <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="6">
-                  <FontIcon Glyph="&#xE712;" FontSize="26"
-                            Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
-                  <TextBlock Text="暂无插件" FontSize="14" Foreground="{StaticResource TextSecondaryBrush}"
-                             HorizontalAlignment="Center"/>
-                  <TextBlock Text="用上面的按钮安装插件包，或加载本地开发目录" FontSize="11"
-                             Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
-                </StackPanel>
-              </Grid>
-
-              <ListView x:Name="PluginList" SelectionMode="None" IsItemClickEnabled="False"
-                        Padding="0" Background="Transparent" BorderThickness="0" Margin="0,4,0,0">
-                <ListView.ItemContainerStyle>
-                  <Style TargetType="ListViewItem">
-                    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-                    <Setter Property="VerticalContentAlignment" Value="Stretch"/>
-                    <Setter Property="Padding" Value="0"/>
-                    <Setter Property="Margin" Value="-12,0,-12,12"/>
-                    <!-- 容器不获焦，焦点落在内部按钮/ToggleSwitch/CheckBox（自带系统焦点视觉） -->
-                    <Setter Property="IsTabStop" Value="False"/>
-                    <Setter Property="UseSystemFocusVisuals" Value="True"/>
-                    <!-- 去掉默认 ListViewItemPresenter 的方角 hover/选中背景，只保留 DataTemplate 内的圆角卡片；
-                         ContentPresenter 显式绑定容器的内容对齐与边距，确保 Stretch 可靠撑满 -->
-                    <Setter Property="Template">
-                      <Setter.Value>
-                        <ControlTemplate TargetType="ListViewItem">
-                          <ContentPresenter Content="{TemplateBinding Content}"
-                                            ContentTemplate="{TemplateBinding ContentTemplate}"
-                                            HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
-                                            VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
-                                            Padding="{TemplateBinding Padding}"
-                                            HorizontalAlignment="Stretch"
-                                            VerticalAlignment="Stretch"/>
-                        </ControlTemplate>
-                      </Setter.Value>
-                    </Setter>
-                  </Style>
-                </ListView.ItemContainerStyle>
-                <ListView.ItemTemplate>
-                  <DataTemplate>
-                    <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
-                            BorderThickness="1" CornerRadius="12" Padding="16,12">
-                      <Grid ColumnSpacing="12">
-                        <Grid.ColumnDefinitions>
-                          <ColumnDefinition Width="Auto"/>
-                          <ColumnDefinition Width="*"/>
-                          <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-
-                        <!-- 图标：清单 icon 优先，缺省用首字母色块 -->
-                        <Grid Width="36" Height="36" VerticalAlignment="Top">
-                          <Image Source="{Binding IconImage}" Width="36" Height="36" Stretch="Uniform"
-                                 Visibility="{Binding IconImageVisibility}"/>
-                          <Border CornerRadius="9" Background="{StaticResource ChipBgBrush}"
-                                  Visibility="{Binding IconTextVisibility}">
-                            <TextBlock Text="{Binding IconLetter}" FontSize="16" FontWeight="SemiBold"
-                                       Foreground="{StaticResource TextSecondaryBrush}"
-                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                          </Border>
-                        </Grid>
-
-                        <StackPanel Grid.Column="1" Spacing="5" VerticalAlignment="Center">
-                          <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                              <ColumnDefinition Width="*"/>
-                              <ColumnDefinition Width="Auto"/>
-                              <ColumnDefinition Width="Auto"/>
-                              <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0" Text="{Binding Name}" FontSize="13" FontWeight="SemiBold"
-                                       Foreground="{StaticResource TextPrimaryBrush}"
-                                       TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
-                            <TextBlock Grid.Column="1" Text="{Binding Version}" FontSize="10" VerticalAlignment="Center"
-                                       Foreground="{StaticResource TextTertiaryBrush}"/>
-                            <Border Grid.Column="2" Background="#3330D158" CornerRadius="4" Padding="5,1"
-                                    Visibility="{Binding DevBadgeVisibility}" VerticalAlignment="Center">
-                              <TextBlock Text="开发" FontSize="9" Foreground="#FF30D158"/>
-                            </Border>
-                            <!-- 签名角标：官方=绿，三方=蓝，失效=红；Unsigned 隐藏 -->
-                            <Border Grid.Column="3" Background="{Binding SignBadgeBackground}" CornerRadius="4" Padding="5,1"
-                                    Visibility="{Binding SignBadgeVisibility}" VerticalAlignment="Center">
-                              <TextBlock Text="{Binding SignBadgeText}" FontSize="9"
-                                         Foreground="{Binding SignBadgeForeground}"/>
-                            </Border>
+                            <!-- 右侧：展开切换 + 开关（与通用页同款 ToggleButton + SwitchStyle，无 hover 缩放） -->
+                            <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6"
+                                        VerticalAlignment="Center" HorizontalAlignment="Right">
+                              <Button Click="OnTogglePluginExpand" Padding="6,5"
+                                      Background="Transparent" BorderThickness="0"
+                                      Foreground="{StaticResource TextSecondaryBrush}">
+                                <FontIcon Glyph="&#xE70D;" FontSize="11"
+                                          Foreground="{StaticResource TextSecondaryBrush}"
+                                          RenderTransformOrigin="0.5,0.5">
+                                  <FontIcon.RenderTransform>
+                                    <RotateTransform x:Name="ExpandArrowRotate" Angle="0"/>
+                                  </FontIcon.RenderTransform>
+                                </FontIcon>
+                              </Button>
+                              <ToggleButton IsChecked="{Binding Enabled, Mode=TwoWay}"
+                                            Style="{StaticResource SwitchStyle}"
+                                            Checked="OnPluginToggled" Unchecked="OnPluginToggled"/>
+                            </StackPanel>
                           </Grid>
 
-                          <TextBlock Text="{Binding Description}" FontSize="11"
-                                     Foreground="{StaticResource TextTertiaryBrush}"
-                                     TextTrimming="CharacterEllipsis"/>
+                          <!-- 详情区：展开后显示。左右缩进 2px 与标题区对齐，分隔线收窄留呼吸。
+                               展开过渡由 OnTogglePluginExpand 驱动 Opacity+位移；Visibility 仍由绑定瞬时控制。 -->
+                          <StackPanel x:Name="PluginDetailPanel" Spacing="10" Margin="2,12,2,0"
+                                      Visibility="{Binding DetailVisibility}" Opacity="0"
+                                      RenderTransformOrigin="0.5,0">
+                            <StackPanel.RenderTransform>
+                              <TranslateTransform x:Name="PluginDetailShift"/>
+                            </StackPanel.RenderTransform>
+                            <Border Background="{StaticResource DividerBrush}" Height="1" Opacity="0.4"
+                                    Margin="-2,0"/>
 
-                          <!-- 签名失效提示：仅 Invalid 显示。host 不会自动禁用失效插件，
-                               此处如实告知校验失败并建议用户停用/卸载，不虚构"已禁用"状态。 -->
-                          <TextBlock Text="签名校验失败（文件可能被篡改），建议停用或卸载" FontSize="10"
-                                     Foreground="#FFFF453A"
-                                     Visibility="{Binding InvalidHintVisibility}"/>
+                            <!-- 签名失效提示 -->
+                            <TextBlock Text="签名校验失败（文件可能被篡改），建议停用或卸载" FontSize="10"
+                                       Foreground="#FFFF453A"
+                                       Visibility="{Binding InvalidHintVisibility}"/>
 
-                          <!-- 触发关键字：横向排列，超出宽度由 ScrollViewer 裁剪，避免盖到右侧按钮列 -->
-                          <ScrollViewer HorizontalScrollBarVisibility="Hidden"
-                                        VerticalScrollBarVisibility="Disabled"
-                                        HorizontalScrollMode="Enabled" VerticalScrollMode="Disabled"
-                                        Padding="0" Margin="0">
+                            <!-- 触发关键字 -->
                             <ItemsControl ItemsSource="{Binding Keywords}">
                               <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
@@ -1279,22 +1237,18 @@
                               </ItemsControl.ItemsPanel>
                               <ItemsControl.ItemTemplate>
                                 <DataTemplate>
-                                  <Border Background="{StaticResource ChipBgBrush}" CornerRadius="4" Padding="6,2">
+                                  <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                                          BorderThickness="1" CornerRadius="4" Padding="6,2">
                                     <TextBlock Text="{Binding}" FontSize="10"
                                                Foreground="{StaticResource TextSecondaryBrush}"/>
                                   </Border>
                                 </DataTemplate>
                               </ItemsControl.ItemTemplate>
                             </ItemsControl>
-                          </ScrollViewer>
 
-                          <!-- 权限授权：勾选即调 host.plugin.grant；横向排列，超出宽度由 ScrollViewer 裁剪，避免盖到右侧按钮列 -->
-                          <ScrollViewer HorizontalScrollBarVisibility="Hidden"
-                                        VerticalScrollBarVisibility="Disabled"
-                                        HorizontalScrollMode="Enabled" VerticalScrollMode="Disabled"
-                                        Padding="0" Margin="0,2,0,0"
-                                        Visibility="{Binding PermissionsVisibility}">
-                            <ItemsControl ItemsSource="{Binding Permissions}">
+                            <!-- 权限授权 -->
+                            <ItemsControl ItemsSource="{Binding Permissions}"
+                                          Visibility="{Binding PermissionsVisibility}">
                               <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
                                   <StackPanel Orientation="Horizontal" Spacing="10"/>
@@ -1309,32 +1263,320 @@
                                 </DataTemplate>
                               </ItemsControl.ItemTemplate>
                             </ItemsControl>
-                          </ScrollViewer>
-                        </StackPanel>
 
-                        <StackPanel Grid.Column="2" Spacing="8" VerticalAlignment="Center"
-                                    HorizontalAlignment="Right">
-                          <ToggleSwitch IsOn="{Binding Enabled, Mode=TwoWay}"
-                                        OnContent="" OffContent=""
-                                        MinWidth="0" Toggled="OnPluginToggled" HorizontalAlignment="Right"/>
-                          <StackPanel Orientation="Horizontal" Spacing="6" HorizontalAlignment="Right">
-                            <Button Content="调试" Click="OnDebugPlugin" Padding="12,5" FontSize="11"
-                                    Visibility="{Binding DebugVisibility}"
-                                    Background="Transparent"
-                                    BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"
-                                    CornerRadius="8" Foreground="{StaticResource AccentBrush}"/>
-                            <Button Content="卸载" Click="OnUninstallPlugin" Padding="12,5" FontSize="11"
-                                    Visibility="{Binding UninstallVisibility}"
-                                    Background="Transparent"
-                                    BorderBrush="{StaticResource GlassBorderBrush}" BorderThickness="1"
-                                    CornerRadius="8" Foreground="{StaticResource TextSecondaryBrush}"/>
+                            <!-- 操作按钮 -->
+                            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                              <Button Click="OnDebugPlugin" Padding="12,5" FontSize="11"
+                                      Visibility="{Binding DebugVisibility}"
+                                      Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                      BorderThickness="1" CornerRadius="8" Foreground="{StaticResource AccentBrush}">
+                                <StackPanel Orientation="Horizontal" Spacing="5">
+                                  <FontIcon Glyph="&#xEB1F;" FontSize="11" Foreground="{StaticResource AccentBrush}"/>
+                                  <TextBlock Text="调试" Foreground="{StaticResource AccentBrush}"/>
+                                </StackPanel>
+                              </Button>
+                              <Button Click="OnUninstallPlugin" Padding="12,5" FontSize="11"
+                                      Visibility="{Binding UninstallVisibility}"
+                                      Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                      BorderThickness="1" CornerRadius="8" Foreground="{StaticResource TextSecondaryBrush}">
+                                <StackPanel Orientation="Horizontal" Spacing="5">
+                                  <FontIcon Glyph="&#xE74D;" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
+                                  <TextBlock Text="卸载" Foreground="{StaticResource TextSecondaryBrush}"/>
+                                </StackPanel>
+                              </Button>
+                            </StackPanel>
                           </StackPanel>
                         </StackPanel>
-                      </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ListView.ItemTemplate>
+                </ListView>
+              </StackPanel>
+
+              <!-- 子面板 1b：插件安全（严格模式 + 受信任开发者，从已安装面板抽出独立展示） -->
+              <StackPanel x:Name="SubPanePluginSecurity" Visibility="Collapsed" Spacing="10"
+                          RenderTransformOrigin="0.5,0.5">
+                <StackPanel.RenderTransform>
+                  <TranslateTransform x:Name="SubPanePluginSecurityShift"/>
+                </StackPanel.RenderTransform>
+                <!-- 签名安全：严格模式 + 受信任开发者（3.2/3.3） -->
+                <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                        BorderThickness="1" CornerRadius="12" Padding="14,12">
+                  <StackPanel Spacing="10">
+                    <Grid ColumnSpacing="16">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel Spacing="3">
+                        <TextBlock Text="严格模式" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
+                        <TextBlock Text="开启后仅安装带有效签名的插件（官方或已信任的三方），无签名插件拒装。默认关闭。" FontSize="11"
+                                   Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" LineHeight="16"/>
+                      </StackPanel>
+                      <ToggleButton x:Name="StrictModeSwitch" Grid.Column="1" VerticalAlignment="Center"
+                                    Style="{StaticResource SwitchStyle}" Checked="OnToggleStrictMode" Unchecked="OnToggleStrictMode"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <!-- 受信任开发者（3.3）：导入三方公钥，其签名的插件显"已签名"角标 -->
+                <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                        BorderThickness="1" CornerRadius="12" Padding="14,12" Margin="0,10,0,0">
+                  <StackPanel Spacing="10">
+                    <StackPanel Spacing="3">
+                      <TextBlock Text="受信任开发者" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
+                      <TextBlock Text="导入第三方开发者的 Ed25519 公钥后，其签名的插件将显示&quot;已签名&quot;角标（不会变成&quot;官方&quot;）。" FontSize="11"
+                                 Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" LineHeight="16"/>
+                    </StackPanel>
+
+                    <!-- 已导入的公钥列表 -->
+                    <ItemsControl x:Name="TrustedDevList">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                          <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                                  BorderThickness="1" CornerRadius="8" Padding="10,6" Margin="0,0,0,6">
+                            <Grid ColumnSpacing="8">
+                              <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                              </Grid.ColumnDefinitions>
+                              <StackPanel Spacing="2" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding KeyId}" FontSize="12" FontWeight="SemiBold"
+                                           Foreground="{StaticResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding PublicKeyPreview}" FontSize="10"
+                                           Foreground="{StaticResource TextTertiaryBrush}" FontFamily="Consolas"
+                                           TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding Note}" FontSize="10"
+                                           Foreground="{StaticResource TextSecondaryBrush}" TextTrimming="CharacterEllipsis"/>
+                              </StackPanel>
+                              <Button Grid.Column="1" Click="OnRemoveTrustedDev" Padding="8,4"
+                                      Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                      BorderThickness="1" CornerRadius="6" FontSize="11"
+                                      Foreground="{StaticResource TextSecondaryBrush}"
+                                      VerticalAlignment="Center">
+                                <FontIcon Glyph="&#xE74D;" FontSize="11"/>
+                              </Button>
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <!-- 添加新公钥：key_id + base64 公钥 + 添加按钮 -->
+                    <Grid ColumnSpacing="8">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBox x:Name="TrustedDevKeyId" PlaceholderText="key_id" Width="140"
+                               FontSize="12" Padding="8,5" CornerRadius="6"
+                               BorderBrush="{StaticResource GlassBorderBrush}"
+                               Foreground="{StaticResource TextPrimaryBrush}"/>
+                      <TextBox x:Name="TrustedDevPubkey" Grid.Column="1" PlaceholderText="base64 公钥（32 字节 Ed25519）"
+                               FontSize="12" Padding="8,5" CornerRadius="6"
+                               BorderBrush="{StaticResource GlassBorderBrush}"
+                               Foreground="{StaticResource TextPrimaryBrush}"/>
+                      <Button Grid.Column="2" Click="OnAddTrustedDev" Content="添加" Padding="12,5"
+                              Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                              BorderThickness="1" CornerRadius="8" FontSize="12"
+                              Foreground="{StaticResource TextPrimaryBrush}"
+                              VerticalAlignment="Center"/>
+                    </Grid>
+
+                    <TextBlock x:Name="TrustedDevStatus" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"
+                               TextWrapping="Wrap" LineHeight="16" Visibility="Collapsed"/>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+
+              <!-- 子面板 2：插件市场 -->
+              <StackPanel x:Name="SubPaneMarketplace" Visibility="Collapsed" Spacing="10"
+                          RenderTransformOrigin="0.5,0.5">
+                <StackPanel.RenderTransform>
+                  <TranslateTransform x:Name="SubPaneMarketplaceShift"/>
+                </StackPanel.RenderTransform>
+                <!-- 市场源选择与配置卡片 -->
+                <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                        BorderThickness="1" CornerRadius="12" Padding="14,12">
+                  <StackPanel Spacing="10">
+                    <Grid ColumnSpacing="12">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <ComboBox x:Name="MarketSourceCombo" Style="{StaticResource ComboStyle}" ItemContainerStyle="{StaticResource ComboItemStyle}"
+                                HorizontalAlignment="Stretch" SelectionChanged="OnMarketSourceChanged"/>
+                      <Button Grid.Column="1" x:Name="MarketCustomManageBtn" Content="管理仓库…" Click="OnToggleManageCustomRepos"
+                              Padding="10,6" Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                              BorderThickness="1" CornerRadius="8" FontSize="12"
+                              Foreground="{StaticResource TextPrimaryBrush}"/>
+                      <Button Grid.Column="2" x:Name="MarketRefreshBtn" Click="OnMarketRefresh" Padding="10,6"
+                              Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                              BorderThickness="1" CornerRadius="8" FontSize="12"
+                              Foreground="{StaticResource TextPrimaryBrush}">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                          <FontIcon Glyph="&#xE72C;" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
+                          <TextBlock Text="刷新"/>
+                        </StackPanel>
+                      </Button>
+                    </Grid>
+
+                    <!-- 自定义仓库管理展开区 -->
+                    <StackPanel x:Name="MarketCustomReposPanel" Visibility="Collapsed" Spacing="8" Margin="0,4,0,0">
+                      <TextBlock Text="自定义仓库列表 (URL)" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}"/>
+                      <ItemsControl x:Name="MarketCustomUrlList">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate>
+                            <Grid ColumnSpacing="8" Margin="0,0,0,6">
+                              <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                              </Grid.ColumnDefinitions>
+                              <TextBox Text="{Binding Url, Mode=TwoWay}" FontSize="11" VerticalAlignment="Center"/>
+                              <Button Grid.Column="1" Click="OnRemoveCustomRepoUrl" Padding="8,4"
+                                      Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                      BorderThickness="1" CornerRadius="6" FontSize="11"
+                                      Foreground="{StaticResource TextSecondaryBrush}" VerticalAlignment="Center">
+                                <FontIcon Glyph="&#xE74D;" FontSize="11"/>
+                              </Button>
+                            </Grid>
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="＋ 添加仓库" Click="OnAddCustomRepoUrl" Padding="10,5"
+                                Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                BorderThickness="1" CornerRadius="8" FontSize="11"
+                                Foreground="{StaticResource TextPrimaryBrush}"/>
+                        <Button Content="保存更改" Click="OnSaveCustomRepoUrls" Padding="12,5"
+                                Background="{StaticResource AccentSoftBrush}" BorderThickness="0"
+                                CornerRadius="8" FontSize="11" FontWeight="SemiBold"
+                                Foreground="{StaticResource TextPrimaryBrush}"/>
+                      </StackPanel>
+                    </StackPanel>
+
+                    <!-- 第三方仓库安全提示 -->
+                    <Border x:Name="MarketCustomWarning" Background="#26FF9F0A" BorderBrush="#66FF9F0A"
+                            BorderThickness="1" CornerRadius="8" Padding="10,8" Visibility="Collapsed">
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <FontIcon Glyph="&#xE7BA;" FontSize="14" Foreground="#FFFF9F0A" VerticalAlignment="Center"/>
+                        <TextBlock Text="你正在连接第三方仓库，插件安全性由仓库维护者负责，请谨慎安装高权限插件。"
+                                   FontSize="11" Foreground="#FFFF9F0A" TextWrapping="Wrap" LineHeight="16"/>
+                      </StackPanel>
                     </Border>
-                  </DataTemplate>
-                </ListView.ItemTemplate>
-              </ListView>
+                  </StackPanel>
+                </Border>
+
+                <!-- 市场状态提示 / 加载中 -->
+                <StackPanel x:Name="MarketLoadingWrap" Orientation="Horizontal" Spacing="10"
+                            HorizontalAlignment="Center" Margin="0,16,0,8" Visibility="Collapsed">
+                  <ProgressRing Width="20" Height="20" IsActive="True"/>
+                  <TextBlock Text="正在连接插件仓库…" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                             VerticalAlignment="Center"/>
+                </StackPanel>
+
+                <TextBlock x:Name="MarketStatusText" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                           Margin="0,4,0,0" TextWrapping="Wrap" LineHeight="18"
+                           Visibility="Collapsed"/>
+
+                <!-- 市场空态 -->
+                <Grid x:Name="MarketEmpty" MinHeight="260" Visibility="Collapsed">
+                  <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="6">
+                    <FontIcon Glyph="&#xE719;" FontSize="28"
+                              Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+                    <TextBlock Text="仓库暂无可用插件" FontSize="14" Foreground="{StaticResource TextSecondaryBrush}"
+                               HorizontalAlignment="Center"/>
+                    <TextBlock Text="请检查网络或切换到其他仓库源" FontSize="11"
+                               Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+                  </StackPanel>
+                </Grid>
+
+                <!-- 市场插件列表 -->
+                <ListView x:Name="MarketList" SelectionMode="None" IsItemClickEnabled="False"
+                          Padding="0" Background="Transparent" BorderThickness="0" Margin="0,4,0,0">
+                  <ListView.ItemContainerStyle>
+                    <Style TargetType="ListViewItem">
+                      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                      <Setter Property="VerticalContentAlignment" Value="Stretch"/>
+                      <Setter Property="Padding" Value="0"/>
+                      <Setter Property="Margin" Value="-12,0,-12,12"/>
+                      <Setter Property="IsTabStop" Value="False"/>
+                      <Setter Property="UseSystemFocusVisuals" Value="True"/>
+                      <Setter Property="Template">
+                        <Setter.Value>
+                          <ControlTemplate TargetType="ListViewItem">
+                            <ContentPresenter Content="{TemplateBinding Content}"
+                                              ContentTemplate="{TemplateBinding ContentTemplate}"
+                                              HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              Padding="{TemplateBinding Padding}"
+                                              HorizontalAlignment="Stretch"
+                                              VerticalAlignment="Stretch"/>
+                          </ControlTemplate>
+                        </Setter.Value>
+                      </Setter>
+                    </Style>
+                  </ListView.ItemContainerStyle>
+                  <ListView.ItemTemplate>
+                    <DataTemplate>
+                      <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
+                              BorderThickness="1" CornerRadius="12" Padding="16,14">
+                        <Grid ColumnSpacing="12">
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+
+                          <!-- 图标占位 -->
+                          <Border Width="36" Height="36" CornerRadius="9" Background="{StaticResource ChipBgBrush}"
+                                  VerticalAlignment="Top">
+                            <FontIcon Glyph="&#xE71D;" FontSize="18" Foreground="{StaticResource TextSecondaryBrush}"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                          </Border>
+
+                          <StackPanel Grid.Column="1" Spacing="4" VerticalAlignment="Center">
+                            <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                              <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="SemiBold"
+                                         Foreground="{StaticResource TextPrimaryBrush}"/>
+                              <Border Background="{StaticResource ChipBgBrush}" CornerRadius="4" Padding="5,1">
+                                <TextBlock Text="{Binding VersionText}" FontSize="10" Foreground="{StaticResource TextSecondaryBrush}"/>
+                              </Border>
+                              <Border Background="#33FF9F0A" CornerRadius="4" Padding="5,1"
+                                      Visibility="{Binding NativeBadgeVisibility}" VerticalAlignment="Center">
+                                <TextBlock Text="原生插件" FontSize="9" Foreground="#FFFF9F0A"/>
+                              </Border>
+                            </StackPanel>
+                            <TextBlock Text="{Binding Description}" FontSize="11"
+                                       Foreground="{StaticResource TextTertiaryBrush}"
+                                       TextWrapping="Wrap" MaxLines="2" LineHeight="16"/>
+                            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2,0,0">
+                              <TextBlock Text="{Binding Author}" FontSize="10"
+                                         Foreground="{StaticResource TextTertiaryBrush}"/>
+                              <TextBlock Text="{Binding PermissionsSummary}" FontSize="10"
+                                         Foreground="{StaticResource TextTertiaryBrush}"/>
+                            </StackPanel>
+                          </StackPanel>
+
+                          <StackPanel Grid.Column="2" Spacing="4" VerticalAlignment="Center" HorizontalAlignment="Right">
+                            <Button Content="{Binding ActionButtonText}" IsEnabled="{Binding ActionButtonEnabled}"
+                                    Click="OnInstallFromMarketplace"
+                                    Padding="14,6" CornerRadius="8" FontSize="12" FontWeight="SemiBold"
+                                    Background="{StaticResource AccentSoftBrush}" Foreground="{StaticResource TextPrimaryBrush}"
+                                    BorderThickness="0"/>
+                            <TextBlock Text="{Binding InstalledVersion}"
+                                       Visibility="{Binding InstalledLabelVisibility}"
+                                       FontSize="10" Foreground="{StaticResource TextTertiaryBrush}"
+                                       HorizontalAlignment="Center"/>
+                          </StackPanel>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ListView.ItemTemplate>
+                </ListView>
+              </StackPanel>
             </StackPanel>
 
             <!-- 关于 -->
