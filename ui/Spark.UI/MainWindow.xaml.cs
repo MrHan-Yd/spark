@@ -83,6 +83,9 @@ public sealed partial class MainWindow : Window
     private int _animHideGen;
     /// <summary>IME 组词中：期间箭头键交给输入法（不拦截）。</summary>
     private bool _composing;
+    /// <summary>上次 ImeKick 注入时间（TickCount64）：300ms 内不重复注入——
+    /// 两次快速连点会被 XAML 识别为双击选词，反而破坏输入框内容。</summary>
+    private long _lastImeKickTicks;
     /// <summary>当前打开的动作菜单（右键/Tab 共用）；打开期间根上箭头键交给菜单，不移动选中项。</summary>
     private MenuFlyout? _itemMenu;
 
@@ -167,11 +170,12 @@ public sealed partial class MainWindow : Window
         ResultList.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
         ResultGrid.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
         // IME 组词期间不拦截箭头（组词光标移动由输入法管），否则会破坏中文输入
-        QueryBox.TextCompositionStarted += (_, _) => _composing = true;
+        QueryBox.TextCompositionStarted += (_, _) => { _composing = true; App.Log("Ime", "composition started"); };
         // 组词结束（上屏/取消）补一次查询：组词期间 TextChanged 也在触发，已被 ScheduleRefresh 挂起
         QueryBox.TextCompositionEnded += (_, _) =>
         {
             _composing = false;
+            App.Log("Ime", "composition ended");
             ScheduleRefresh(QueryBox.Text ?? "");
         };
 
@@ -863,6 +867,9 @@ public sealed partial class MainWindow : Window
             Activate();
             QueryBox.Focus(FocusState.Keyboard);
             ResetIme();
+            // 失焦到重新抢回前台的链路同样挂不上 TSF（程序化聚焦无效），
+            // 补一次真实输入激活（组词进行中会自动跳过，见 KickImeAsync）。
+            _ = KickImeAsync();
             return;
         }
 
@@ -936,54 +943,98 @@ public sealed partial class MainWindow : Window
             if (!string.IsNullOrEmpty(text))
             {
                 QueryBox.Text = text;
+                _composing = false;  // 程序化替换文本已销毁组词；防 Ended 不触发留下 stale 标记
                 QueryBox.SelectionStart = text.Length;
                 QueryBox.SelectionLength = 0;
                 _ = RefreshResultsAsync(text);
             }
             // 跨屏后 TSF 文档管理器只有真实输入事件能重新激活（WinUI 3 框架 bug，
-            // 程序化聚焦/往返全部无效）——自动注入一次点击恢复输入法
-            _ = RestoreImeByClickAsync();
+            // 程序化聚焦/往返全部无效）——ShowLauncher 内置的 KickImeAsync 已在显示
+            // 后 150ms 注入一次真实点击，这里无需重复（300ms 去重兜底连点）。
         }));
     }
 
-    /// <summary>跨屏显示稳定后注入一次真实指针输入恢复输入法（TSF 文档管理器激活）。
-    /// 位置实时取 GetWindowRect（窗口移到哪点哪，不怕用户移动窗口）。</summary>
-    private async Task RestoreImeByClickAsync()
+    /// <summary>显示/抢回焦点稳定后注入一次真实指针输入恢复输入法（TSF 文档管理器
+    /// 激活）。抑制条件只有"组词进行中"（_composing）：组词活着 = TSF 已挂接，
+    /// 无需救活且点击会打断组词；而"文本非空但无组词"恰恰是 TSF 挂接失败的表现
+    /// （坏状态下按键直接落明文），必须注入。300ms 内不重复注入（连点会被识别为
+    /// 双击选词）。落点校验/换算见 InjectImeKickClick。</summary>
+    private async Task KickImeAsync()
     {
-        await Task.Delay(150);  // 等窗口显示稳定（位置已定）
-        if (!_visible || _hwnd == IntPtr.Zero)
-            return;
-        await InjectImeKickClickAsync();
+        try
+        {
+            await Task.Delay(150);  // 等窗口显示稳定（布局就绪）
+            if (!_visible || _hwnd == IntPtr.Zero)
+                return;
+            if (_composing)
+                return;
+            if (Environment.TickCount64 - _lastImeKickTicks < 300)
+                return;
+            if (InjectImeKickClick())
+                _lastImeKickTicks = Environment.TickCount64;
+        }
+        catch (Exception ex) { App.Log("ImeKick", ex); }
     }
 
     /// <summary>注入一次真实指针输入激活 TSF：优先触摸注入（InputInjector 走
     /// WM_POINTER 指针管道，WinUI 3 XAML 原生识别，且不移动光标）；
     /// mouse_event 经典鼠标消息不被 XAML 识别（实测 Pointer 事件不产生），
-    /// 仅作回退。点击输入框区域（顶部搜索行），位置实时取 GetWindowRect。</summary>
-    private async Task InjectImeKickClickAsync()
+    /// 仅作回退。落点由 QueryBox 实时布局换算（DPI 缩放/留白调整免疫，不再用
+    /// "窗口顶+40px"硬编码——高 DPI 下会脱靶）。注入前校验落点确实命中本窗口：
+    /// 系统级注入点到别的应用等于替用户点击别人，窗口被隐藏/被遮挡时必须放弃。
+    /// 返回是否实际注入。</summary>
+    private bool InjectImeKickClick()
     {
         try
         {
-            if (_hwnd == IntPtr.Zero) return;
-            if (!GetWindowRect(_hwnd, out var wr)) return;
-            GetCursorPos(out var cur);
+            if (_hwnd == IntPtr.Zero) return false;
+            if (!GetWindowRect(_hwnd, out var wr)) return false;
 
             var cx = (wr.Left + wr.Right) / 2;
-            var cy = wr.Top + 40;  // 输入框区域（顶部 16px 留白之下）
+            var cy = wr.Top + 40;  // 布局换算失败的回退落点（输入行近似位置）
+            try
+            {
+                // QueryBox 中心（Root 坐标 × DPI 缩放 + 窗口原点）= 物理屏幕坐标
+                var pt = QueryBox.TransformToVisual(Root)
+                    .TransformPoint(new Point(QueryBox.ActualWidth / 2, QueryBox.ActualHeight / 2));
+                var scale = Root.XamlRoot?.RasterizationScale ?? 1.0;
+                cx = wr.Left + (int)(pt.X * scale);
+                cy = wr.Top + (int)(pt.Y * scale);
+            }
+            catch (Exception ex)
+            {
+                App.Log("Ime", $"querybox point fallback: {ex.Message}");
+            }
+
+            // 落点必须命中本窗口（XAML 桥接子窗口的根也是 _hwnd）。
+            // _visible 字段可能与真实状态错位（Show 失败/外部隐藏），
+            // 隐藏窗口的 GetWindowRect 仍返回旧矩形——不校验就会注入到别人窗口上。
+            var hit = WindowFromPoint(new POINT { X = cx, Y = cy });
+            if (hit == IntPtr.Zero || GetAncestor(hit, GA_ROOT) != _hwnd)
+            {
+                App.Log("Ime", $"kick skipped: hit 0x{hit.ToInt64():X} at ({cx},{cy}) is not self (visible={IsWindowVisible(_hwnd)})");
+                return false;
+            }
 
             if (TryInjectTouchClick(cx, cy))
             {
                 App.Log("Ime", $"touch injected at ({cx},{cy}) wr=({wr.Left},{wr.Top},{wr.Right},{wr.Bottom})");
-                return;
+                return true;
             }
             // 回退：SetCursorPos + mouse_event（经典消息，XAML 可能不识别）
+            GetCursorPos(out var cur);
             SetCursorPos(cx, cy);
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
             SetCursorPos(cur.X, cur.Y);
             App.Log("Ime", $"mouse fallback at ({cx},{cy})");
+            return true;
         }
-        catch (Exception ex) { App.Log("ImeKick", ex); }
+        catch (Exception ex)
+        {
+            App.Log("ImeKick", ex);
+            return false;
+        }
     }
 
     /// <summary>InputInjector 触摸注入（WM_POINTER 管道，XAML 原生输入路径）。
@@ -1302,9 +1353,11 @@ public sealed partial class MainWindow : Window
             // 瞬时切换同时复位模式动画可能停在中间值的透明度/位移
             ApplyModeSwitch(open: false, animate: false);
             QueryBox.Text = "";
+            _composing = false;  // 清空文本已销毁组词会话；Ended 事件未必触发，防 stale 挡住 kick
             _ = RefreshResultsAsync("");
-            // 用 Keyboard 状态聚焦 + IME 重建：修复 Show/Hide 循环后中文输入法
-            // 候选窗不弹、只能打英文的问题（详见 ResetIme）
+            // 用 Keyboard 状态聚焦 + IME 重建：缓解 Show/Hide 循环后中文输入法
+            // 候选窗不弹（详见 ResetIme）。注意：仅靠程序化聚焦+重建不足以挂上
+            // TSF 文档管理器，真正的修复在下面的 KickImeAsync（注入真实输入）。
             QueryBox.Focus(FocusState.Keyboard);
             ResetIme();
             LogFocusState("show");
@@ -1314,6 +1367,11 @@ public sealed partial class MainWindow : Window
             // 前台锁偶发拦截 SetForegroundWindow（窗口显示但未激活 → 点击外面不会触发失焦隐藏）。
             // 延迟重试几次，确保窗口真正拿到前台。
             _ = RetryFocusAsync();
+            // 热键/托盘唤起路径与跨屏同患：TSF 文档管理器挂不上（WinUI 3 框架 bug，
+            // 程序化聚焦/焦点往返/IMM 重建全部无效，只有真实指针输入能激活，详见
+            // MoveToCursorMonitor 注释），表现为中文输入法候选框不弹、鼠标点一下
+            // 搜索框才恢复。注入一次真实点击救活，用户无需手动点。
+            _ = KickImeAsync();
 
             // pop-in（对齐原型 .launcher 入场）
             _hideGen++;  // 使已排队的隐藏动画 Completed→HideNow 失配，防止刚显示的窗口被延迟关掉
@@ -1368,6 +1426,9 @@ public sealed partial class MainWindow : Window
                     ImmReleaseContext(focusHwnd, himc);
                 }
             }
+            // CPS_CANCEL 程序化取消组词时 TextCompositionEnded 未必触发，
+            // 显式复位防 stale 的 _composing 把 KickImeAsync 永久挡住
+            _composing = false;
         }
         catch { /* ignore */ }
     }
@@ -5606,6 +5667,15 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT Point);
+
+    /// <summary>GetAncestor uFlags：取给定窗口的顶层根窗口。</summary>
+    private const uint GA_ROOT = 2;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
 
     [DllImport("user32.dll")]
     private static extern IntPtr SetActiveWindow(IntPtr hWnd);
