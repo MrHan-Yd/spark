@@ -31,6 +31,7 @@ public static class RegistryService
     private const long MaxZipSize = 50 * 1024 * 1024;      // 50 MiB
     private const long MaxUnpackSize = 100 * 1024 * 1024;  // 100 MiB
     private const int MaxEntryCount = 10000;
+    private const long MaxIconSize = 2 * 1024 * 1024;      // 2 MiB，图标字节上限
 
     static RegistryService()
     {
@@ -64,6 +65,23 @@ public static class RegistryService
                     .Where(p => !string.IsNullOrWhiteSpace(p.Id) && !string.IsNullOrWhiteSpace(p.Latest))
                     .ToList();
 
+                // 第三方 registry.json 不可信：显式 null 会把 C# 属性初始化的默认值覆写为 null。
+                // 在数据入口统一归一化，保证 ViewDto 的展示 getter（IconLetter/PermissionsSummary 等）
+                // 在布局期绑定求值时永不抛 NRE；不改变正常数据的展示，也不会误过滤合法条目。
+                foreach (var p in index.Plugins)
+                {
+                    p.Name = p.Name ?? "";
+                    p.Description = p.Description ?? "";
+                    p.Author = p.Author ?? "";
+                    p.Homepage = p.Homepage ?? "";
+                    p.Icon = p.Icon ?? "";
+                    p.Runtime = p.Runtime ?? "webview";
+                    p.Permissions = p.Permissions ?? new List<string>();
+                    p.Versions = p.Versions is null
+                        ? new List<RegistryVersionDto>()
+                        : p.Versions.Where(v => v is not null).ToList();
+                }
+
                 return index;
             }
             catch (OperationCanceledException) { throw; }
@@ -77,6 +95,62 @@ public static class RegistryService
             }
         }
         throw lastEx ?? new IOException("抓取仓库索引失败");
+    }
+
+    /// <summary>
+    /// 下载市场插件图标字节（registry.json 的 icon 为 http(s) 绝对 URL）。
+    /// 失败/超限返回 null，由调用方退回字母占位——图标是装饰性资源，静默降级即可。
+    /// 显式 15s 总时长 CTS 兜底：ResponseHeadersRead 模式下 HttpClient.Timeout 只覆盖到响应头，
+    /// 正文读取（慢速滴流/停滞服务器）必须由它约束，否则任务永久挂起占住连接。
+    /// </summary>
+    public static async Task<byte[]?> DownloadIconAsync(string? url, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(url)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != "http" && uri.Scheme != "https"))
+        {
+            App.Log("MarketIcon", $"icon url 无效: {url}");
+            return null;
+        }
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(15));
+
+            using var resp = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            if (!resp.IsSuccessStatusCode)
+            {
+                App.Log("MarketIcon", $"icon HTTP {(int)resp.StatusCode}: {url}");
+                return null;
+            }
+            var len = resp.Content.Headers.ContentLength;
+            if (len.HasValue && len.Value > MaxIconSize)
+            {
+                App.Log("MarketIcon", $"icon 超限 {len.Value}B: {url}");
+                return null;
+            }
+
+            using var ms = new MemoryStream();
+            await using var stream = await resp.Content.ReadAsStreamAsync(cts.Token);
+            await stream.CopyToAsync(ms, cts.Token);
+            if (ms.Length > MaxIconSize)
+            {
+                App.Log("MarketIcon", $"icon 超限 {ms.Length}B: {url}");
+                return null;
+            }
+            return ms.ToArray();
+        }
+        catch (OperationCanceledException)
+        {
+            App.Log("MarketIcon", $"icon 超时/取消: {url}");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            App.Log("MarketIcon", $"icon 下载异常 {ex.GetType().Name}: {ex.Message} url={url}");
+            return null;
+        }
     }
 
     /// <summary>
@@ -131,14 +205,15 @@ public static class RegistryService
         string zipballUrl,
         string versionPath,
         string? expectedSha256,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<DownloadProgressReport>? progress = null)
     {
         var tempZip = Path.Combine(Path.GetTempPath(), $"spark_market_{Guid.NewGuid():N}.zip");
         var tempExtractDir = Path.Combine(Path.GetTempPath(), $"spark_plugin_{Guid.NewGuid():N}");
 
         try
         {
-            await DownloadToFileAsync(zipballUrl, tempZip, MaxZipSize, ct);
+            await DownloadToFileAsync(zipballUrl, tempZip, MaxZipSize, ct, progress);
 
             if (!string.IsNullOrEmpty(expectedSha256))
             {
@@ -247,14 +322,15 @@ public static class RegistryService
     public static async Task<string> DownloadDirectZipAsync(
         string zipUrl,
         string? expectedSha256,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<DownloadProgressReport>? progress = null)
     {
         var tempZip = Path.Combine(Path.GetTempPath(), $"spark_market_{Guid.NewGuid():N}.zip");
         var tempExtractDir = Path.Combine(Path.GetTempPath(), $"spark_plugin_{Guid.NewGuid():N}");
 
         try
         {
-            await DownloadToFileAsync(zipUrl, tempZip, MaxZipSize, ct);
+            await DownloadToFileAsync(zipUrl, tempZip, MaxZipSize, ct, progress);
 
             if (!string.IsNullOrEmpty(expectedSha256))
             {
@@ -328,7 +404,7 @@ public static class RegistryService
         }
     }
 
-    private static async Task DownloadToFileAsync(string url, string destPath, long maxBytes, CancellationToken ct)
+    private static async Task DownloadToFileAsync(string url, string destPath, long maxBytes, CancellationToken ct, Action<DownloadProgressReport>? progress = null)
     {
         using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
@@ -342,6 +418,8 @@ public static class RegistryService
         using var stream = await response.Content.ReadAsStreamAsync(ct);
         using var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
 
+        // 进度节流：读块频率高，按时间窗口 80ms 回调一次；收尾必报一次终值（Total 可能为 null=总量未知）。
+        var throttle = System.Diagnostics.Stopwatch.StartNew();
         var buffer = new byte[81920];
         long totalRead = 0;
         int read;
@@ -353,7 +431,13 @@ public static class RegistryService
                 throw new InvalidDataException($"下载流超过最大限制 ({maxBytes / 1024 / 1024} MiB)");
             }
             await fs.WriteAsync(buffer, 0, read, ct);
+            if (progress is not null && throttle.ElapsedMilliseconds >= 80)
+            {
+                throttle.Restart();
+                progress(new DownloadProgressReport(totalRead, contentLength));
+            }
         }
+        progress?.Invoke(new DownloadProgressReport(totalRead, contentLength));
     }
 
     public static string ComputeSha256(string filePath)
@@ -377,3 +461,6 @@ public static class RegistryService
         }
     }
 }
+
+/// <summary>下载进度快照（字节）。Total=null 表示服务端未声明 Content-Length（总量未知，UI 走不确定条）。</summary>
+public readonly record struct DownloadProgressReport(long Received, long? Total);

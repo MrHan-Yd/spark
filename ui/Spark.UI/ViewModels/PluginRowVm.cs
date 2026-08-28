@@ -3,7 +3,6 @@ using System.Runtime.CompilerServices;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Media.Imaging;
 using Spark.UI.Models;
 using Spark.UI.Services;
 using Windows.UI;
@@ -29,8 +28,8 @@ public sealed class PluginRowVm : INotifyPropertyChanged
             .ToList();
         if (!string.IsNullOrEmpty(info.Icon) && File.Exists(info.Icon))
         {
-            try { IconImage = new BitmapImage(new Uri(info.Icon)); }
-            catch (Exception ex) { App.Log("PluginIcon", ex); }
+            // 位图走 WIC，SVG 走 SvgImageSource（见 PluginIconLoader）；失败保持 null → 首字母占位
+            IconImage = PluginIconLoader.Load(info.Icon);
         }
     }
 
@@ -170,16 +169,9 @@ public sealed class PluginRowVm : INotifyPropertyChanged
     private void OnPropertyChanged([CallerMemberName] string? name = null)
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
-    /// <summary>把 host 的 snake_case 字符串解析为枚举；未知值回落 Unsigned。</summary>
+    /// <summary>把 host 的 snake_case 字符串解析为枚举；共享解析见 <see cref="PluginSignStateParser"/>。</summary>
     private static PluginSignState ParseSignState(string raw)
-        => raw?.ToLowerInvariant() switch
-        {
-            "official" => PluginSignState.Official,
-            "third_party" => PluginSignState.ThirdParty,
-            "unsigned" => PluginSignState.Unsigned,
-            "invalid" => PluginSignState.Invalid,
-            _ => PluginSignState.Unsigned,
-        };
+        => PluginSignStateParser.Parse(raw);
 }
 
 /// <summary>一条权限的授权状态；勾选变化由插件页回写 host.plugin.grant。</summary>
@@ -197,18 +189,27 @@ public sealed class PermissionVm : INotifyPropertyChanged
     /// <summary>host 侧已知的授权状态；与 <see cref="Granted"/> 相同即为绑定回声。</summary>
     public bool SyncedGranted { get; set; }
 
-    /// <summary>中文显示名（对齐《插件开发规范》§7 权限表）。</summary>
+    /// <summary>中文显示名（对齐《插件开发规范》§7 权限表）。
+    /// 措辞强调"插件自动访问"——与用户手动粘贴/打字相区分：剪贴板权限
+    /// 管的是插件程序化读写系统剪贴板，不限制用户往插件输入框 Ctrl+V。</summary>
     public string Display => Key switch
     {
-        "clipboard" => "剪贴板",
-        "notify" => "通知",
-        "net" => "网络",
+        "clipboard" => "自动读写剪贴板",
+        "notify" => "发送系统通知",
+        "net" => "访问网络",
         "shell.open" => "打开外部程序",
-        "fs.read" => "读文件",
-        "fs.write" => "写文件",
+        "fs.read" => "读取文件",
+        "fs.write" => "写入文件",
         "window.alwaysOnTop" => "窗口置顶",
         "db" => "私有存储",
         _ => Key
+    };
+
+    /// <summary>勾选框悬浮说明：把"自动访问"的语义边界讲清，避免误解为限制用户粘贴。</summary>
+    public string Description => Key switch
+    {
+        "clipboard" => "授权后允许插件在后台自动读取/写入系统剪贴板；你手动复制粘贴、输入的内容不受影响。",
+        _ => "授权后允许插件自动使用该系统能力；你手动输入/粘贴的内容不受影响。"
     };
 
     private bool _granted;

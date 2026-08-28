@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use spark_core::{history_path, Action, Candidate, Source};
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -121,13 +122,21 @@ impl HistoryStore {
         );
     }
 
+    /// 测试专用：物理条目数。as_candidates 的读取过滤会掩盖物理清理的回归
+    /// （死条目被滤掉后展示层看不出库里还有它），跨 crate 断言物理删除须查条目数。
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Re-point stale history entries at the current index.
     ///
     /// Shortcut-merging changed the id space (per-shortcut id → per-exe id), so
     /// legacy entries whose target is a `.lnk` no longer match anything. They
     /// are remapped to the merged app row by unique title match, or dropped.
     /// Non-shortcut entries (files, plugins) are kept unless their id or target
-    /// resolves to a live row.
+    /// resolves to a live row. 已卸载应用的死条目不在这里清理——物理清理跟随
+    /// 读取路径（as_candidates 查列表时顺带进行），见其文档注释。
     pub fn reconcile(&mut self, index: &MemoryIndex) {
         let mut by_target: HashMap<String, &Candidate> = HashMap::new();
         let mut by_title: HashMap<String, Vec<&Candidate>> = HashMap::new();
@@ -198,7 +207,23 @@ impl HistoryStore {
     /// use_count 仅作同秒平局判断）。不做频率加权——默认页语义是"最近使用"，
     /// 不是"最常用"；频率信号只用在搜索路径的 apply_boost 里。
     /// 只输出应用：文档类文件历史（txt/word 等）不展示、不参与搜索。
-    pub fn as_candidates(&self, limit: usize) -> Vec<Candidate> {
+    /// 清理跟随读取：应用类条目的 target 在本地固定盘上已确认消失（已卸载）时，
+    /// 查列表的这一次遍历顺带物理移除并落盘（有变化才落盘）——不依赖定时器
+    /// 或索引重建。盘符甄别与判死细则见 target_alive。
+    pub fn as_candidates(&mut self, limit: usize) -> Vec<Candidate> {
+        let mut changed = false;
+        self.entries.retain(|_, e| match e.target.as_deref() {
+            Some(t) if is_app_target(t) && !target_alive(t) => {
+                changed = true;
+                false
+            }
+            _ => true,
+        });
+        if changed {
+            #[cfg(not(test))]
+            self.save();
+        }
+
         let mut list: Vec<&HistoryEntry> = self
             .entries
             .values()
@@ -277,6 +302,60 @@ fn norm_path(s: &str) -> String {
     t.to_lowercase()
 }
 
+/// Win32 盘符类型：固定磁盘。
+const DRIVE_FIXED: u32 = 3;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+}
+
+/// 盘符根是否为本地固定磁盘。GetDriveTypeW 是本地内核查询（读重定向器的
+/// 既有映射状态），不会向远端发起重连，微秒级返回，可安全放在查询热路径。
+#[cfg(windows)]
+fn drive_is_fixed(root: &str) -> bool {
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { GetDriveTypeW(wide.as_ptr()) == DRIVE_FIXED }
+}
+
+#[cfg(not(windows))]
+fn drive_is_fixed(_root: &str) -> bool {
+    true
+}
+
+/// 从目标中提取盘符根 `X:\`；非盘符开头形态返回 None。
+/// UNC `\\...`、协议 `ms-settings:`、命令 `echo:hello`、纯 CJK 文本都不是盘符形态。
+fn drive_root(target: &str) -> Option<String> {
+    let bytes = target.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+    Some(format!("{}:\\", bytes[0].to_ascii_uppercase() as char))
+}
+
+/// 本地固定磁盘上的盘符路径（`X:\...`）才做文件级存在性检查；
+/// 文件已删除（应用已卸载）的条目在 as_candidates 查列表时被顺带物理清理。
+/// 检查前先做盘符甄别：可移动盘/映射网络盘/未知盘符一律视为存活——
+/// 死亡网络盘的 stat（GetFileAttributes）会触发重连阻塞数秒，而本检查
+/// 运行在 host 锁内的每次查询上，绝不能引入该阻塞。UNC/命令/协议/插件类
+/// 目标同样不检查。固定盘上的 stat 是本地微秒级操作（~54-100 次/查询）。
+/// 有意不做任何按文件路径的存活缓存——缓存"存在"结论会让卸载检测失效，
+/// 退化回本过滤要修的原始 bug。
+/// 判死语义：仅 `try_exists` 返回 Ok(false)（确认不存在）才判死；
+/// stat 出错（ACL 收紧、设备错误等 Err）视为存活保留——本结果同时是
+/// 物理删除（as_candidates 清理）的依据，"错误=判死"会把临时不可读
+/// 升级成不可逆误删。
+fn target_alive(target: &str) -> bool {
+    let Some(root) = drive_root(target) else {
+        return true;
+    };
+    if !drive_is_fixed(&root) {
+        return true;
+    }
+    !matches!(Path::new(target).try_exists(), Ok(false))
+}
+
 fn recency_score(last: u64) -> f32 {
     recency_score_at(last, now_secs())
 }
@@ -291,6 +370,13 @@ fn recency_score_at(last: u64, now: u64) -> f32 {
 mod tests {
     use super::*;
     use spark_core::Candidate;
+
+    /// 真实存在的临时 exe 文件：存在性过滤只放行活文件，展示路径的用例需要真路径。
+    fn temp_app_exe(tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("spark_hist_{}_{}.exe", tag, std::process::id()));
+        std::fs::write(&p, b"").unwrap();
+        p.to_string_lossy().into_owned()
+    }
 
     #[test]
     fn record_and_boost() {
@@ -315,7 +401,7 @@ mod tests {
                 item_id: "app:once".into(),
                 title: "Once App".into(),
                 subtitle: None,
-                target: Some(r"C:\once.exe".into()),
+                target: Some(temp_app_exe("once")),
                 icon: None,
                 use_count: 1,
                 last_used_at: now - 86_400,
@@ -327,7 +413,7 @@ mod tests {
                 item_id: "app:freq".into(),
                 title: "Freq App".into(),
                 subtitle: None,
-                target: Some(r"C:\freq.exe".into()),
+                target: Some(temp_app_exe("freq")),
                 icon: None,
                 use_count: 20,
                 last_used_at: now - 5 * 86_400,
@@ -435,12 +521,67 @@ mod tests {
     fn as_candidates_filters_document_files() {
         let mut h = HistoryStore::default();
         let now = now_secs();
+        let exe = temp_app_exe("docfilter");
         h.seed_for_test("app.doc", 1, now, Some(r"D:\WinRAR\WhatsNew.txt"));
-        h.seed_for_test("app.exe", 1, now - 60, Some(r"D:\WinRAR\WinRAR.exe"));
+        h.seed_for_test("app.exe", 1, now - 60, Some(exe.as_str()));
         h.seed_for_test("app.noext", 1, now - 120, None);
         let items = h.as_candidates(10);
         assert_eq!(items.len(), 2, "文档类历史不展示");
         assert_eq!(items[0].id, "app.exe", "应用保留且按 recency 排序");
         assert_eq!(items[1].id, "app.noext");
+    }
+
+    #[test]
+    fn as_candidates_skips_dead_local_targets() {
+        let mut h = HistoryStore::default();
+        let now = now_secs();
+        let alive = temp_app_exe("alive");
+        // 已卸载应用：本地盘符路径且文件不存在 → 展示层忽略 + 物理清理
+        h.seed_for_test(
+            "app.dead",
+            1,
+            now,
+            Some(r"C:\spark_no_such_dir_7f3a\quark.exe"),
+        );
+        // 文件仍存在的条目正常展示
+        h.seed_for_test("app.alive", 1, now - 60, Some(alive.as_str()));
+        // 命令/协议类目标不做存在性检查，原样保留
+        h.seed_for_test("app.proto", 1, now - 120, Some("ms-settings:"));
+        let items = h.as_candidates(10);
+        let ids: Vec<&str> = items.iter().map(|c| c.id.as_str()).collect();
+        assert!(!ids.contains(&"app.dead"), "已卸载应用的历史条目应被忽略");
+        assert!(ids.contains(&"app.alive"));
+        assert!(
+            ids.contains(&"app.proto"),
+            "非文件路径目标不受存在性检查影响"
+        );
+        // 查列表这一次遍历顺带物理清理：死条目从库内移除，不再占配额
+        assert_eq!(h.len_for_test(), 2, "死条目被物理移除，活/命令条目保留");
+    }
+
+    #[test]
+    fn drive_root_extraction() {
+        assert_eq!(drive_root(r"C:\x\app.exe").as_deref(), Some(r"C:\"));
+        assert_eq!(drive_root(r"c:\x").as_deref(), Some(r"C:\"));
+        assert_eq!(drive_root(r"\\server\share\app.exe"), None);
+        assert_eq!(drive_root("ms-settings:"), None);
+        assert_eq!(drive_root("echo:hello"), None);
+        assert_eq!(drive_root("夸克浏览器"), None);
+        assert_eq!(drive_root("C:"), None);
+        assert_eq!(drive_root(""), None);
+        assert_eq!(drive_root(r"C:/x"), None, "正斜杠不是盘符形态");
+        assert_eq!(drive_root(r"\\?\C:\x"), None, "扩展前缀不是盘符形态");
+    }
+
+    #[test]
+    fn target_alive_skips_non_fixed_and_non_drive_forms() {
+        // 本机 C:\ 是固定盘：死路径被过滤、活文件放行
+        assert!(!target_alive(r"C:\spark_no_such_dir_7f3a\quark.exe"));
+        assert!(target_alive(temp_app_exe("alive2").as_str()));
+        // 非盘符形态（UNC/协议/命令/CJK）：直接放行，不做磁盘 IO
+        assert!(target_alive("ms-settings:"));
+        assert!(target_alive("echo:hello"));
+        assert!(target_alive(r"\\server\share\app.exe"));
+        assert!(target_alive("夸克"));
     }
 }

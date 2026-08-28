@@ -37,7 +37,8 @@ fn titles_overlap(a: &str, b: &str) -> bool {
 }
 
 pub trait SearchIndex: Send + Sync {
-    fn search(&self, query: &Query) -> Vec<Candidate>;
+    /// &mut self：实现方可在搜索路径上做顺带的维护（如历史死条目清理）。
+    fn search(&mut self, query: &Query) -> Vec<Candidate>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -95,7 +96,7 @@ impl AppIndex {
         self.history.record(item);
     }
 
-    pub fn find_by_id(&self, id: &str) -> Option<Candidate> {
+    pub fn find_by_id(&mut self, id: &str) -> Option<Candidate> {
         self.memory
             .iter()
             .find(|c| c.id == id)
@@ -108,7 +109,7 @@ impl AppIndex {
             })
     }
 
-    pub fn search_with_history(&self, query: &Query) -> Vec<Candidate> {
+    pub fn search_with_history(&mut self, query: &Query) -> Vec<Candidate> {
         let q = query.normalized();
         if q.is_empty() {
             // 默认页只展示"打开过的"：纯最近使用（recency 序），最多 6 条一屏扫完。
@@ -161,13 +162,15 @@ impl AppIndex {
     }
 
     /// 后台重建完成后原子换入新内存索引（历史记录保留），避免重建期间长时间占用锁。
+    /// 已卸载应用的死历史条目不在这里清理——清理跟随读取路径（as_candidates 查列表
+    /// 时顺带物理清理），不依赖 30s 重建定时器。
     pub fn swap_memory(&mut self, memory: MemoryIndex) {
         self.memory = memory;
     }
 }
 
 impl SearchIndex for AppIndex {
-    fn search(&self, query: &Query) -> Vec<Candidate> {
+    fn search(&mut self, query: &Query) -> Vec<Candidate> {
         self.search_with_history(query)
     }
 
@@ -203,7 +206,7 @@ mod tests {
         }
     }
 
-    fn empty_query(idx: &AppIndex, limit: u32) -> Vec<Candidate> {
+    fn empty_query(idx: &mut AppIndex, limit: u32) -> Vec<Candidate> {
         idx.search_with_history(&Query {
             text: String::new(),
             limit,
@@ -215,12 +218,39 @@ mod tests {
         let mut idx = AppIndex::new();
         idx.memory.upsert(app("app.pad", "Pad App", 0.95));
         // 没有打开记录 → 空查询不展示任何兜底应用
-        assert!(empty_query(&idx, 10).is_empty());
+        assert!(empty_query(&mut idx, 10).is_empty());
         // 有记录 → 只展示历史项，不混入没打开过的
-        idx.record_usage(&app("app.used", "Used App", 0.0));
-        let items = empty_query(&idx, 10);
+        // （target 指向真实存在的文件：已卸载应用的死路径会被读取时清理）
+        let exe = std::env::temp_dir().join(format!("spark_hist_used_{}.exe", std::process::id()));
+        std::fs::write(&exe, b"").unwrap();
+        let mut used = app("app.used", "Used App", 0.0);
+        used.target = Some(exe.to_string_lossy().into_owned());
+        idx.record_usage(&used);
+        let items = empty_query(&mut idx, 10);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "app.used");
+    }
+
+    #[test]
+    fn empty_query_prunes_dead_history_physically() {
+        let mut idx = AppIndex::new();
+        // 死目标：固定盘上已不存在的 exe（已卸载应用）
+        let mut dead = app("app.dead", "Dead App", 0.5);
+        dead.target = Some(r"C:\spark_no_such_dir_7f3a\quark.exe".into());
+        idx.record_usage(&dead);
+        // 活目标：真实存在的临时文件
+        let exe = std::env::temp_dir().join(format!("spark_hist_swap_{}.exe", std::process::id()));
+        std::fs::write(&exe, b"").unwrap();
+        let mut alive = app("app.alive", "Alive App", 0.4);
+        alive.target = Some(exe.to_string_lossy().into_owned());
+        idx.record_usage(&alive);
+
+        // 打开默认页（查最近使用列表）这一次调用顺带物理清理死条目。
+        // 直接断言物理条目数——仅靠展示层断言会掩盖"读取过滤存在但清理缺失"的回归。
+        let items = empty_query(&mut idx, 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "app.alive");
+        assert_eq!(idx.history().len_for_test(), 1, "死条目随查询被物理清理");
     }
 
     #[test]
@@ -236,7 +266,7 @@ mod tests {
             .seed_for_test("app.old", 20, now - 86_400, None);
         idx.history_mut()
             .seed_for_test("app.new", 1, now - 60, None);
-        let items = empty_query(&idx, 10);
+        let items = empty_query(&mut idx, 10);
         assert_eq!(items.len(), 2);
         // 纯 recency 序：刚用过的在最前（哪怕 app.old 用了 20 次），不被分数重排
         assert_eq!(items[0].id, "app.new");
@@ -254,7 +284,7 @@ mod tests {
             idx.history_mut()
                 .seed_for_test(&format!("app.{i}"), 1, now - i * 60, None);
         }
-        let items = empty_query(&idx, 50);
+        let items = empty_query(&mut idx, 50);
         assert_eq!(
             items.len(),
             EMPTY_QUERY_RECENT_LIMIT,
@@ -285,7 +315,7 @@ mod tests {
     #[test]
     fn builtin_shows_when_no_app_conflict() {
         // 开始菜单没有同功能应用时，内置命令正常出现
-        let idx = AppIndex::new();
+        let mut idx = AppIndex::new();
         let items = idx.search_with_history(&Query {
             text: "锁屏".into(),
             limit: 50,

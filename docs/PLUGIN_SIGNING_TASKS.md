@@ -170,25 +170,25 @@ crates/host/src/ipc_server.rs
 
 ## Phase 4：UI 角标 + 安装提示 + 市场 signature 字段
 
-> 状态：4.1/4.2 已完成（Code Auditor 回归通过）；4.3/4.4 待市场页落地后再做；4.5 文档同步待做。
+> 状态：4.1/4.2 已完成（Code Auditor 回归通过）；4.3 卡片徽章/待签名灰徽、4.4 已随市场页（MainWindow 市场 Tab）落地（2026-08-27，Code Auditor 回归通过），4.3 的"未签名安装前确认框"待做。
 
 ### 4.1 C# DTO ✅
 - [x] `Models/PluginDto.cs` 加 `sign_state` 字段（string，承接 host snake_case）+ `PluginSignState` 枚举（VM 解析用）
-- [ ] ~~`Models/RegistryDto.cs` `RegistryVersionDto` 加 `Signature` 可选字段~~ — 市场页（`RegistryDto`/`RegistryService`）尚未落地，随市场二期一起做
+- [x] ~~`Models/RegistryDto.cs` `RegistryVersionDto` 加 `Signature` 可选字段~~ ✅ 2026-08-27（`RegistrySignatureDto`：schema/key_id/algorithm/signature）
 
 ### 4.2 设置·插件列表 ✅
 - [x] 插件项加 `SignState` 角标：官方=绿色"官方"、三方=蓝色"已签名"、未签名=无、失效=红色"签名失效"
 - [x] `Invalid` 时不阻止"关闭"，仅阻止"启用"（`OnPluginToggled` 拦截 Off→On，保留 On→Off 处置路径）+ 红色提示行（如实告知"文件可能被篡改，建议停用或卸载"，不虚构"已禁用"）
 - [x] Code Auditor 回归 PASSED（Issue #1 开关锁死、Issue #2 文案误报 两个阻断级已修复）
 
-### 4.3 市场·插件卡片（待市场页落地）
-- [ ] 卡片标题旁徽章（官方/已签名/未签名）— `MarketplacePage` 尚未创建
+### 4.3 市场·插件卡片
+- [x] 卡片标题旁徽章（官方/已签名/签名失效/待签名）✅ 2026-08-27（MainWindow 市场 Tab；官方=索引 key_id 预判且仅官方源生效、本地验签优先（包内权威 §4.6）、三方源仅本地验签后显示、官方源未签名=灰"待签名"）
 - [ ] 未签名安装前弹"未签名，确认来源可信"确认框
-- [ ] 官方仓库未签名版本（3.0 过渡期）显示"待签名"灰徽，仍可装但警告
+- [x] 官方仓库未签名版本（3.0 过渡期）显示"待签名"灰徽，仍可装（灰徽提示）✅ 2026-08-27
 
-### 4.4 registry.json signature 字段处理（待市场页落地）
-- [ ] `RegistryService` 下载后若 `version.signature` 有值，与包内 `signature.json` 比对（不一致以包内为准，仅记日志）— `RegistryService` 尚未创建
-- [ ] 卡片优先用 `version.signature.key_id` 预判"官方"（下载前展示），安装时以 host 验签结果为准
+### 4.4 registry.json signature 字段处理
+- [x] `RegistryService` 下载后若 `version.signature` 有值，与包内 `signature.json` 比对（不一致以包内为准，仅记日志）✅ 2026-08-27（`LogRegistrySignatureMismatch`，装前预检）
+- [x] 卡片优先用 `version.signature.key_id` 预判"官方"（下载前展示），安装时以 host 验签结果为准 ✅ 2026-08-27（`RegistryPluginViewDto.DisplaySignState`：本地验签 > 官方源 key_id 预判；三方源门控防伪造 key_id 钓鱼）
 
 ### 4.5 文档同步 ✅
 - [x] `插件开发/插件开发规范.md` §9.5 发布（CI 自动签名 + 三方待后续）/ §12 安全约束（官方私钥签名 + 本地免签名）/ §14 清单 schema（反注释不加 official/signed 字段）/ §15 IPC 表（install 内部验签 + list 返 sign_state）

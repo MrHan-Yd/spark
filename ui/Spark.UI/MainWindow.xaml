@@ -1257,6 +1257,7 @@
                               <ItemsControl.ItemTemplate>
                                 <DataTemplate>
                                   <CheckBox Content="{Binding Display}" IsChecked="{Binding Granted, Mode=TwoWay}"
+                                            ToolTipService.ToolTip="{Binding Description}"
                                             MinWidth="0" FontSize="11" Checked="OnPermissionToggled"
                                             Unchecked="OnPermissionToggled"
                                             Foreground="{StaticResource TextSecondaryBrush}"/>
@@ -1493,7 +1494,7 @@
                   </StackPanel>
                 </Grid>
 
-                <!-- 市场插件列表 -->
+                <!-- 市场插件列表（卡片样式与已装插件列表同款：34px 首字母图标 + 标题行 + 元信息行） -->
                 <ListView x:Name="MarketList" SelectionMode="None" IsItemClickEnabled="False"
                           Padding="0" Background="Transparent" BorderThickness="0" Margin="0,4,0,0">
                   <ListView.ItemContainerStyle>
@@ -1501,7 +1502,7 @@
                       <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
                       <Setter Property="VerticalContentAlignment" Value="Stretch"/>
                       <Setter Property="Padding" Value="0"/>
-                      <Setter Property="Margin" Value="-12,0,-12,12"/>
+                      <Setter Property="Margin" Value="0,0,0,8"/>
                       <Setter Property="IsTabStop" Value="False"/>
                       <Setter Property="UseSystemFocusVisuals" Value="True"/>
                       <Setter Property="Template">
@@ -1522,54 +1523,125 @@
                   <ListView.ItemTemplate>
                     <DataTemplate>
                       <Border Background="{StaticResource ChipBgBrush}" BorderBrush="{StaticResource GlassBorderBrush}"
-                              BorderThickness="1" CornerRadius="12" Padding="16,14">
-                        <Grid ColumnSpacing="12">
+                              BorderThickness="1" CornerRadius="12" Padding="14,12">
+                        <Grid ColumnSpacing="10">
                           <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
                           </Grid.ColumnDefinitions>
 
-                          <!-- 图标占位 -->
-                          <Border Width="36" Height="36" CornerRadius="9" Background="{StaticResource ChipBgBrush}"
-                                  VerticalAlignment="Top">
-                            <FontIcon Glyph="&#xE71D;" FontSize="18" Foreground="{StaticResource TextSecondaryBrush}"
-                                      HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                          </Border>
+                          <!-- 图标：远程加载的 Image 优先，失败/未就绪退回首字母兜底 -->
+                          <Grid Width="34" Height="34" VerticalAlignment="Center">
+                            <Image Source="{Binding IconImage}" Stretch="Uniform"
+                                   Visibility="{Binding IconImageVisibility}"/>
+                            <Border CornerRadius="9" Background="{StaticResource ChipBgBrush}"
+                                    Visibility="{Binding IconLetterVisibility}">
+                              <TextBlock Text="{Binding IconLetter}" FontSize="15" FontWeight="SemiBold"
+                                         Foreground="{StaticResource TextSecondaryBrush}"
+                                         HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                          </Grid>
 
-                          <StackPanel Grid.Column="1" Spacing="4" VerticalAlignment="Center">
+                          <!-- 名称 + 版本 + 角标 + 描述 + 元信息 -->
+                          <StackPanel Grid.Column="1" Spacing="3" VerticalAlignment="Center" Margin="0,0,8,0">
                             <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                               <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="SemiBold"
-                                         Foreground="{StaticResource TextPrimaryBrush}"/>
-                              <Border Background="{StaticResource ChipBgBrush}" CornerRadius="4" Padding="5,1">
-                                <TextBlock Text="{Binding VersionText}" FontSize="10" Foreground="{StaticResource TextSecondaryBrush}"/>
-                              </Border>
+                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                         TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+                              <TextBlock Text="{Binding VersionText}" FontSize="10" VerticalAlignment="Center"
+                                         Foreground="{StaticResource TextTertiaryBrush}"/>
                               <Border Background="#33FF9F0A" CornerRadius="4" Padding="5,1"
                                       Visibility="{Binding NativeBadgeVisibility}" VerticalAlignment="Center">
-                                <TextBlock Text="原生插件" FontSize="9" Foreground="#FFFF9F0A"/>
+                                <TextBlock Text="原生" FontSize="9" Foreground="#FFFF9F0A"/>
+                              </Border>
+                              <!-- 签名角标（规范 Phase 4.3/4.4）：官方源按索引 signature.key_id 预判"官方"（下载前展示）；
+                                   已装副本本地验签优先（包内权威）；官方源未签名版本显灰"待签名"；三方源仅本地验签通过后显示 -->
+                              <Border Background="{Binding SignBadgeBackground}" CornerRadius="4" Padding="5,1"
+                                      Visibility="{Binding SignBadgeVisibility}" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding SignBadgeText}" FontSize="9"
+                                           Foreground="{Binding SignBadgeForeground}"/>
                               </Border>
                             </StackPanel>
                             <TextBlock Text="{Binding Description}" FontSize="11"
                                        Foreground="{StaticResource TextTertiaryBrush}"
-                                       TextWrapping="Wrap" MaxLines="2" LineHeight="16"/>
-                            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2,0,0">
-                              <TextBlock Text="{Binding Author}" FontSize="10"
-                                         Foreground="{StaticResource TextTertiaryBrush}"/>
-                              <TextBlock Text="{Binding PermissionsSummary}" FontSize="10"
-                                         Foreground="{StaticResource TextTertiaryBrush}"/>
+                                       TextTrimming="CharacterEllipsis" TextWrapping="Wrap" MaxLines="2" LineHeight="16"/>
+                            <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,2,0,0">
+                              <StackPanel Orientation="Horizontal" Spacing="4"
+                                          Visibility="{Binding AuthorVisibility}">
+                                <FontIcon Glyph="&#xE77B;" FontSize="10"
+                                          Foreground="{StaticResource TextTertiaryBrush}"/>
+                                <TextBlock Text="{Binding Author}" FontSize="10"
+                                           Foreground="{StaticResource TextTertiaryBrush}"
+                                           TextTrimming="CharacterEllipsis"/>
+                              </StackPanel>
+                              <StackPanel Orientation="Horizontal" Spacing="4">
+                                <FontIcon Glyph="&#xE8D7;" FontSize="10"
+                                          Foreground="{StaticResource TextTertiaryBrush}"/>
+                                <TextBlock Text="{Binding PermissionsSummary}" FontSize="10"
+                                           Foreground="{StaticResource TextTertiaryBrush}"
+                                           TextTrimming="CharacterEllipsis"/>
+                              </StackPanel>
                             </StackPanel>
                           </StackPanel>
 
+                          <!-- 右侧：安装/更新按钮（版本号在名称行展示）。安装中按钮自身即进度载体：
+                               水体从底部升起 + 双层正弦波横流（充电动画式），满格=下载完成 -->
                           <StackPanel Grid.Column="2" Spacing="4" VerticalAlignment="Center" HorizontalAlignment="Right">
                             <Button Content="{Binding ActionButtonText}" IsEnabled="{Binding ActionButtonEnabled}"
-                                    Click="OnInstallFromMarketplace"
-                                    Padding="14,6" CornerRadius="8" FontSize="12" FontWeight="SemiBold"
-                                    Background="{StaticResource AccentSoftBrush}" Foreground="{StaticResource TextPrimaryBrush}"
-                                    BorderThickness="0"/>
-                            <TextBlock Text="{Binding InstalledVersion}"
-                                       Visibility="{Binding InstalledLabelVisibility}"
-                                       FontSize="10" Foreground="{StaticResource TextTertiaryBrush}"
-                                       HorizontalAlignment="Center"/>
+                                    Click="OnInstallFromMarketplace" Padding="12,5" CornerRadius="8"
+                                    Loaded="OnInstallButtonLoaded" Unloaded="OnInstallButtonUnloaded"
+                                    DataContextChanged="OnInstallButtonDataContextChanged"
+                                    FontSize="11" FontWeight="SemiBold" BorderThickness="0"
+                                    Background="{StaticResource AccentSoftBrush}" Foreground="{StaticResource TextPrimaryBrush}">
+                              <Button.Template>
+                                <ControlTemplate TargetType="Button">
+                                  <Grid x:Name="WaveRoot">
+                                    <VisualStateManager.VisualStateGroups>
+                                      <VisualStateGroup x:Name="CommonStates">
+                                        <VisualState x:Name="Normal"/>
+                                        <VisualState x:Name="PointerOver">
+                                          <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="WaveRoot" Storyboard.TargetProperty="Opacity"
+                                                             To="0.88" Duration="0"/>
+                                          </Storyboard>
+                                        </VisualState>
+                                        <VisualState x:Name="Pressed">
+                                          <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="WaveRoot" Storyboard.TargetProperty="Opacity"
+                                                             To="0.75" Duration="0"/>
+                                          </Storyboard>
+                                        </VisualState>
+                                        <VisualState x:Name="Disabled">
+                                          <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="WaveRoot" Storyboard.TargetProperty="Opacity"
+                                                             To="0.45" Duration="0"/>
+                                          </Storyboard>
+                                        </VisualState>
+                                      </VisualStateGroup>
+                                    </VisualStateManager.VisualStateGroups>
+                                    <Border Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}"/>
+                                    <!-- 水体：显式 Width=0 + Left 对齐，使其对按钮期望尺寸的贡献恒为 0
+                                         （Canvas/Grid 的可见子元素本会计入 DesiredSize，撑宽按钮）；
+                                         波浪向右渲染、超出部分由 WaveRoot 的 Clip（代码设置）裁齐。
+                                         Height 由代码随下载进度驱动。 -->
+                                    <Canvas x:Name="WaveWater" Width="0" HorizontalAlignment="Left" VerticalAlignment="Bottom" Height="0"
+                                            Visibility="Collapsed" IsHitTestVisible="False">
+                                      <Path x:Name="WaveBack" Canvas.Left="0" Canvas.Top="0" Margin="-12,1.5,0,0"
+                                            Fill="#244C9AFF"
+                                            Data="M0,2.5 Q6,-1 12,2.5 T24,2.5 T36,2.5 T48,2.5 T60,2.5 T72,2.5 T84,2.5 T96,2.5 T108,2.5 T120,2.5 T132,2.5 T144,2.5 T156,2.5 T168,2.5 T180,2.5 T192,2.5 T204,2.5 T216,2.5 T228,2.5 T240,2.5 T252,2.5 T264,2.5 L264,44 L0,44 Z"/>
+                                      <Path x:Name="WaveFront" Canvas.Left="0" Canvas.Top="0"
+                                            Fill="#3D4C9AFF"
+                                            Data="M0,2.5 Q6,-1 12,2.5 T24,2.5 T36,2.5 T48,2.5 T60,2.5 T72,2.5 T84,2.5 T96,2.5 T108,2.5 T120,2.5 T132,2.5 T144,2.5 T156,2.5 T168,2.5 T180,2.5 T192,2.5 T204,2.5 T216,2.5 T228,2.5 T240,2.5 T252,2.5 T264,2.5 L264,44 L0,44 Z"/>
+                                    </Canvas>
+                                    <ContentPresenter Content="{TemplateBinding Content}"
+                                                      Foreground="{TemplateBinding Foreground}"
+                                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                      Margin="{TemplateBinding Padding}"/>
+                                  </Grid>
+                                </ControlTemplate>
+                              </Button.Template>
+                            </Button>
                           </StackPanel>
                         </Grid>
                       </Border>

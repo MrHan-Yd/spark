@@ -8,6 +8,7 @@
   <Grid x:Name="Root" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
     </Grid.RowDefinitions>
 
@@ -92,6 +93,11 @@
               IsHitTestVisible="False"/>
     </Grid>
 
-    <controls:WebView2 x:Name="Web" Grid.Row="1"/>
+    <!-- 权限被拒提示条（IsOpen=false 时整行折叠为 0 高，不占布局）。
+         放在 WebView2 独立行而非覆盖：WebView2 是 HWND 宿主，XAML 元素盖不住它。 -->
+    <controls:InfoBar x:Name="PermBar" Grid.Row="1" Margin="12,8,12,0"
+                      Severity="Warning" IsOpen="False" IsClosable="True"/>
+
+    <controls:WebView2 x:Name="Web" Grid.Row="2"/>
   </Grid>
 </Window>

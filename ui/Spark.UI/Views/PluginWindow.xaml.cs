@@ -4,7 +4,6 @@ using Microsoft.UI;
 using Microsoft.UI.Input;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.Web.WebView2.Core;
 using Spark.UI.Models;
 using Spark.UI.Services;
@@ -80,16 +79,11 @@ public sealed partial class PluginWindow : Window
 
     private bool TrySetIcon(string? path)
     {
-        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
-        try
-        {
-            // 本地反斜杠路径直接 new Uri 会抛 UriFormatException；转成 file:/// URI。
-            var file = path.Replace('\\', '/');
-            if (!file.StartsWith('/')) file = "/" + file;
-            TitleIcon.Source = new BitmapImage(new Uri("file:///" + file));
-            return true;
-        }
-        catch (Exception ex) { App.Log("PluginTitleIcon", ex); return false; }
+        // 统一走 PluginIconLoader：位图用 BitmapImage，SVG 用 SvgImageSource
+        var src = PluginIconLoader.Load(path);
+        if (src is null) return false;
+        TitleIcon.Source = src;
+        return true;
     }
 
     private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
@@ -211,6 +205,13 @@ public sealed partial class PluginWindow : Window
             // 新窗口/导航到外部站点一律拒绝：插件页只能待在自己的虚拟主机内。
             core.NewWindowRequested += (_, e) => e.Handled = true;
             core.NavigationStarting += OnNavigationStarting;
+            // Web 权限请求（web 剪贴板读取、通知、地理位置等）一律显式拒绝：
+            // 特权能力只走 spark.* 桥，由 host 按"清单声明+用户授权"鉴权。
+            core.PermissionRequested += (_, e) =>
+            {
+                e.Handled = true;
+                e.State = CoreWebView2PermissionState.Deny;
+            };
 
             await core.AddScriptToExecuteOnDocumentCreatedAsync(BuildBootstrapScript(input, command, rawQuery));
             await core.AddScriptToExecuteOnDocumentCreatedAsync(LoadPreloadShim());
@@ -293,6 +294,8 @@ public sealed partial class PluginWindow : Window
     private async void OnWebMessage(CoreWebView2 sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
         int seq = 0;
+        var capability = "";
+        var method = "";
         try
         {
             using var doc = JsonDocument.Parse(e.WebMessageAsJson);
@@ -302,8 +305,8 @@ public sealed partial class PluginWindow : Window
                 || !root.TryGetProperty("seq", out var seqEl)) return;
 
             seq = seqEl.GetInt32();
-            var capability = root.GetProperty("capability").GetString() ?? "";
-            var method = root.GetProperty("method").GetString() ?? "";
+            capability = root.GetProperty("capability").GetString() ?? "";
+            method = root.GetProperty("method").GetString() ?? "";
             var args = root.TryGetProperty("args", out var a) ? a.Clone() : default;
 
             // window/dev 由宿主本地处理，其余转 host。
@@ -319,8 +322,45 @@ public sealed partial class PluginWindow : Window
         {
             var (code, message) = ClassifyError(ex);
             if (seq > 0) PostReply(seq, false, default, code, message);
+            // host 的拒绝消息格式固定为 "PERMISSION_DENIED: ..."，用前缀严格匹配，
+            // 避免插件用含此字样的 capability 名把普通错误伪装成权限拒绝弹提示。
+            if (message.StartsWith("PERMISSION_DENIED:", StringComparison.Ordinal))
+                ShowPermissionDenied(capability, method);
             App.Log("PluginApi", ex);
         }
+    }
+
+    /// <summary>
+    /// host 拒绝特权能力调用时在窗口顶部给出可见提示——授权开关必须"名实相符"，
+    /// 不能让页面静默降级后用户以为权限没被管控。
+    /// 仅覆盖走桥鉴权的能力（clipboard、window.set_always_on_top）；notify/fs/net/shell
+    /// 仍由 preload guarded() 本地快拦静默失败，属既有分期行为。
+    /// </summary>
+    private void ShowPermissionDenied(string capability, string method)
+    {
+        // 在途 IPC 长达 8s，续体可能晚于关窗恢复——与 PostReply 同语义短路，
+        // 不触碰已拆树的 PermBar（async void 异常会直接崩进程）。
+        if (_closing) return;
+        var name = PermissionDisplayName(capability, method);
+        PermBar.Message = $"插件「{_info.Name}」的「{name}」权限未开启，相关操作已被拦截，" +
+                          "可在 插件管理 中勾选授权后重试（你手动粘贴/输入的内容不受影响）。";
+        PermBar.IsOpen = true;
+    }
+
+    /// <summary>capability/method → 用户可读的权限名。措辞与插件管理的"自动读写"语义对齐。</summary>
+    private static string PermissionDisplayName(string capability, string method)
+    {
+        return capability switch
+        {
+            "clipboard" => "自动读写剪贴板",
+            "notify" => "发送系统通知",
+            // window 目前唯一受限方法是 set_always_on_top；后续新增受限方法需同步这里。
+            "window" when method == "set_always_on_top" => "窗口置顶",
+            "net" => "访问网络",
+            "fs" => "读写文件",
+            "shell" => "打开外部程序",
+            _ => capability
+        };
     }
 
     /// <summary>host 以 "CODE: detail" 形式回错误消息，这里还原成规范 §8.6 的 error.code。</summary>

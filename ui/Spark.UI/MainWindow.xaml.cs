@@ -17,8 +17,8 @@ using Microsoft.UI.Xaml.Documents;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Media.Animation;
 using XamlPath = Microsoft.UI.Xaml.Shapes.Path;
+using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.Win32;
 using Spark.UI.Models;
 using Spark.UI.Services;
@@ -1748,12 +1748,30 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>后台取图标补到行上：gen 过期（新一轮查询已开始）则丢弃。</summary>
+    /// <summary>插件候选判别：host 正常候选 Source=="plugin"；收藏兜底重建的 CandidateDto
+    /// 可能丢 Source（FavEntryDto 快照不含该字段），用 PluginId/Target 前缀防御性补判。</summary>
+    private static bool IsPluginCandidate(CandidateDto c)
+        => c.Source == "plugin"
+           || c.PluginId is not null
+           || (c.Target?.StartsWith("plugin:", StringComparison.Ordinal) ?? false);
+
+    /// <summary>后台取图标补到行上：gen 过期（新一轮查询已开始）则丢弃。
+    /// 插件候选的图标是本地图片文件（svg/png），走 PluginIconLoader（与设置页同款）；
+    /// 其余候选是 exe/dll/lnk 的 GDI 图标提取，走 AppIconService。</summary>
     private async Task LoadIconAsync(CandidateDto item, int gen)
     {
         try
         {
-            var src = await AppIconService.GetIconAsync(item.Id, item.Target ?? item.IconPath);
+            ImageSource? src;
+            if (IsPluginCandidate(item))
+            {
+                // ImageSource 有线程亲和性，Load 必须在 UI 线程构造（与设置页先例一致）。
+                src = PluginIconLoader.Load(item.IconPath);
+            }
+            else
+            {
+                src = await AppIconService.GetIconAsync(item.Id, item.Target ?? item.IconPath);
+            }
             if (src is null || gen != _queryGen) return;
             item.IconImage = src;
         }
@@ -1764,14 +1782,31 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>收藏卡图标异步补齐：后台提取完成后替换字母占位。
-    /// 卡片可能已被重建（切组/重绘），对孤立元素赋值无害。</summary>
-    private async Task LoadFavIconAsync(Image img, Border letter, string id, string? hint)
+    /// 卡片可能已被重建（切组/重绘），对孤立元素赋值无害。
+    /// 插件候选走 PluginIconLoader 读本地图片文件，其余走 AppIconService GDI 提取。</summary>
+    private async Task LoadFavIconAsync(Image img, Border letter, CandidateDto c)
     {
-        var src = await AppIconService.GetIconAsync(id, hint);
-        if (src is null) return;
-        img.Source = src;
-        img.Visibility = Visibility.Visible;
-        letter.Visibility = Visibility.Collapsed;
+        try
+        {
+            ImageSource? src;
+            if (IsPluginCandidate(c))
+            {
+                // ImageSource 有线程亲和性，Load 必须在 UI 线程构造（与设置页先例一致）。
+                src = PluginIconLoader.Load(c.IconPath);
+            }
+            else
+            {
+                src = await AppIconService.GetIconAsync(c.Id, c.Target ?? c.IconPath);
+            }
+            if (src is null) return;
+            img.Source = src;
+            img.Visibility = Visibility.Visible;
+            letter.Visibility = Visibility.Collapsed;
+        }
+        catch (Exception ex)
+        {
+            App.Log("FavIcon", ex);
+        }
     }
 
     // ==================== 收藏坞 ====================
@@ -1868,7 +1903,7 @@ public sealed partial class MainWindow : Window
             };
             iconEl.Children.Add(letterTile);
             iconEl.Children.Add(iconImg);
-            _ = LoadFavIconAsync(iconImg, letterTile, c.Id, c.Target ?? c.IconPath);
+            _ = LoadFavIconAsync(iconImg, letterTile, c);
 
             var panel = new StackPanel
             {
@@ -3413,7 +3448,7 @@ public sealed partial class MainWindow : Window
         if (keyId.Length == 0) err = "请填 key_id（开发者公钥标识）";
         else if (keyId.Length > 128) err = "key_id 过长（>128 字符）";
         else if (keyId.Any(char.IsWhiteSpace)) err = "key_id 不能含空白字符";
-        else if (keyId == "spark-official-v1") err = "该 key_id 与内置官方密钥冲突，不可导入";
+        else if (keyId == Models.RegistrySignatureDto.OfficialKeyId) err = "该 key_id 与内置官方密钥冲突，不可导入";
         else if (_trustedDevs.Any(t => t.KeyId == keyId)) err = $"key_id「{keyId}」已存在";
         if (err is null)
         {
@@ -4002,13 +4037,18 @@ public sealed partial class MainWindow : Window
 
         MarketLoadingWrap.Visibility = Visibility.Visible;
         MarketEmpty.Visibility = Visibility.Collapsed;
-        MarketList.Visibility = Visibility.Collapsed;
+        // 已有内容时保留旧列表可见（否则拉取索引期间整块消失，造成"闪一下"）；
+        // 仅首次加载（空列表）才隐藏并显示 loading 占位
+        if (_marketPlugins.Count == 0) MarketList.Visibility = Visibility.Collapsed;
         SetMarketStatus(null);
 
         var idx = MarketSourceCombo.SelectedIndex;
         var url = (idx > 0 && idx < MarketSourceCombo.Items.Count)
             ? MarketSourceCombo.Items[idx]?.ToString() ?? RegistryService.OfficialRegistryUrl
             : RegistryService.OfficialRegistryUrl;
+        // 官方源门控：只有内置官方仓库的索引 signature 字段才参与"官方"预判，
+        // 三方仓库的该字段可伪造（防钓鱼），不预判（规范 Phase 4.4）。
+        var isOfficialSource = string.Equals(url, RegistryService.OfficialRegistryUrl, StringComparison.OrdinalIgnoreCase);
 
         try
         {
@@ -4042,11 +4082,19 @@ public sealed partial class MainWindow : Window
                     InstalledVersion = localVer,
                     CanUpdate = canUpdate,
                     CanDowngrade = canDowngrade,
+                    // 官方源门控 + 已装副本本地验签原文；卡片按 DisplaySignState 优先级展示角标。
+                    IsOfficialSource = isOfficialSource,
+                    InstalledSignStateRaw = local?.SignState,
                 });
             }
 
             MarketList.ItemsSource = null;
             MarketList.ItemsSource = _marketPlugins;
+
+            // 图标异步补齐：registry 的 icon 是 http(s) URL，下载+解码后回填；
+            // 失败保持字母占位。刷新整表重建 DTO，迟到结果落孤立对象无害。
+            foreach (var it in _marketPlugins)
+                _ = LoadMarketIconAsync(it);
 
             var empty = _marketPlugins.Count == 0;
             MarketEmpty.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
@@ -4061,6 +4109,7 @@ public sealed partial class MainWindow : Window
             _marketPlugins.Clear();
             MarketList.ItemsSource = null;
             MarketList.ItemsSource = _marketPlugins;
+            MarketList.Visibility = Visibility.Collapsed; // 与成功路径保持 MarketEmpty/MarketList 互斥不变量
             MarketEmpty.Visibility = Visibility.Visible;
         }
         finally
@@ -4070,24 +4119,65 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>市场卡片图标异步补齐：远程下载 + 解码（SVG/位图均支持），失败保持字母占位。</summary>
+    private async Task LoadMarketIconAsync(RegistryPluginViewDto item)
+    {
+        try
+        {
+            var src = await PluginIconLoader.LoadRemoteAsync(item.Plugin.Icon);
+            if (src is null) return;
+            item.IconImage = src;
+        }
+        catch (Exception ex)
+        {
+            App.Log("MarketIcon", ex);
+        }
+    }
+
     private async void OnInstallFromMarketplace(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is not RegistryPluginViewDto item) return;
         if (item.IsInstalling) return;
+        var btn = sender as Button;
+
+        // await 前置位防重入：原生确认框期间再点会被 IsInstalling 守卫挡住
+        item.IsInstalling = true;
+        item.InstallProgress = 0;
+        StartInstallWave(btn);
 
         if (item.IsNative)
         {
             var confirmNative = await ConfirmDestructiveAsync(
                 $"插件「{item.Name}」为原生插件 (Native)\n拥有操作系统完整执行权限。确认安装？");
-            if (!confirmNative) return;
+            if (!confirmNative)
+            {
+                item.IsInstalling = false;
+                StopInstallWave(btn);
+                return;
+            }
         }
 
-        item.IsInstalling = true;
-        SetMarketStatus($"正在下载 {item.Name} v{item.TargetVersion.Version}…", isError: false);
-        MarketList.ItemsSource = null;
-        MarketList.ItemsSource = _marketPlugins;
+        // 下载进度：HttpClient 线程池线程回调，1% 步进节流后经 DispatcherQueue 回 UI 线程。
+        // 水位即按钮内水体高度：满格=下载完成，之后保持满格 + "安装中…"直到安装结果。
+        // 容器回收会把 btn 重绑到别的条目：驱动视觉前校验 DataContext 仍是本条目，防止给错卡注水。
+        var dispatcher = DispatcherQueue;
+        double lastPct = -1;
+        var progress = new Action<DownloadProgressReport>(rep =>
+        {
+            var pct = rep.Total is > 0 ? Math.Min(100.0, rep.Received * 100.0 / rep.Total.Value) : -1;
+            if (pct >= 0 && pct < 100 && pct - lastPct < 1) return;
+            lastPct = pct;
+            dispatcher.TryEnqueue(() =>
+            {
+                item.ReportDownloadProgress(rep.Received, rep.Total);
+                if (ReferenceEquals(btn?.DataContext, item))
+                    SetInstallWaveLevel(btn, item.ProgressIndeterminate ? 45 : item.InstallProgress);
+            });
+        });
 
         string? tempDir = null;
+        // 安装成功（含更新/降级）时为目标版本装机结果；确认取消/失败为 null（不回填卡片）
+        PluginInstallOutcomeDto? done = null;
         try
         {
             if (!string.IsNullOrEmpty(item.TargetVersion.Url))
@@ -4095,7 +4185,8 @@ public sealed partial class MainWindow : Window
                 // 直链下载预打包 zip
                 tempDir = await RegistryService.DownloadDirectZipAsync(
                     item.TargetVersion.Url,
-                    item.TargetVersion.Sha256);
+                    item.TargetVersion.Sha256,
+                    progress: progress);
             }
             else
             {
@@ -4111,50 +4202,54 @@ public sealed partial class MainWindow : Window
                     tempDir = await RegistryService.DownloadAndExtractZipballAsync(
                         zipballUrl,
                         verPath,
-                        expectedSha256: null);
+                        expectedSha256: null,
+                        progress: progress);
                 }
                 catch (HttpRequestException ex) when (zipballUrl != RegistryService.OfficialZipballUrl)
                 {
                     App.Log("InstallZipballFallback", ex);
+                    lastPct = -1; // 回退地址是新的下载流，进度基线复位，避免条在旧值停滞
                     tempDir = await RegistryService.DownloadAndExtractZipballAsync(
                         RegistryService.OfficialZipballUrl,
                         verPath,
-                        expectedSha256: null);
+                        expectedSha256: null,
+                        progress: progress);
                 }
             }
 
+            // 条满 = 下载完成；解压/安装阶段保持满格 + "安装中…"文案。
+            item.ReportDownloadDone();
+            if (ReferenceEquals(btn?.DataContext, item)) SetInstallWaveLevel(btn, 100);
+
+            // 规范 Phase 4.4：registry signature 与包内 signature.json 装前比对（包内权威，仅记日志不阻断）。
+            LogRegistrySignatureMismatch(item, tempDir);
+
+            // 安装结果通过卡片原位回填呈现（按钮→已是最新、签名角标），状态栏不输出成功文案；
+            // 仅失败时提示。
             var outcome = await _host.PluginInstallAsync(tempDir);
             switch (outcome.Action)
             {
                 case "installed":
-                    SetMarketStatus($"已安装{SignSuffix(outcome.SignState)}：{item.Name} v{outcome.Version}");
+                    done = outcome;
                     break;
                 case "updated":
+                    done = outcome;
                     PluginWindowHost.CloseIfOpen(outcome.Id);
-                    SetMarketStatus($"已更新到 v{outcome.Version}{SignSuffix(outcome.SignState)}");
                     break;
                 case "confirm_downgrade":
                 {
                     var msg = $"检测到已安装较新版本\n当前已装 v{outcome.PreviousVersion}，是否覆盖降级安装 v{outcome.Version}？";
-                    if (!await ConfirmDestructiveAsync(msg))
-                    {
-                        SetMarketStatus("已取消覆盖");
-                        break;
-                    }
+                    if (!await ConfirmDestructiveAsync(msg)) break;
                     PluginWindowHost.CloseIfOpen(outcome.Id);
-                    var forced = await _host.PluginInstallAsync(tempDir, force: true);
-                    SetMarketStatus(forced.Action == "updated"
-                        ? $"已降级安装到 v{forced.Version}{SignSuffix(forced.SignState)}"
-                        : $"已安装{SignSuffix(forced.SignState)}：{item.Name}");
+                    done = await _host.PluginInstallAsync(tempDir, force: true);
                     break;
                 }
                 default:
-                    SetMarketStatus($"安装完成：{item.Name}");
+                    // 未知动作不回填卡片（避免未来 host 新增拒绝/回滚类动作时被误标"已是最新"）
                     break;
             }
 
             await LoadPluginsAsync();
-            await LoadMarketplaceAsync();
         }
         catch (Exception ex)
         {
@@ -4165,8 +4260,334 @@ public sealed partial class MainWindow : Window
         {
             RegistryService.CleanupTemp(tempDir);
             item.IsInstalling = false;
-            MarketList.ItemsSource = null;
-            MarketList.ItemsSource = _marketPlugins;
+            // 原位回填卡片已装状态（不整表重建，列表不闪）：放在 IsInstalling=false 之后，
+            // 让按钮文案/可用性直接落到终态（"已是最新"），排空动画不在"安装中"求值路径上播放。
+            // 成功后同时清空状态栏（不输出成功文案）；失败信息（catch 所设）保留供用户读取
+            if (done is not null)
+            {
+                item.UpdateInstalledState(done.Version, done.SignState);
+                SetMarketStatus(null);
+            }
+            // 按钮可能已被容器回收重绑：只排空仍属于本条目的按钮（回收时已由
+            // DataContextChanged/Unloaded 钩子复位过）
+            if (ReferenceEquals(btn?.DataContext, item)) StopInstallWave(btn);
+        }
+    }
+
+    // ==================== 市场安装按钮·水体波浪 ====================
+
+    /// <summary>按钮 → 水体动画状态。按按钮隔离（多插件可并发安装，谁的动画谁停），
+    /// 避免窗口级单槽被并发安装互相覆盖导致半途冻结/永久泄漏。</summary>
+    private sealed class WaveState
+    {
+        /// <summary>双层波横流动画（Forever）。</summary>
+        public Storyboard FlowSb = new();
+        /// <summary>水位过渡动画（每次进度更新重定向，400ms 缓动）。</summary>
+        public Storyboard? LevelSb;
+        /// <summary>水体垂直位移：Y=按钮高（空，被裁剪不可见）→ 0（满格）。用位移而非 Height
+        /// 驱动水位：RenderTransform 属独立动画（无需 EnableDependentAnimation）且不参与布局。</summary>
+        public TranslateTransform WaterY = new();
+        /// <summary>按钮高度基准（水位映射用）。容器未完成布局时可能为 0，由 SizeChanged 补齐。</summary>
+        public double ButtonH;
+        /// <summary>最近提交的水位百分比（0-100），供高度基准补齐时重建水位。</summary>
+        public double LevelPct;
+        /// <summary>当前水位动画的起止 Y / 起始时刻 / 时长——用于在重定向或排空前推算
+        /// "此刻视觉水位"。WinUI 合成器动画不回写基值，WaterY.Y 始终是基值，不能直接读。</summary>
+        public double LevelFromY;
+        public double LevelToY;
+        public DateTimeOffset LevelStartUtc;
+        public TimeSpan LevelDuration = TimeSpan.Zero;
+    }
+
+    private readonly Dictionary<Button, WaveState> _waveStates = new();
+
+    /// <summary>推算当前视觉水位 Y：水位过渡动画进行中时按缓动曲线插值，否则为基值。</summary>
+    private static double CurrentVisualY(WaveState st)
+    {
+        if (st.LevelSb is null || st.LevelDuration.TotalMilliseconds <= 0) return st.WaterY.Y;
+        var t = (DateTimeOffset.UtcNow - st.LevelStartUtc) / st.LevelDuration;
+        t = Math.Clamp(t, 0, 1);
+        var eased = 1 - Math.Pow(1 - t, 3); // CubicEase EaseOut
+        return st.LevelFromY + (st.LevelToY - st.LevelFromY) * eased;
+    }
+
+    /// <summary>安装开始：铺满水体（初始整体沉到按钮下方不可见）、启动双层波横流。
+    /// 水位由 SetInstallWaveLevel 以平滑过渡动画驱动；按钮自身即进度载体。</summary>
+    private void StartInstallWave(Button? btn)
+    {
+        if (btn is null) return;
+        var root = FindTemplateChild<Grid>(btn, "WaveRoot");
+        var water = FindTemplateChild<Canvas>(btn, "WaveWater");
+        var front = FindTemplateChild<XamlPath>(btn, "WaveFront");
+        var back = FindTemplateChild<XamlPath>(btn, "WaveBack");
+        if (root is null || water is null || front is null || back is null) return;
+
+        // 同按钮重入（Loaded 重启/快速重装）先停旧动画，防累积
+        if (_waveStates.TryGetValue(btn, out var existing))
+        {
+            existing.FlowSb.Stop();
+            existing.LevelSb?.Stop();
+            _waveStates.Remove(btn);
+        }
+
+        // 水体/波浪宽于按钮（264px 波形），用按钮矩形裁剪避免溢出卡片；裁剪随按钮尺寸
+        // （安装文案变化会改宽）经 SizeChanged 持续刷新。WinUI 的 RectangleGeometry 无
+        // RadiusX/Y；水体是半透明色，方形裁剪在 8px 圆角处差异不可见。
+        root.SizeChanged -= OnWaveRootSizeChanged;
+        root.SizeChanged += OnWaveRootSizeChanged;
+        UpdateWaveClip(root);
+
+        // 水体铺满按钮高，初始 Y=按钮高 → 整体沉到裁剪区外（空水）；水位上升 = Y 减小。
+        // 容器刚 realize 尚未布局（滚动往返）时 ActualHeight=0：先登记状态，由
+        // OnWaveRootSizeChanged 在首次有效测量时按 LevelPct 补建水位基准。
+        var h = btn.ActualHeight;
+        var waterY = new TranslateTransform { Y = h };
+        water.RenderTransform = waterY;
+        if (h > 0)
+        {
+            water.Height = h;
+            water.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            water.Height = 0;
+            water.Visibility = Visibility.Collapsed;
+        }
+
+        var ttFront = new TranslateTransform();
+        front.RenderTransform = ttFront;
+        var ttBack = new TranslateTransform();
+        back.RenderTransform = ttBack;
+        var flowSb = new Storyboard();
+        var daFront = new DoubleAnimation
+        {
+            From = 0,
+            To = -24, // 一个波长；循环位移即"海面横流"
+            Duration = new Duration(TimeSpan.FromMilliseconds(1600)),
+            RepeatBehavior = RepeatBehavior.Forever,
+        };
+        Storyboard.SetTarget(daFront, ttFront);
+        Storyboard.SetTargetProperty(daFront, "X");
+        var daBack = new DoubleAnimation
+        {
+            From = -24,
+            To = 0,
+            Duration = new Duration(TimeSpan.FromMilliseconds(2400)),
+            RepeatBehavior = RepeatBehavior.Forever,
+        };
+        Storyboard.SetTarget(daBack, ttBack);
+        Storyboard.SetTargetProperty(daBack, "X");
+        flowSb.Children.Add(daFront);
+        flowSb.Children.Add(daBack);
+        flowSb.Begin();
+
+        _waveStates[btn] = new WaveState
+        {
+            FlowSb = flowSb,
+            WaterY = waterY,
+            ButtonH = h,
+            LevelPct = 0,
+            LevelFromY = h,
+            LevelToY = h,
+        };
+    }
+
+    /// <summary>水位更新（UI 线程）：pct 0-100 → 从当前视觉水位以 400ms 缓动动画平滑推向目标。
+    /// 小插件秒下也能看到一段完整的上升过程；频繁更新则逐次重定向，不跳变、不塌空。</summary>
+    private void SetInstallWaveLevel(Button? btn, double pct)
+    {
+        if (btn is null || !_waveStates.TryGetValue(btn, out var st)) return;
+        if (st.ButtonH <= 0)
+        {
+            // 高度基准未就绪（容器未布局）：只记账，等 SizeChanged 补建基准
+            st.LevelPct = Math.Clamp(pct, 0, 100);
+            return;
+        }
+        var currentY = CurrentVisualY(st);
+        // 关键：先把基值固化为当前视觉水位，再停旧动画——WinUI 合成器动画不回写
+        // WaterY.Y，Stop 会让视觉塌回基值，导致"清空-重爬"抖动
+        st.WaterY.Y = currentY;
+        st.LevelSb?.Stop();
+        st.LevelPct = Math.Clamp(pct, 0, 100);
+        st.LevelFromY = currentY;
+        st.LevelToY = st.ButtonH * (1 - st.LevelPct / 100.0);
+        st.LevelStartUtc = DateTimeOffset.UtcNow;
+        st.LevelDuration = TimeSpan.FromMilliseconds(400);
+        var da = new DoubleAnimation
+        {
+            From = currentY,
+            To = st.LevelToY,
+            Duration = new Duration(st.LevelDuration),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        Storyboard.SetTarget(da, st.WaterY);
+        Storyboard.SetTargetProperty(da, "Y");
+        var sb = new Storyboard();
+        sb.Children.Add(da);
+        sb.Begin();
+        st.LevelSb = sb;
+    }
+
+    private void OnWaveRootSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (sender is not Grid g) return;
+        UpdateWaveClip(g);
+        // 高度基准补齐：Start 时 ActualHeight=0（容器未布局）的场景——首次有效测量时
+        // 按 LevelPct 重建水位基准（直接落位不动画），后续进度更新再走平滑动画
+        if (g.ActualHeight <= 0) return;
+        DependencyObject? p = g;
+        while (p is not null && p is not Button) p = VisualTreeHelper.GetParent(p);
+        if (p is not Button b || !_waveStates.TryGetValue(b, out var st) || st.ButtonH > 0) return;
+        var h = b.ActualHeight;
+        if (h <= 0) return;
+        st.ButtonH = h;
+        st.LevelToY = h * (1 - Math.Clamp(st.LevelPct, 0, 100) / 100.0);
+        st.WaterY.Y = st.LevelToY;
+        st.LevelSb?.Stop();
+        st.LevelSb = null; // 基值已固化，旧动画作废；后续进度从当前水位继续过渡
+        var water = FindTemplateChild<Canvas>(b, "WaveWater");
+        if (water is not null)
+        {
+            water.Height = h;
+            water.Visibility = Visibility.Visible;
+        }
+    }
+
+    private static void UpdateWaveClip(Grid root)
+    {
+        if (root.ActualWidth > 0 && root.ActualHeight > 0)
+        {
+            root.Clip = new RectangleGeometry { Rect = new Rect(0, 0, root.ActualWidth, root.ActualHeight) };
+        }
+    }
+
+    /// <summary>停止指定按钮的水体波浪：停横流/水位动画，水位以 250ms 排空动画退场后隐藏。
+    /// 只动传入按钮自己的动画（按按钮隔离）。无状态（回收残留兜底）时直接隐藏。</summary>
+    private void StopInstallWave(Button? btn)
+    {
+        if (btn is null) return;
+        var water = FindTemplateChild<Canvas>(btn, "WaveWater");
+        if (_waveStates.TryGetValue(btn, out var st))
+        {
+            // 先固化当前视觉水位为基值再停动画（否则视觉塌回基值，排空不可见）
+            var currentY = CurrentVisualY(st);
+            st.WaterY.Y = currentY;
+            st.FlowSb.Stop();
+            st.LevelSb?.Stop();
+            _waveStates.Remove(btn);
+
+            if (water is not null && st.ButtonH > 0)
+            {
+                // 排空过渡；期间按钮若重新开始安装（新水体已挂新 Transform），
+                // Completed 按 Transform 身份判定，不误伤新水位
+                var da = new DoubleAnimation
+                {
+                    From = currentY,
+                    To = st.ButtonH,
+                    Duration = new Duration(TimeSpan.FromMilliseconds(250)),
+                };
+                Storyboard.SetTarget(da, st.WaterY);
+                Storyboard.SetTargetProperty(da, "Y");
+                var sb = new Storyboard();
+                sb.Children.Add(da);
+                sb.Completed += (_, _) =>
+                {
+                    var w = FindTemplateChild<Canvas>(btn, "WaveWater");
+                    if (w is not null && ReferenceEquals(w.RenderTransform, st.WaterY))
+                    {
+                        w.Height = 0;
+                        w.RenderTransform = null;
+                        w.Visibility = Visibility.Collapsed;
+                    }
+                };
+                sb.Begin();
+            }
+            else if (water is not null)
+            {
+                water.Height = 0;
+                water.RenderTransform = null;
+                water.Visibility = Visibility.Collapsed;
+            }
+        }
+        else if (water is not null)
+        {
+            water.Height = 0;
+            water.RenderTransform = null;
+            water.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    // 容器回收/滚动/整表重建会把按钮重绑到别的条目或移出可视树：必须排空水体并停掉
+    // 本按钮的动画，防止上一条目的水位/波浪残留在无关插件的卡片上。重新进入视口时，
+    // 若该条目仍在安装中，Loaded 按当前进度重启波浪。
+    private void OnInstallButtonUnloaded(object sender, RoutedEventArgs e)
+        => StopInstallWave(sender as Button);
+
+    private void OnInstallButtonLoaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn) return;
+        if (btn.DataContext is not RegistryPluginViewDto item || !item.IsInstalling)
+        {
+            StopInstallWave(btn); // 非安装态一律排空（清回收残留）
+            return;
+        }
+        StartInstallWave(btn);
+        SetInstallWaveLevel(btn, item.ProgressIndeterminate ? 45 : item.InstallProgress);
+    }
+
+    private void OnInstallButtonDataContextChanged(FrameworkElement sender, DataContextChangedEventArgs args)
+    {
+        if (sender is not Button btn) return;
+        // 重绑即复位：回收容器可能带着上一条目的水位与运行中动画
+        // （WinUI 3 的 DataContextChangedEventArgs 不带 NewData，直接读 sender.DataContext）
+        StopInstallWave(btn);
+        if (btn.DataContext is RegistryPluginViewDto item && item.IsInstalling)
+        {
+            StartInstallWave(btn);
+            SetInstallWaveLevel(btn, item.ProgressIndeterminate ? 45 : item.InstallProgress);
+        }
+    }
+
+    /// <summary>视觉树递归找模板内命名子元素（Template.FindName 在 WinUI 对模板件不可靠，走视觉树更稳）。</summary>
+    private static T? FindTemplateChild<T>(DependencyObject root, string name) where T : FrameworkElement
+    {
+        int count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            if (VisualTreeHelper.GetChild(root, i) is not FrameworkElement fe) continue;
+            if (fe.Name == name && fe is T match) return match;
+            var deep = FindTemplateChild<T>(fe, name);
+            if (deep is not null) return deep;
+        }
+        return null;
+    }
+
+    /// <summary>装前预检（规范 Phase 4.4）：registry 索引声明的 signature 与包内 signature.json
+    /// 比对，不一致仅记日志（包内权威，以包内为准；host 安装时仍会全量验签兜底）。
+    /// 包内缺 signature.json 不在此报——由 host 安装验签按策略拦截/记录。</summary>
+    private static void LogRegistrySignatureMismatch(RegistryPluginViewDto item, string dir)
+    {
+        var regSig = item.TargetVersion.Signature;
+        if (regSig is null) return;
+        try
+        {
+            var pkgPath = Path.Combine(dir, "signature.json");
+            if (!File.Exists(pkgPath)) return;
+            using var doc = JsonDocument.Parse(File.ReadAllText(pkgPath));
+            var root = doc.RootElement;
+            var pkgSig = root.TryGetProperty("signature", out var sigProp) ? sigProp.GetString() : null;
+            var pkgKeyId = root.TryGetProperty("key_id", out var keyProp) ? keyProp.GetString() : null;
+            if (!string.Equals(pkgSig?.Trim(), regSig.Signature.Trim(), StringComparison.Ordinal)
+                || !string.Equals(pkgKeyId, regSig.KeyId, StringComparison.Ordinal))
+            {
+                App.Log("RegistrySignature", new InvalidDataException(
+                    $"{item.Id}@{item.TargetVersion.Version}: registry signature 与包内不一致（以包内为准，建议同步修正 registry）"));
+            }
+        }
+        catch (Exception ex)
+        {
+            // 预检自身失败（signature.json 损坏等）不阻断安装，host 装时全量验签兜底。
+            App.Log("RegistrySignature", ex);
         }
     }
 

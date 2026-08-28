@@ -72,7 +72,7 @@ impl MemoryIndex {
 }
 
 impl SearchIndex for MemoryIndex {
-    fn search(&self, query: &Query) -> Vec<Candidate> {
+    fn search(&mut self, query: &Query) -> Vec<Candidate> {
         let q = query.normalized();
         let mut hits: Vec<Candidate> = if q.is_empty() {
             self.items
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn finds_terminal() {
-        let idx = MemoryIndex::with_seed_apps();
+        let mut idx = MemoryIndex::with_seed_apps();
         let hits = idx.search(&Query::new("term"));
         assert!(hits.iter().any(|h| h.title.contains("Terminal")));
     }

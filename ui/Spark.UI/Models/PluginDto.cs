@@ -81,6 +81,21 @@ public enum PluginSignState
     Invalid,
 }
 
+/// <summary>snake_case 签名状态字符串 → 枚举。未知值回落 Unsigned（host 老版本兼容）。
+/// 已装列表（PluginRowVm）与市场卡片（RegistryPluginViewDto）共用，避免两份映射漂移。</summary>
+public static class PluginSignStateParser
+{
+    public static PluginSignState Parse(string? raw)
+        => raw?.ToLowerInvariant() switch
+        {
+            "official" => PluginSignState.Official,
+            "third_party" => PluginSignState.ThirdParty,
+            "unsigned" => PluginSignState.Unsigned,
+            "invalid" => PluginSignState.Invalid,
+            _ => PluginSignState.Unsigned,
+        };
+}
+
 public sealed class PluginFeatureDto
 {
     /// <summary>keyword | regex | root</summary>
