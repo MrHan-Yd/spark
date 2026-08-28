@@ -686,7 +686,8 @@ impl PluginManager {
                     }
                     let prefix = format!("{kw_l} ");
                     if let Some(_rest) = lower.strip_prefix(&prefix) {
-                        // 关键字已校验为 ASCII，按字节偏移取原始大小写输入。
+                        // 按字节偏移取原始大小写输入：to_ascii_lowercase 只改 1 字节 ASCII
+                        // 字符，不改变字节长度与 UTF-8 字符边界，故对中文关键字同样安全。
                         let input = trimmed[kw.len() + 1..].to_string();
                         return Some(KeywordMatch {
                             plugin_id: p.manifest.id.clone(),
@@ -915,6 +916,32 @@ mod tests {
         pm.load_dev_dir(&tmp.join("com.spark.tr")).unwrap();
         pm.set_enabled("com.spark.tr", false).unwrap();
         assert!(pm.find_keyword_match("tr").is_none());
+    }
+
+    #[test]
+    fn keyword_match_chinese() {
+        // 中文关键字：精确命中 + 前缀带参，且字节偏移切片不 panic、参数完整。
+        let tmp = std::env::temp_dir().join("spark_pm_kw_cn");
+        let _ = fs::remove_dir_all(&tmp);
+        make_webview_plugin(&tmp.join("com.spark.fy"), "com.spark.fy", "翻译");
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.load_dev_dir(&tmp.join("com.spark.fy")).unwrap();
+
+        let m = pm.find_keyword_match("翻译").unwrap();
+        assert_eq!(m.plugin_id, "com.spark.fy");
+        assert!(m.input.is_empty());
+        assert_eq!(m.keyword, "翻译");
+
+        let m2 = pm.find_keyword_match("翻译 hello world").unwrap();
+        assert_eq!(m2.input, "hello world");
+        assert_eq!(m2.keyword, "翻译");
+
+        // 大小写混排 ASCII 与中文混打的输入也要保真。
+        let m3 = pm.find_keyword_match("翻译 HeLLo").unwrap();
+        assert_eq!(m3.input, "HeLLo");
+
+        // 非该关键字前缀不误命中。
+        assert!(pm.find_keyword_match("翻 译").is_none());
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub struct PluginFeature {
     /// 触发类型；`keyword` 一期主推。
     #[serde(rename = "type")]
     pub kind: FeatureType,
-    /// `type=keyword` 时必填：触发关键字，ASCII、无空格、1-4 字符推荐。
+    /// `type=keyword` 时必填：触发关键字，无空格、1-4 字符推荐；支持中文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyword: Option<String>,
     /// `type=regex` 时必填：正则表达式（二期）。
@@ -259,12 +259,10 @@ impl PluginFeature {
                 if kw.is_empty() {
                     return Err(PluginError::Manifest("keyword must not be empty".into()));
                 }
-                if !kw.is_ascii() {
-                    return Err(PluginError::Manifest("keyword must be ASCII".into()));
-                }
-                if kw.contains(' ') {
+                // 路由以 ASCII 空格为参数分隔符；关键字含任意空白（含全角空格）都会产生歧义。
+                if kw.chars().any(char::is_whitespace) {
                     return Err(PluginError::Manifest(
-                        "keyword must not contain spaces".into(),
+                        "keyword must not contain whitespace".into(),
                     ));
                 }
             }
@@ -338,8 +336,17 @@ mod tests {
     }
 
     #[test]
-    fn keyword_non_ascii_rejected() {
-        let m: PluginManifest = serde_json::from_str(&webview_manifest_json("翻")).unwrap();
+    fn keyword_chinese_accepted() {
+        // 规范只要求无空格；中文关键字（如 "翻译"）合法。
+        let m: PluginManifest = serde_json::from_str(&webview_manifest_json("翻译")).unwrap();
+        m.validate().unwrap();
+        assert_eq!(m.features[0].keyword(), Some("翻译"));
+    }
+
+    #[test]
+    fn keyword_full_width_space_rejected() {
+        // 全角空格同样是空格分隔符，必须拒绝。
+        let m: PluginManifest = serde_json::from_str(&webview_manifest_json("翻　译")).unwrap();
         assert!(m.validate().is_err());
     }
 
