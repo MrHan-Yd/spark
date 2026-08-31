@@ -56,6 +56,9 @@ Root: HKCU; Subkey: "Software\Spark"; ValueType: string; ValueName: "Version"; V
 ; 不会重新提取图标（实测重装后搜索图标变回占位），删除→新建才能触发重索引。
 Type: files; Name: "{autoprograms}\Spark.lnk"
 Type: files; Name: "{autodesktop}\Spark.lnk"
+; 清理 v0.2.11 及之前捆绑的示例插件 echo（不再随包分发）：目录名固定为 "echo"，
+; 市场安装的插件按 manifest id 落盘（如 com.spark.echo），不会被误删。
+Type: filesandordirs; Name: "{app}\plugins\echo"
 
 [Icons]
 ; 快捷方式目标必须是 host（host 会拉起整个应用）；图标显式用 Spark.exe 的——

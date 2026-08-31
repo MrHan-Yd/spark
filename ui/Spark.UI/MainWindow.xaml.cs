@@ -2804,32 +2804,95 @@ public sealed partial class MainWindow : Window
     {
         SyncSettingsUi();
         ShowPane("general");
-        _ = LoadBuiltinsAsync();   // 内置命令清单（host 不可达则保持空列表）
+        _ = LoadBuiltinsAsync();   // 内置命令清单（host 不可达则降级为空列表，筛选行随之隐藏）
         // SettingsPanel 无背景（玻璃下透壁纸），主页必须隐藏，否则内容从透明区透出来叠在一起
         ApplyModeSwitch(open: true, animate: _visible);
         UpdateDragRegions();
     }
 
-    /// <summary>设置页"命令"栏：从 host 拉取命令表（含图标路径），失败/未连接时降级为空。</summary>
+    /// <summary>设置页"命令"栏：从 host 拉取命令表（含图标路径），失败/未连接时降级为空列表并隐藏筛选行。</summary>
     private async Task LoadBuiltinsAsync()
     {
         try
         {
             var items = await _host.GetBuiltinsAsync();
-            if (items.Count > 0)
+            foreach (var it in items)
             {
-                BuiltinList.ItemsSource = items;
-                // 逐行异步补系统图标（字形先占位，提取完切换显示）
-                foreach (var it in items)
-                {
-                    _ = LoadBuiltinListIconAsync(it);
-                }
+                _ = LoadBuiltinListIconAsync(it);
             }
+            _allBuiltins.Clear();
+            _allBuiltins.AddRange(items);
         }
         catch (Exception ex)
         {
+            // GetBuiltinsAsync 内部吞错返回空表，理论不可达；兜底清空，避免残留过期清单
             App.Log("LoadBuiltins", ex);
+            _allBuiltins.Clear();
         }
+        finally
+        {
+            // 显隐收敛在每次拉取后无条件执行（GetBuiltinsAsync 从不抛错，空表 = 未连接/出错），
+            // 保证 host 不可达时筛选框与空态互斥不变量成立，也避免空表分支在主路径上死代码化
+            ApplyBuiltinFilter();
+        }
+    }
+
+    private readonly List<BuiltinInfoDto> _allBuiltins = new();
+
+    private void OnBuiltinFilterChanged(object sender, object e)
+    {
+        // 全字段空引用短路：文本事件可能在窗口初始化早期触发，此时列表字段可能未就绪
+        if (BuiltinFilterBox is null || BuiltinList is null || BuiltinFilterEmpty is null) return;
+        ApplyBuiltinFilter();
+    }
+
+    /// <summary>
+    /// 命令清单筛选：关键词（名称/别名/拼音缩写/说明/id）仅内存过滤 _allBuiltins（数据源不动），
+    /// ItemsSource 指向筛选副本。与市场筛选同款交互；无清单时整行隐藏。
+    /// </summary>
+    private void ApplyBuiltinFilter()
+    {
+        if (_allBuiltins.Count == 0)
+        {
+            BuiltinFilterBox.Visibility = Visibility.Collapsed;
+            BuiltinList.ItemsSource = null;
+            BuiltinList.Visibility = Visibility.Collapsed;
+            BuiltinFilterEmpty.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        BuiltinFilterBox.Visibility = Visibility.Visible;
+        var kw = BuiltinFilterBox.Text?.Trim() ?? "";
+        var view = new List<BuiltinInfoDto>(_allBuiltins.Count);
+        foreach (var it in _allBuiltins)
+        {
+            if (MatchesBuiltinFilter(it, kw)) view.Add(it);
+        }
+
+        // 逐键筛选：筛选结果与当前视图逐项一致时跳过 ItemsSource 重赋值（整表替换会
+        // 重建容器并重置滚动位置，与市场筛选同一抖动源处理）。
+        var skipReassign = false;
+        if (BuiltinList.ItemsSource is List<BuiltinInfoDto> cur && cur.Count == view.Count)
+        {
+            skipReassign = true;
+            for (var i = 0; i < view.Count; i++)
+            {
+                if (!ReferenceEquals(cur[i], view[i])) { skipReassign = false; break; }
+            }
+        }
+        if (!skipReassign) BuiltinList.ItemsSource = view;
+
+        BuiltinList.Visibility = view.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        BuiltinFilterEmpty.Visibility = view.Count > 0 ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private static bool MatchesBuiltinFilter(BuiltinInfoDto it, string keyword)
+    {
+        if (keyword.Length == 0) return true;
+        return ContainsIgnoreCase(it.Title, keyword)
+            || ContainsIgnoreCase(it.Subtitle, keyword)
+            || ContainsIgnoreCase(it.Id, keyword)
+            || it.Aliases?.Any(a => ContainsIgnoreCase(a, keyword)) == true;
     }
 
     /// <summary>命令栏行图标：有系统图标路径就提取显示，否则保持字形。</summary>
@@ -4767,9 +4830,8 @@ public sealed partial class MainWindow : Window
         AboutUpdateStatus.Text = "正在检查更新…";
         try
         {
-            using var client = new HttpClient();
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
-            var json = await client.GetStringAsync(UpdateManifestUrl);
+            // 检查更新走代理回退链：与市场索引同一套网络容错（默认客户端 → 环境代理客户端）
+            var json = await RegistryService.GetStringWithProxyFallbackAsync(UpdateManifestUrl);
             var m = ParseManifest(json);
             if (m is null)
             {
@@ -4833,13 +4895,16 @@ public sealed partial class MainWindow : Window
         var setup = Path.Combine(dir, $"Spark-{m.Version}-setup.exe");
         try
         {
-            using var client = new HttpClient();
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
+            using var clientDefault = new HttpClient();
+            clientDefault.DefaultRequestHeaders.UserAgent.ParseAdd("Spark/" + AppVersionText);
+            var envProxyClient = RegistryService.EnvProxyClient;
 
             var verified = false;
             var everDownloaded = false;
             for (var attempt = 1; attempt <= MaxDownloadAttempts && !verified; attempt++)
             {
+                // 弱网兜底：偶数次尝试改走环境变量代理客户端（系统代理在当前进程上下文可能失效）
+                var client = envProxyClient is not null && attempt % 2 == 0 ? envProxyClient : clientDefault;
                 var downloaded = await TryDownloadAsync(client, m.Url, setup);
                 if (!downloaded)
                 {

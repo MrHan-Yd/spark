@@ -91,22 +91,11 @@ public sealed class FavoritesState
     public string ActiveGroup { get; set; } = "all";
     public bool Expanded { get; set; } = true;
 
+    /// <summary>新用户零预置：只留「全部」兜底分组，收藏完全由用户右键「收藏到」自建；
+    /// 空态由 RenderFavorites 的占位文案兜住，绝不写死演示应用。</summary>
     public static FavoritesState CreateDefault() => new()
     {
-        Groups =
-        {
-            new() { Id = "all", Name = "全部" },
-            new() { Id = "work", Name = "工作" },
-            new() { Id = "dev", Name = "开发" },
-            new() { Id = "daily", Name = "日常" },
-        },
-        Items =
-        {
-            new() { ItemId = "app.wt", GroupId = "dev" },
-            new() { ItemId = "app.code", GroupId = "dev" },
-            new() { ItemId = "app.chrome", GroupId = "daily" },
-            new() { ItemId = "app.explorer", GroupId = "work" },
-        },
+        Groups = { new() { Id = "all", Name = "全部" } },
         ActiveGroup = "all",
         Expanded = true
     };

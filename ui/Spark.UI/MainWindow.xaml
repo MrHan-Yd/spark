@@ -949,7 +949,14 @@
               <StackPanel.RenderTransform>
                 <TranslateTransform x:Name="PaneBuiltinsShift"/>
               </StackPanel.RenderTransform>
+              <!-- 筛选行：关键词（名称/别名/拼音缩写/说明/id）；仅客户端内存过滤，随清单拉取结果显示 -->
+              <TextBox x:Name="BuiltinFilterBox" PlaceholderText="筛选：名称 / 拼音缩写（calc、jt）"
+                       FontSize="12" Padding="8,5" CornerRadius="8" VerticalAlignment="Center"
+                       BorderBrush="{StaticResource GlassBorderBrush}"
+                       Foreground="{StaticResource TextPrimaryBrush}" Visibility="Collapsed"
+                       TextChanged="OnBuiltinFilterChanged"/>
               <ListView x:Name="BuiltinList" SelectionMode="None" IsItemClickEnabled="False"
+                        Margin="0,10,0,0"
                         Padding="0" Background="Transparent" BorderThickness="0">
                 <ListView.ItemContainerStyle>
                   <Style TargetType="ListViewItem">
@@ -1011,6 +1018,10 @@
                   </DataTemplate>
                 </ListView.ItemTemplate>
               </ListView>
+              <!-- 有清单但筛选后为空（与"host 不可达时列表空白"自然区分） -->
+              <TextBlock x:Name="BuiltinFilterEmpty" Text="没有符合筛选条件的命令" FontSize="12"
+                         Foreground="{StaticResource TextSecondaryBrush}" HorizontalAlignment="Center"
+                         Margin="0,24,0,0" Visibility="Collapsed"/>
             </StackPanel>
 
             <!-- 插件 -->

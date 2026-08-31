@@ -28,19 +28,6 @@ if (-not $iscc) {
 }
 if (-not $iscc) { throw "Inno Setup 6 (ISCC.exe) not found. Install it first: choco install innosetup -y" }
 
-# locate cargo (plugin build); PATH 可能不完整，兜底常见安装位置
-$cargo = $null
-foreach ($p in @(
-        "$env:USERPROFILE\.cargo\bin\cargo.exe",
-        "$env:CARGO_HOME\bin\cargo.exe")) {
-    if (Test-Path $p) { $cargo = $p; break }
-}
-if (-not $cargo) {
-    $cmd = Get-Command cargo -ErrorAction SilentlyContinue
-    if ($cmd) { $cargo = $cmd.Source }
-}
-if (-not $cargo) { throw "cargo not found. Install Rust: https://rustup.rs" }
-
 # ---- 2. verify build outputs and stage installer\dist\ (host exe + full UI output) ----
 $hostExePath = Join-Path (Get-Location) $HostExe
 $uiDirPath = Join-Path (Get-Location) $UiDir
@@ -54,15 +41,7 @@ New-Item -ItemType Directory -Path $dist | Out-Null
 Copy-Item $hostExePath $dist
 Copy-Item (Join-Path $uiDirPath "*") $dist -Recurse -Force
 Write-Host "Staged dist: $dist"
-
-# ---- 2b. build & stage bundled plugins (echo) ----
-& $cargo build --release -p spark-plugin-echo
-if ($LASTEXITCODE -ne 0) { throw "plugin build failed (exit $LASTEXITCODE)" }
-$pluginDist = Join-Path $dist "plugins\echo"
-New-Item -ItemType Directory -Path $pluginDist -Force | Out-Null
-Copy-Item "plugins\echo\plugin.json" $pluginDist
-Copy-Item "target\release\spark-plugin-echo.exe" (Join-Path $pluginDist "spark-plugin-echo.exe")
-Write-Host "Staged plugin: $pluginDist"
+# 不再捆绑示例插件 echo（v0.2.12 起）：新装零插件；老安装残留由 spark.iss [InstallDelete] 清理
 
 # ---- 3. compile the installer ----
 & $iscc "installer\spark.iss" "/DAppVersion=$Version" "/DSourceDir=$dist"
