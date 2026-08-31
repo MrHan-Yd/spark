@@ -657,7 +657,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spark-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "spark-host"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "base64",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "spark-index"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "spark-ipc"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "spark-plugin-echo"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "serde_json",
  "spark-core",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "spark-plugin-manager"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "spark-sdk"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "spark-sign"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "base64",

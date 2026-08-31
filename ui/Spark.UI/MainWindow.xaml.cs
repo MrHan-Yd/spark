@@ -148,6 +148,10 @@ public sealed partial class MainWindow : Window
         _paneShifts[PanePlugins] = PanePluginsShift;
         _paneShifts[PaneAbout] = PaneAboutShift;
 
+        // 市场筛选初选"全部"：与 ThemeCombo 同款代码后置范式（XAML 解析期设 IsSelected 会
+        // 同步触发 SelectionChanged，早于列表元素构造导致空引用）
+        MarketFilterCombo.SelectedIndex = 0;
+
         // 关于页：版本号（csproj Version，与 Cargo 工作区一致）与初始更新状态
         AboutVersionText.Text = $"版本 {AppVersionText}";
         AboutUpdateStatus.Text = $"当前版本 {AppVersionText}";
@@ -201,6 +205,7 @@ public sealed partial class MainWindow : Window
         try { ApplyDwmDarkMode(); } catch (Exception ex) { App.Log("DwmDarkMode", ex); }
 
         _host.HostNotification += OnHostNotification;
+        _host.Connected += OnHostConnected;
 
         // 热键主路径：Host SetEvent → 这里唤醒（不依赖 pipe 推送）
         _toggleWatcher = new ToggleWatcher(() =>
@@ -799,6 +804,15 @@ public sealed partial class MainWindow : Window
             wasConnected = _host.IsConnected;
             await Task.Delay(2000);
         }
+    }
+
+    /// <summary>host 连接建立（含 UI 冷拉 host 成功）即补查当前输入：连接期间用户敲的词
+    /// 已被 DemoData 兜底吞掉显示，不补查的话要等 2s 轮询守护循环才自愈。
+    /// 事件可能在任意线程触发，统一 marshal 回 UI 线程。</summary>
+    private void OnHostConnected()
+    {
+        App.Log("Ipc", "host connected; replaying current query");
+        DispatcherQueue.TryEnqueue(() => ScheduleRefresh(QueryBox?.Text ?? ""));
     }
 
     private void OnHostNotification(string method)
@@ -3009,24 +3023,10 @@ public sealed partial class MainWindow : Window
 
     /// <summary>
     /// 定位 spark-host.exe：优先 UI 同目录（安装布局 {app}\Spark.exe + {app}\spark-host.exe）；
-    /// 开发布局回退到仓库根 target/{debug,release}\spark-host.exe
-    /// （UI 在 ui/Spark.UI/bin/{Debug,Release}/net8.0-…/win-x64，上溯 6 层到仓库根）。
+    /// 开发布局回退到仓库根 target/{debug,release}\spark-host.exe（详见 HostIpcClient.FindHostExe）。
     /// 返回 null 表示找不到 host。
     /// </summary>
-    private static string? FindHostExe()
-    {
-        var baseDir = AppContext.BaseDirectory;
-        var beside = Path.Combine(baseDir, "spark-host.exe");
-        if (File.Exists(beside)) return beside;
-        var repo = Path.GetFullPath(Path.Combine(
-            baseDir, "..", "..", "..", "..", "..", ".."));
-        foreach (var profile in new[] { "debug", "release" })
-        {
-            var p = Path.Combine(repo, "target", profile, "spark-host.exe");
-            if (File.Exists(p)) return p;
-        }
-        return null;
-    }
+    private static string? FindHostExe() => HostIpcClient.FindHostExe();
 
     /// <summary>写入/删除开机启动项：true = 注册 host 路径（带引号，路径含空格时注册表才认得）。
     /// 必须写 spark-host.exe 而不是 Spark.exe：热键/托盘/索引都在 host 里，
@@ -4091,6 +4091,78 @@ public sealed partial class MainWindow : Window
         MarketStatusText.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
     }
 
+    private void OnMarketFilterChanged(object sender, object e)
+    {
+        // 全字段空引用短路：选中/文本事件可能在窗口初始化早期触发， 此时列表相关字段可能未就绪
+        if (MarketFilterBox is null || MarketFilterCombo is null
+            || MarketList is null || MarketFilterEmpty is null) return;
+        ApplyMarketFilter();
+    }
+
+    /// <summary>
+    /// 市场列表筛选：关键词 + 状态，仅内存过滤 _marketPlugins（数据源不动），ItemsSource 指向筛选副本。
+    /// 安装成功回填写原 DTO（与筛选视图同一实例），按钮/角标状态照常原位刷新。
+    /// 已知的瞬态不一致（accepted）：如"未安装"筛选激活时安装成功，卡片原位保留在已不再匹配的
+    /// 视图里（显示"已是最新"），下次筛选变更/刷新自愈——重算 membership 会打断原位回填与退场动画。
+    /// </summary>
+    private void ApplyMarketFilter()
+    {
+        if (_marketPlugins.Count == 0)
+        {
+            MarketList.ItemsSource = null;
+            MarketList.Visibility = Visibility.Collapsed;
+            MarketFilterEmpty.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var kw = MarketFilterBox.Text?.Trim() ?? "";
+        var view = new List<RegistryPluginViewDto>(_marketPlugins.Count);
+        foreach (var it in _marketPlugins)
+        {
+            if (MatchesMarketFilter(it, kw, MarketFilterCombo.SelectedIndex)) view.Add(it);
+        }
+
+        // 筛选结果与当前视图逐项一致时跳过 ItemsSource 重赋值：整表替换会重建
+        // 容器，打断安装中卡片的状态回填动画并重置滚动位置（逐键筛选的抖动源）。
+        var skipReassign = false;
+        if (MarketList.ItemsSource is List<RegistryPluginViewDto> cur && cur.Count == view.Count)
+        {
+            skipReassign = true;
+            for (var i = 0; i < view.Count; i++)
+            {
+                if (!ReferenceEquals(cur[i], view[i])) { skipReassign = false; break; }
+            }
+        }
+        if (!skipReassign) MarketList.ItemsSource = view;
+
+        MarketList.Visibility = view.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        MarketFilterEmpty.Visibility = view.Count > 0 ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    /// <summary>索引序与 XAML ComboBoxItem 一一对应：0全部 1未安装 2已安装 3官方 4已签名 5待签名 6签名失效。</summary>
+    private static bool MatchesMarketFilter(RegistryPluginViewDto it, string keyword, int selectedIndex)
+    {
+        var stateOk = selectedIndex switch
+        {
+            1 => !it.IsInstalled,
+            2 => it.IsInstalled,
+            3 => it.DisplaySignState == PluginSignState.Official,
+            4 => it.DisplaySignState == PluginSignState.ThirdParty,
+            5 => it.PendingSignBadge,
+            6 => it.DisplaySignState == PluginSignState.Invalid,
+            _ => true,
+        };
+        if (!stateOk) return false;
+        if (keyword.Length == 0) return true;
+        return ContainsIgnoreCase(it.Name, keyword)
+            || ContainsIgnoreCase(it.Description, keyword)
+            || ContainsIgnoreCase(it.Author, keyword)
+            || ContainsIgnoreCase(it.Id, keyword);
+    }
+
+    private static bool ContainsIgnoreCase(string? haystack, string needle)
+        => haystack?.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+
     private async Task LoadMarketplaceAsync()
     {
         if (_loadingMarket) return;
@@ -4149,17 +4221,15 @@ public sealed partial class MainWindow : Window
                 });
             }
 
-            MarketList.ItemsSource = null;
-            MarketList.ItemsSource = _marketPlugins;
-
             // 图标异步补齐：registry 的 icon 是 http(s) URL，下载+解码后回填；
-            // 失败保持字母占位。刷新整表重建 DTO，迟到结果落孤立对象无害。
+            // 失败保持字母占位。列表刷新会整表重建 DTO，迟到结果落孤立对象无害。
             foreach (var it in _marketPlugins)
                 _ = LoadMarketIconAsync(it);
 
             var empty = _marketPlugins.Count == 0;
             MarketEmpty.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
-            MarketList.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
+            MarketFilterRow.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
+            ApplyMarketFilter();
         }
         catch (Exception ex)
         {
@@ -4168,8 +4238,8 @@ public sealed partial class MainWindow : Window
             // 抓取失败：清空残留索引与列表，避免用旧仓库元数据安装新仓库插件
             _currentRegistry = null;
             _marketPlugins.Clear();
-            MarketList.ItemsSource = null;
-            MarketList.ItemsSource = _marketPlugins;
+            MarketFilterRow.Visibility = Visibility.Collapsed;
+            ApplyMarketFilter();
             MarketList.Visibility = Visibility.Collapsed; // 与成功路径保持 MarketEmpty/MarketList 互斥不变量
             MarketEmpty.Visibility = Visibility.Visible;
         }

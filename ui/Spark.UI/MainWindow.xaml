@@ -1470,6 +1470,31 @@
                   </StackPanel>
                 </Border>
 
+                <!-- 筛选行：关键词（名称/描述/作者/id）+ 安装与签名状态；仅客户端内存过滤，随加载结果显隐 -->
+                <Grid x:Name="MarketFilterRow" ColumnSpacing="8" Visibility="Collapsed">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBox x:Name="MarketFilterBox" PlaceholderText="筛选：名称 / 描述 / 作者 / id"
+                           FontSize="12" Padding="8,5" CornerRadius="8" VerticalAlignment="Center"
+                           BorderBrush="{StaticResource GlassBorderBrush}"
+                           Foreground="{StaticResource TextPrimaryBrush}"
+                           TextChanged="OnMarketFilterChanged"/>
+                  <ComboBox x:Name="MarketFilterCombo" Grid.Column="1" Style="{StaticResource ComboStyle}"
+                            ItemContainerStyle="{StaticResource ComboItemStyle}" MinWidth="104"
+                            VerticalAlignment="Center" SelectionChanged="OnMarketFilterChanged">
+                    <!-- 初选在代码后置设（构造函数）：WinUI 解析期 IsSelected="True" 会同步触发 SelectionChanged -->
+                    <ComboBoxItem Content="全部"/>
+                    <ComboBoxItem Content="未安装"/>
+                    <ComboBoxItem Content="已安装"/>
+                    <ComboBoxItem Content="官方"/>
+                    <ComboBoxItem Content="已签名"/>
+                    <ComboBoxItem Content="待签名"/>
+                    <ComboBoxItem Content="签名失效"/>
+                  </ComboBox>
+                </Grid>
+
                 <!-- 市场状态提示 / 加载中 -->
                 <StackPanel x:Name="MarketLoadingWrap" Orientation="Horizontal" Spacing="10"
                             HorizontalAlignment="Center" Margin="0,16,0,8" Visibility="Collapsed">
@@ -1493,6 +1518,11 @@
                                Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
                   </StackPanel>
                 </Grid>
+
+                <!-- 有数据但筛选后为空（与"仓库空态"区分，文案更精确） -->
+                <TextBlock x:Name="MarketFilterEmpty" Text="没有符合筛选条件的插件" FontSize="12"
+                           Foreground="{StaticResource TextSecondaryBrush}" HorizontalAlignment="Center"
+                           Margin="0,24,0,0" Visibility="Collapsed"/>
 
                 <!-- 市场插件列表（卡片样式与已装插件列表同款：34px 首字母图标 + 标题行 + 元信息行） -->
                 <ListView x:Name="MarketList" SelectionMode="None" IsItemClickEnabled="False"
@@ -1565,7 +1595,7 @@
                             </StackPanel>
                             <TextBlock Text="{Binding Description}" FontSize="11"
                                        Foreground="{StaticResource TextTertiaryBrush}"
-                                       TextTrimming="CharacterEllipsis" TextWrapping="Wrap" MaxLines="2" LineHeight="16"/>
+                                       TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" MaxLines="1" LineHeight="16"/>
                             <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,2,0,0">
                               <StackPanel Orientation="Horizontal" Spacing="4"
                                           Visibility="{Binding AuthorVisibility}">

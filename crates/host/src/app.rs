@@ -69,9 +69,21 @@ impl HostApp {
         let mut hits = self.index.search(&q);
         // 插件关键字路由：命中 webview 插件的 keyword feature 时，在结果最前
         // 插入一个 page-mode 候选项，UI 见 target="plugin:page:<id>" 即开插件窗口。
+        let mut next_top = 0usize; // 前缀建议紧跟精确命中之后（都排在应用结果前面）
         if let Some(m) = self.plugins.find_keyword_match(text) {
             if let Some(cand) = self.build_plugin_candidate(&m) {
                 hits.insert(0, cand);
+                next_top = 1;
+            }
+        }
+        // 关键字真前缀建议：中文关键字较长，用户敲前缀（如 "内容"）时也应看到插件
+        // 候选随列表出现（uTools 同款交互），打完回车即进插件页。
+        for m in self.plugins.find_keyword_prefix_matches(text) {
+            if let Some(mut cand) = self.build_plugin_candidate(&m) {
+                cand.score = 90.0 - next_top as f32; // 精确命中(100)之下的稳定次序
+                let at = next_top.min(hits.len());
+                hits.insert(at, cand);
+                next_top += 1;
             }
         }
         // native 插件（mode:list）：命中关键字前缀时，把插件返回的结果项并入列表。
@@ -472,4 +484,88 @@ pub fn dev_invoke_first(app: &mut HostApp, text: &str) -> Result<()> {
     let r = app.invoke(&params)?;
     println!("{r:?}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// 写一个 webview page 插件 fixture（manifest + 占位 index.html）。
+    fn write_webview_plugin(dir: &Path, id: &str, keyword: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let json = format!(
+            r#"{{ "id": "{id}", "name": "T", "version": "0.1.0", "api_version": 2,
+                 "runtime": "webview", "main": "index.html",
+                 "features": [{{ "type": "keyword", "keyword": "{keyword}", "title": "T", "mode": "page" }}] }}"#
+        );
+        fs::write(dir.join("plugin.json"), json).unwrap();
+        fs::write(dir.join("index.html"), "<html></html>").unwrap();
+    }
+
+    /// 空 app 索引的 HostApp：只测 search 的插件候选插入粘合，不建真实 Start Menu 索引。
+    fn host_with_empty_index() -> HostApp {
+        HostApp {
+            index: AppIndex::new(),
+            plugins: PluginManager::with_dirs(
+                PathBuf::from("./__tests_plugins"),
+                PathBuf::from("./__tests_data"),
+            ),
+            config: HostConfig::default(),
+            tray: None,
+        }
+    }
+
+    /// 三个断言域共用：装载两个插件（关键字"翻译"+"翻译器"，后者是前者的真前缀超集）。
+    fn host_with_translator_plugins(tmp: &Path) -> HostApp {
+        write_webview_plugin(&tmp.join("com.spark.fy"), "com.spark.fy", "翻译");
+        write_webview_plugin(&tmp.join("com.spark.trl"), "com.spark.trl", "翻译器");
+        let mut app = host_with_empty_index();
+        app.plugins.load_dev_dir(&tmp.join("com.spark.fy")).unwrap();
+        app.plugins
+            .load_dev_dir(&tmp.join("com.spark.trl"))
+            .unwrap();
+        app
+    }
+
+    #[test]
+    fn search_exact_hit_then_prefix_suggestion_ordering() {
+        // 精确命中 + 前缀候选：精确(100)置顶，前缀候选紧随其后排在应用结果前面。
+        let tmp = std::env::temp_dir().join("spark_host_kw_ordering");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut app = host_with_translator_plugins(&tmp);
+
+        let hits = app.search("翻译");
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
+        assert_eq!(hits[0].score, 100.0);
+        assert_eq!(hits[1].id, "plugin:com.spark.trl:翻译器");
+        assert_eq!(hits[1].score, 89.0);
+
+        // 只有前缀（无精确命中）：前缀候选置顶
+        let hits = app.search("翻");
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
+        assert_eq!(hits[0].score, 90.0);
+
+        // 前缀带参进入参数阶段后不再给前缀建议：只剩精确路由的带参候选
+        let hits = app.search("翻译 1");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
+    }
+
+    #[test]
+    fn search_prefix_order_stable_with_many_candidates() {
+        // 多个前缀候选：按插入次序稳定排列，分数严格递减。
+        let tmp = std::env::temp_dir().join("spark_host_kw_prefix_many");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut app = host_with_translator_plugins(&tmp);
+        write_webview_plugin(&tmp.join("com.spark.zn"), "com.spark.zn", "翻译指南");
+        app.plugins.load_dev_dir(&tmp.join("com.spark.zn")).unwrap();
+
+        let hits = app.search("翻译");
+        assert_eq!(hits.len(), 3); // 精确 + 两个真前缀候选
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
+        assert_eq!(hits[1].id, "plugin:com.spark.trl:翻译器");
+        assert_eq!(hits[2].id, "plugin:com.spark.zn:翻译指南");
+        assert!(hits[0].score > hits[1].score && hits[1].score > hits[2].score);
+    }
 }

@@ -118,6 +118,13 @@ fn main() -> Result<()> {
         match single_instance::SingleInstance::acquire() {
             Ok(g) => Some(g),
             Err(e) => {
+                // UI 兜底拉起带 --no-ui：走到这里说明 host 其实已在运行（UI 只是
+                // 管道瞬时连不上），是冗余拉起而非用户主动唤醒，静默退出；
+                // 转发 toggle 会把运行中的启动器窗口无端弹/收一次。
+                if cli.no_ui {
+                    info!(?e, "host already running; --no-ui second instance exits");
+                    return Ok(());
+                }
                 info!(?e, "instance exists — forwarding toggle");
                 match ipc_server::send_toggle_to_running_host() {
                     Ok(()) => info!("toggle forwarded"),

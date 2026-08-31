@@ -406,38 +406,54 @@ public static class RegistryService
 
     private static async Task DownloadToFileAsync(string url, string destPath, long maxBytes, CancellationToken ct, Action<DownloadProgressReport>? progress = null)
     {
-        using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-        response.EnsureSuccessStatusCode();
-
-        var contentLength = response.Content.Headers.ContentLength;
-        if (contentLength.HasValue && contentLength.Value > maxBytes)
+        // 网络层异常统一翻成中文正文，原文进 InnerException（App.Log 可溯源）。
+        // 保持 HttpRequestException 类型不变：安装侧"zipball 失败回退官方地址"的 catch 依赖它。
+        try
         {
-            throw new InvalidDataException($"下载文件体积过大 ({contentLength.Value / 1024 / 1024} MiB > {maxBytes / 1024 / 1024} MiB)");
+            using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+            response.EnsureSuccessStatusCode();
+
+            var contentLength = response.Content.Headers.ContentLength;
+            if (contentLength.HasValue && contentLength.Value > maxBytes)
+            {
+                throw new InvalidDataException($"下载文件体积过大 ({contentLength.Value / 1024 / 1024} MiB > {maxBytes / 1024 / 1024} MiB)");
+            }
+
+            using var stream = await response.Content.ReadAsStreamAsync(ct);
+            using var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
+
+            // 进度节流：读块频率高，按时间窗口 80ms 回调一次；收尾必报一次终值（Total 可能为 null=总量未知）。
+            var throttle = System.Diagnostics.Stopwatch.StartNew();
+            var buffer = new byte[81920];
+            long totalRead = 0;
+            int read;
+            while ((read = await stream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
+            {
+                totalRead += read;
+                if (totalRead > maxBytes)
+                {
+                    throw new InvalidDataException($"下载流超过最大限制 ({maxBytes / 1024 / 1024} MiB)");
+                }
+                await fs.WriteAsync(buffer, 0, read, ct);
+                if (progress is not null && throttle.ElapsedMilliseconds >= 80)
+                {
+                    throttle.Restart();
+                    progress(new DownloadProgressReport(totalRead, contentLength));
+                }
+            }
+            progress?.Invoke(new DownloadProgressReport(totalRead, contentLength));
         }
-
-        using var stream = await response.Content.ReadAsStreamAsync(ct);
-        using var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
-
-        // 进度节流：读块频率高，按时间窗口 80ms 回调一次；收尾必报一次终值（Total 可能为 null=总量未知）。
-        var throttle = System.Diagnostics.Stopwatch.StartNew();
-        var buffer = new byte[81920];
-        long totalRead = 0;
-        int read;
-        while ((read = await stream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
+        catch (HttpRequestException ex)
         {
-            totalRead += read;
-            if (totalRead > maxBytes)
-            {
-                throw new InvalidDataException($"下载流超过最大限制 ({maxBytes / 1024 / 1024} MiB)");
-            }
-            await fs.WriteAsync(buffer, 0, read, ct);
-            if (progress is not null && throttle.ElapsedMilliseconds >= 80)
-            {
-                throttle.Restart();
-                progress(new DownloadProgressReport(totalRead, contentLength));
-            }
+            var detail = ex.StatusCode is { } sc
+                ? $"服务器返回 HTTP {(int)sc}"
+                : "网络错误或仓库地址不可达";
+            throw new HttpRequestException($"下载插件包失败（{detail}）", ex);
         }
-        progress?.Invoke(new DownloadProgressReport(totalRead, contentLength));
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            throw new HttpRequestException("下载插件包超时，请检查网络后重试", ex);
+        }
     }
 
     public static string ComputeSha256(string filePath)

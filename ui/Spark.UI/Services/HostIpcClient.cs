@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.IO;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
@@ -31,6 +33,14 @@ public sealed class HostIpcClient : IAsyncDisposable
 
     public event Action<string>? HostNotification;
 
+    /// <summary>连接真正建立后触发（EnsureConnectedAsync 从"未连接"变为"已连接"时，
+    /// 含冷启动 spawn 拉 host 成功的场景）。调用方据此补做被降级吞掉的查询：
+    /// host 冷启动期间 QueryAsync 会回退 DemoData，host 上线不补查的话用户会一直看到演示结果。</summary>
+    public event Action? Connected;
+
+    /// <summary>上次尝试拉起 host 进程的时刻（节流，防失败重试风暴重复 spawn）。</summary>
+    private long _lastSpawnAttemptTicks;
+
     public async Task EnsureConnectedAsync(CancellationToken ct = default)
     {
         if (IsConnected) return;
@@ -48,10 +58,12 @@ public sealed class HostIpcClient : IAsyncDisposable
 
             Exception? last = null;
             // 本地管道正常应毫秒级连上；超时给足 1.5s，避免客户端先放弃、服务端
-            // 后 accept 造成僵尸连接。重试 6 次 ≈ 最坏 10s，足够等 Host 起来。
-            for (var attempt = 0; attempt < 6; attempt++)
+            // 后 accept 造成僵尸连接。host 不在运行时：第 2 次失败后拉起 host 进程
+            // 再继续重试（spawn + bootstrap 索引构建约 2-4s，8 次 ≈ 最坏 13s 覆盖）。
+            for (var attempt = 0; attempt < 8; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
+                if (attempt == 2) TrySpawnHostIfMissing();
                 var pipe = new NamedPipeClientStream(".", DefaultPipeName, PipeDirection.InOut,
                     PipeOptions.Asynchronous);
                 try
@@ -68,6 +80,7 @@ public sealed class HostIpcClient : IAsyncDisposable
                     _loopDead = false;
                     _loopTask = Task.Run(() => ReadLoopAsync(_loopCts.Token, generation));
                     last = null;
+                    try { Connected?.Invoke(); } catch { /* 订阅者异常不拖垮连接 */ }
                     return;
                 }
                 catch (Exception ex)
@@ -84,6 +97,57 @@ public sealed class HostIpcClient : IAsyncDisposable
         {
             Interlocked.Exchange(ref _connectGate, 0);
         }
+    }
+
+    /// <summary>host 进程缺失时由 UI 拉起（节流 20s）：开机自启/手动场景 host 可能没在跑，
+    /// UI 只管连接从不 spawn 的话，冷启动窗口内所有查询都静默降级成演示数据。
+    /// --no-ui：UI 本尊已在运行，明确告诉 host 别再管 UI 拉起；spawn 失败仅记日志，
+    /// 后续连接失败仍走原有降级路径。</summary>
+    private void TrySpawnHostIfMissing()
+    {
+        var now = Environment.TickCount64;
+        if (now - Interlocked.Read(ref _lastSpawnAttemptTicks) < 20_000) return;
+        Interlocked.Exchange(ref _lastSpawnAttemptTicks, now);
+        try
+        {
+            var exe = FindHostExe();
+            if (string.IsNullOrEmpty(exe)) return;
+            // Dispose 只释放本进程的句柄跟踪对象，不影响已启动的 host 子进程
+            using (var proc = Process.Start(new ProcessStartInfo(exe)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                Arguments = "--no-ui",
+            }))
+            {
+                App.Log("Ipc", $"host not running; spawned by UI (--no-ui, pid={proc?.Id})");
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log("HostSpawn", ex);
+        }
+    }
+
+    /// <summary>
+    /// 定位 spark-host.exe：优先 UI 同目录（安装布局 {app}\Spark.exe + {app}\spark-host.exe）；
+    /// 开发布局回退到仓库根 target/{debug,release}\spark-host.exe
+    /// （UI 在 ui/Spark.UI/bin/{Debug,Release}/net8.0-…/win-x64，上溯 6 层到仓库根）。
+    /// 返回 null 表示找不到 host。
+    /// </summary>
+    public static string? FindHostExe()
+    {
+        var baseDir = AppContext.BaseDirectory;
+        var beside = Path.Combine(baseDir, "spark-host.exe");
+        if (File.Exists(beside)) return beside;
+        var repo = Path.GetFullPath(Path.Combine(
+            baseDir, "..", "..", "..", "..", "..", ".."));
+        foreach (var profile in new[] { "debug", "release" })
+        {
+            var p = Path.Combine(repo, "target", profile, "spark-host.exe");
+            if (File.Exists(p)) return p;
+        }
+        return null;
     }
 
     private async Task ReadLoopAsync(CancellationToken ct, long generation)
@@ -163,7 +227,8 @@ public sealed class HostIpcClient : IAsyncDisposable
                                 var msg = err.TryGetProperty("message", out var m)
                                     ? m.GetString() ?? "ipc error"
                                     : "ipc error";
-                                tcs.TrySetException(new InvalidOperationException(msg));
+                                // host 错误原文是英文（Rust thiserror），在此包一层：正文中文、原文进 InnerException
+                                tcs.TrySetException(HostErrorText.ToException(msg));
                             }
                             else if (root.TryGetProperty("result", out var result))
                             {
@@ -345,12 +410,12 @@ public sealed class HostIpcClient : IAsyncDisposable
         CancellationToken ct = default)
     {
         await EnsureConnectedAsync(ct);
-        if (!IsConnected) throw new InvalidOperationException("host unavailable");
+        if (!IsConnected) throw HostErrorText.HostUnavailable();
         var el = await CallAsync("host.plugin.install", new { path, force }, ct);
         if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("id", out _))
             return JsonSerializer.Deserialize<PluginInstallOutcomeDto>(el.GetRawText())
-                ?? throw new InvalidOperationException("host.plugin.install: empty result");
-        throw new InvalidOperationException("host.plugin.install: unexpected result");
+                ?? throw new InvalidOperationException("后台未返回有效的安装结果");
+        throw new InvalidOperationException("后台返回了无法识别的安装结果");
     }
 
     /// <summary>加载开发目录（不拷贝），返回插件 id；失败抛出。</summary>
@@ -378,23 +443,23 @@ public sealed class HostIpcClient : IAsyncDisposable
         JsonElement args, CancellationToken ct = default)
     {
         await EnsureConnectedAsync(ct);
-        if (!IsConnected) throw new InvalidOperationException("host unavailable");
+        if (!IsConnected) throw HostErrorText.HostUnavailable();
 
         var el = await CallAsync("host.plugin.api",
             new { plugin_id = pluginId, capability, method, args }, ct);
         if (el.ValueKind != JsonValueKind.Object)
-            throw new InvalidOperationException("host.plugin.api: unexpected result");
+            throw new InvalidOperationException("后台返回了无法识别的能力调用结果");
         return el.TryGetProperty("data", out var data) ? data.Clone() : default;
     }
 
     private async Task<string> PluginIdCallAsync(string method, object paramsObj, CancellationToken ct)
     {
         await EnsureConnectedAsync(ct);
-        if (!IsConnected) throw new InvalidOperationException("host unavailable");
+        if (!IsConnected) throw HostErrorText.HostUnavailable();
         var el = await CallAsync(method, paramsObj, ct);
         if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("id", out var idEl))
             return idEl.GetString() ?? "";
-        throw new InvalidOperationException($"{method}: unexpected result");
+        throw new InvalidOperationException($"{method}: 后台返回了无法识别的结果");
     }
 
     private async Task<bool> PluginOkCallAsync(string method, object paramsObj, CancellationToken ct)
@@ -458,7 +523,7 @@ public sealed class HostIpcClient : IAsyncDisposable
             using var reg = timeout.Token.Register(() =>
             {
                 if (_pending.TryRemove(id, out var p))
-                    p.TrySetException(new TimeoutException("host ipc timeout"));
+                    p.TrySetException(new TimeoutException(HostErrorText.Translate("host ipc timeout")));
             });
 
             try

@@ -702,6 +702,56 @@ impl PluginManager {
         None
     }
 
+    /// 搜索前缀建议：输入是某已启用 webview page 插件关键字的**真前缀**（还没打完）时产出候选，
+    /// 供主列表随输入即时展示（uTools 同款：打 "内" 就能看到"内容对比"）。
+    /// 与 `find_keyword_match`（可打开判定，要求完整关键字）解耦：
+    /// 返回的 match 与精确命中同构（input 为空），打开时即以关键字本身进入插件页。
+    pub fn find_keyword_prefix_matches(&self, text: &str) -> Vec<KeywordMatch> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        // 带空格 = 已进入"关键字 + 参数"阶段，由 find_keyword_match 精确路由，不再给前缀建议
+        if trimmed.contains(' ') {
+            return Vec::new();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let mut out = Vec::new();
+        for p in &self.plugins {
+            if !p.enabled || !matches!(p.manifest.runtime, PluginRuntime::Webview) {
+                continue;
+            }
+            for (fi, f) in p.manifest.features.iter().enumerate() {
+                if f.mode != "page" {
+                    continue;
+                }
+                if let Some(kw) = f.keyword() {
+                    if kw.is_empty() {
+                        continue;
+                    }
+                    let kw_l = kw.to_ascii_lowercase();
+                    // 真前缀：关键字严格长于输入且以输入开头（排除完整命中，那由
+                    // find_keyword_match 以更高优先级处理，避免同词双候选）。
+                    if kw_l.len() > lower.len() && kw_l.starts_with(&lower)
+                        // 路由语义是清单内首个匹配 feature 胜出；同插件重复关键字
+                        // 再产候选只会得到两行完全同 id 的结果，此处去重。
+                        && !out
+                            .iter()
+                            .any(|e: &KeywordMatch| e.plugin_id == p.manifest.id && e.keyword == kw)
+                    {
+                        out.push(KeywordMatch {
+                            plugin_id: p.manifest.id.clone(),
+                            feature_index: fi,
+                            input: String::new(),
+                            keyword: kw.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// 检测已启用 webview 插件间的 page 关键字冲突（同一关键字被多个插件占用）。
     ///
     /// 仅统计 `enabled` 的 webview 插件：禁用的插件不参与路由，不构成实际冲突。
@@ -942,6 +992,66 @@ mod tests {
 
         // 非该关键字前缀不误命中。
         assert!(pm.find_keyword_match("翻 译").is_none());
+    }
+
+    #[test]
+    fn keyword_prefix_suggest() {
+        // 前缀建议：真前缀产出候选（input 为空）；完整命中不重复建议；
+        // 带空格（参数阶段）/空输入不产生建议；ASCII 大小写归一同样生效。
+        let tmp = std::env::temp_dir().join("spark_pm_kw_pre");
+        let _ = fs::remove_dir_all(&tmp);
+        make_webview_plugin(&tmp.join("com.spark.fy"), "com.spark.fy", "翻译");
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.load_dev_dir(&tmp.join("com.spark.fy")).unwrap();
+
+        let hits = pm.find_keyword_prefix_matches("翻");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].plugin_id, "com.spark.fy");
+        assert_eq!(hits[0].keyword, "翻译");
+        assert!(hits[0].input.is_empty());
+
+        // 完整命中不进前缀列表（由 find_keyword_match 高优先级处理）
+        assert!(pm.find_keyword_prefix_matches("翻译").is_empty());
+        // 非关键字前缀不误命中
+        assert!(pm.find_keyword_prefix_matches("翻译x").is_empty());
+        // 带空格进入参数阶段交给精确路由；空输入不给建议
+        assert!(pm.find_keyword_prefix_matches("翻 译").is_empty());
+        assert!(pm.find_keyword_prefix_matches("").is_empty());
+
+        make_webview_plugin(&tmp.join("com.spark.tr"), "com.spark.tr", "tr");
+        pm.load_dev_dir(&tmp.join("com.spark.tr")).unwrap();
+        assert!(pm
+            .find_keyword_prefix_matches("T")
+            .iter()
+            .any(|m| m.keyword == "tr"));
+    }
+
+    #[test]
+    fn keyword_prefix_suggest_dedup_same_plugin_duplicate_keyword() {
+        // 同插件清单内两个 feature 声明同一 page 关键字（合法形状，路由首者胜）：
+        // 前缀建议按 (plugin_id, keyword) 去重，不得出现两条同 id 候选。
+        let tmp = std::env::temp_dir().join("spark_pm_kw_pre_dup");
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = tmp.join("com.spark.dup");
+        std::fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("plugin.json"),
+            r#"{ "id": "com.spark.dup", "name": "T", "version": "0.1.0", "api_version": 2,
+                 "runtime": "webview", "main": "index.html",
+                 "features": [
+                   { "type": "keyword", "keyword": "翻译", "title": "T", "mode": "page" },
+                   { "type": "keyword", "keyword": "翻译", "title": "T-dup", "mode": "page" }
+                 ] }"#,
+        )
+        .unwrap();
+        fs::write(dir.join("index.html"), "<html></html>").unwrap();
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.load_dev_dir(&dir).unwrap();
+
+        let hits = pm.find_keyword_prefix_matches("翻");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].plugin_id, "com.spark.dup");
+        assert_eq!(hits[0].feature_index, 0); // 首个匹配 feature 胜出
     }
 
     #[test]
