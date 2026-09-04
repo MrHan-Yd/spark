@@ -1,23 +1,32 @@
 //! Spark 官方 Rust SDK：native 插件入口。
 //!
+//! native 插件是**纯应用**模型：无 commands/keywords，不进搜索框；页面
+//! （WebView2）经 host 转发的 `plugin.page` 是插件的主要交互入口。
 //! 插件作者实现 [`Plugin`] trait，main 里调 [`run_loop`] 即可。
 //! `run_loop` 负责：帧编解码、`plugin.initialize` 握手、`query`/`invoke`/`cancel`
-//! 分发、`plugin.shutdown` 退出。stdout 必须纯净协议帧，日志走 stderr。
+//! /`page` 分发、`plugin.shutdown` 退出。stdout 必须纯净协议帧，日志走 stderr。
 
 use serde_json::Value;
 use spark_core::Candidate;
 use spark_ipc::{
     decode_line, encode_line, read_frame, write_frame, InvokeParams, InvokeResult, JsonRpcRequest,
-    JsonRpcResponse, PluginInitializeParams, PluginInitializeResult, PluginMethod, QueryParams,
-    QueryResult,
+    JsonRpcResponse, PluginInitializeParams, PluginInitializeResult, PluginMethod,
+    PluginPageParams, QueryParams, QueryResult,
 };
 use std::io::{self, BufReader};
 use thiserror::Error;
 
 pub trait Plugin {
     fn id(&self) -> &str;
+    /// 既有搜索入口：纯应用模型下 host 不再调用，保留仅为协议兼容。
     fn query(&mut self, params: QueryParams) -> QueryResult;
+    /// 既有执行入口：纯应用模型下 host 不再调用，保留仅为协议兼容。
     fn invoke(&mut self, params: InvokeParams) -> InvokeResult;
+    /// 页面 `spark.rpc(method, args)` 的宿主（native 纯应用模型唯一入口）。
+    /// 返回值原样回传页面 JS；默认返回 null，插件按需覆写（如配置读写）。
+    fn page(&mut self, _params: PluginPageParams) -> Value {
+        Value::Null
+    }
 }
 
 /// Helper: single-item list result.
@@ -129,6 +138,11 @@ fn dispatch_request(
             let params: InvokeParams = serde_json::from_value(req.params)?;
             let result = plugin.invoke(params);
             JsonRpcResponse::result(id, serde_json::to_value(result)?)
+        }
+        m if m == PluginMethod::Page.as_str() => {
+            let params: PluginPageParams = serde_json::from_value(req.params)?;
+            let result = plugin.page(params);
+            JsonRpcResponse::result(id, result)
         }
         m if m == PluginMethod::Cancel.as_str() => {
             // cancel 是 notification（无 id）：不回帧，保持 stdout 纯净。
@@ -268,6 +282,27 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(r, DispatchOutcome::Shutdown));
+    }
+
+    #[test]
+    fn dispatch_page_returns_plugin_value() {
+        // 未覆写 page() 的插件默认回 null；覆写后原样回传（回显见 echo 插件 e2e）。
+        let mut p = Echo;
+        let r = dispatch_request(
+            &mut p,
+            req(
+                PluginMethod::Page.as_str(),
+                Some(4),
+                serde_json::json!({ "method": "get_config", "args": { "k": "v" } }),
+            ),
+        )
+        .unwrap();
+        match r {
+            DispatchOutcome::Reply(resp) => {
+                assert_eq!(resp.result.unwrap(), Value::Null);
+            }
+            DispatchOutcome::Shutdown | DispatchOutcome::NoReply => panic!("expected reply"),
+        }
     }
 
     #[test]

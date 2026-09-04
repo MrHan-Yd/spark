@@ -23,7 +23,9 @@ public sealed partial class PluginWindow : Window
     private const string VirtualHost = "plugin.spark.invalid";
 
     private readonly PluginOpenInfoDto _info;
-    private readonly HostIpcClient _host;
+    /// <summary>本窗口专属 IPC 连接：rpc 经 host 转发的最坏等待 15s 会占住 host 读循环，
+    /// 绝不与主窗口搜索共用一条管道，否则同连接上的 host.query 排队超时、连带拆连接。</summary>
+    private readonly HostIpcClient _host = new();
     private readonly bool _devMode;
     private readonly AppWindow _appWindow;
     private readonly IntPtr _hwnd;
@@ -40,11 +42,10 @@ public sealed partial class PluginWindow : Window
 
     public string PluginId => _info.Id;
 
-    public PluginWindow(PluginOpenInfoDto info, HostIpcClient host, string input, string command,
+    public PluginWindow(PluginOpenInfoDto info, string input, string command,
         string rawQuery, bool devMode)
     {
         _info = info;
-        _host = host;
         _devMode = devMode;
 
         App.Log("PluginWindow", $"ctor start id={info.Id} name={info.Name} icon_abs={info.IconAbs ?? "(null)"}");
@@ -341,7 +342,7 @@ public sealed partial class PluginWindow : Window
     /// </summary>
     private void ShowPermissionDenied(string capability, string method)
     {
-        // 在途 IPC 长达 8s，续体可能晚于关窗恢复——与 PostReply 同语义短路，
+        // 在途 IPC 最长 8s（rpc 能力 20s），续体可能晚于关窗恢复——与 PostReply 同语义短路，
         // 不触碰已拆树的 PermBar（async void 异常会直接崩进程）。
         if (_closing) return;
         var name = PermissionDisplayName(capability, method);
@@ -505,11 +506,30 @@ public sealed partial class PluginWindow : Window
         // 关窗前给页面一次存盘机会（规范 §8.5 onClose）；WebView2 随窗口销毁。
         if (_webReady) PostEvent("close", null);
         try { Web.Close(); } catch (Exception ex) { App.Log("PluginWebClose", ex); }
+        // native 纯应用插件：exe 生命周期与页面绑定，关窗即以无 id notification 通知 host
+        // 关停进程（host 侧对 webview 插件无操作）。fire-and-forget，不阻塞窗口销毁；
+        // 通知写入先于连接释放，管道缓冲数据 host 仍可读。
+        _ = NotifyPageClosedAsync();
     }
 
-    /// <summary>被再次触发时聚焦已有窗口并刷新输入上下文（默认单开）。</summary>
-    public void FocusWith(string input, string command, string rawQuery)
+    private async Task NotifyPageClosedAsync()
     {
+        try { await _host.PluginPageClosedNotifyAsync(_info.Id); }
+        catch (Exception ex) { App.Log("PluginPageClosed", ex); }
+        finally { await _host.DisposeAsync(); }
+    }
+
+    /// <summary>被再次触发时聚焦已有窗口并刷新输入上下文（默认单开）。
+    /// devMode=true 时即时补开 DevTools/右键菜单/加速键——「调试」按钮对已开窗口
+    /// 复用而非关旧开新（关旧开新会让旧窗的关停通知晚到，误杀新页首次 rpc 懒启动的 exe）。</summary>
+    public void FocusWith(string input, string command, string rawQuery, bool devMode = false)
+    {
+        if (devMode && Web.CoreWebView2 is { } core)
+        {
+            core.Settings.AreDevToolsEnabled = true;
+            core.Settings.AreDefaultContextMenusEnabled = true;
+            core.Settings.AreBrowserAcceleratorKeysEnabled = true;
+        }
         _appWindow.Show();
         SetForegroundWindow(_hwnd);
         if (_webReady)

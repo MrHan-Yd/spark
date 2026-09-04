@@ -14,7 +14,7 @@ pub use message::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use protocol::{
     HostMethod, InvokeParams, InvokeResult, JsonRpcNotification, PluginApiParams,
     PluginDevLoadParams, PluginGrantParams, PluginIdParams, PluginInitializeParams,
-    PluginInitializeResult, PluginInstallParams, PluginMethod, PluginOpenParams,
+    PluginInitializeResult, PluginInstallParams, PluginMethod, PluginOpenParams, PluginPageParams,
     PluginSetDirParams, PluginToggleParams, QueryParams, QueryResult, SetConfigParams,
     TrustedPubkeyEntry, UiMethod, API_VERSION, PIPE_NAME, PIPE_PATH,
 };

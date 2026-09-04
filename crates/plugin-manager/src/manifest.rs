@@ -41,7 +41,8 @@ pub struct PluginFeature {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
-    /// `page`（开窗，webview）或 `list`（返回结果项，native）。
+    /// `page`（开窗）；`list` 已移除（旧 native"exe 直接应答搜索"模式）。
+    /// webview 全量允许；native 仅接受 `page`。
     #[serde(default = "default_feature_mode")]
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,18 +137,25 @@ pub struct PluginManifest {
     /// webview 插件可选的自定义预加载脚本相对路径。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preload: Option<String>,
+    /// 旧版 native 关键字（已废弃：native 纯应用模型下校验直接拒绝）。
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// native 插件命令（向后兼容）。
+    /// 旧版 native 命令（已废弃：native 纯应用模型下校验直接拒绝）。
     #[serde(default)]
     pub commands: Vec<PluginCommand>,
-    /// webview 插件触发入口（一期主推）。
+    /// 插件触发入口：webview 全量；native 仅 page 模式（关键字只做"搜索框 →
+    /// 打开页面"入口，exe 永不直接产出搜索结果）。
     #[serde(default)]
     pub features: Vec<PluginFeature>,
     #[serde(default)]
     pub permissions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<PluginWindow>,
+    /// native 插件页面入口（相对插件根目录的 HTML 路径）；native 必填。
+    /// native 是"纯应用"模型：页面是插件的全部 UI，从插件卡片「打开」或搜索框
+    /// 关键字（features page 模式）进入；exe 只经 `plugin.page` RPC 服务于页面。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
 }
 
 impl PluginManifest {
@@ -173,10 +181,11 @@ impl PluginManifest {
         if self.main.is_empty() {
             return Err(PluginError::Manifest("main is required".into()));
         }
-        // 入口至少有一种：native 用 commands，webview 用 features。
-        if self.commands.is_empty() && self.features.is_empty() {
+        // 入口至少有一种：webview 用 features；native 必有 page（可另声明
+        // features 作搜索入口）。
+        if self.features.is_empty() && self.page.is_none() {
             return Err(PluginError::Manifest(
-                "either commands or features must be present".into(),
+                "either features or page must be present".into(),
             ));
         }
         match self.runtime {
@@ -196,16 +205,60 @@ impl PluginManifest {
                 }
             }
             PluginRuntime::Native => {
-                if self.commands.is_empty() {
+                // native 纯应用模型：旧 commands/keywords（exe 直接向搜索框应答的
+                // list 模式）仍拒绝；features 与 webview 同构，但仅限 page 模式——
+                // 关键字只做"搜索框 → 打开页面"入口，exe 永不直接产出搜索结果。
+                if !self.commands.is_empty() {
                     return Err(PluginError::Manifest(
-                        "native plugin requires at least one command".into(),
+                        "native plugin no longer supports 'commands' (use 'features' with mode=page)"
+                            .into(),
                     ));
                 }
+                if !self.keywords.is_empty() {
+                    return Err(PluginError::Manifest(
+                        "native plugin no longer supports 'keywords' (use 'features')".into(),
+                    ));
+                }
+                for f in &self.features {
+                    f.validate()?;
+                    if f.mode != "page" {
+                        return Err(PluginError::Manifest(format!(
+                            "native feature mode must be 'page', got '{}'",
+                            f.mode
+                        )));
+                    }
+                }
+                let page = self.page.as_deref().ok_or_else(|| {
+                    PluginError::Manifest("native plugin requires 'page' (HTML entry)".into())
+                })?;
+                validate_page_path(page)?;
             }
             PluginRuntime::Wasm => {}
         }
         Ok(())
     }
+}
+
+/// native `page` 路径校验：仅允许"普通相对路径"——所有组件必须是 `Normal`
+/// （拒绝绝对路径/盘符前缀/根路径/`..` 上跳/`.` 当前目录）。页面由 WebView2 以
+/// 虚拟主机映射加载，路径越界会读到插件目录之外的内容；`C:evil`（有前缀无根）、
+/// `\evil`（有根无前缀）这类 `is_absolute()` 拦不住的形状也被 Normal 约束覆盖。
+fn validate_page_path(page: &str) -> Result<(), PluginError> {
+    if page.is_empty() {
+        return Err(PluginError::Manifest("page must not be empty".into()));
+    }
+    let all_normal = Path::new(page)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !all_normal {
+        return Err(PluginError::Manifest(
+            "page must be a plain relative path (no '..' / drive / rooted components)".into(),
+        ));
+    }
+    if !page.to_ascii_lowercase().ends_with(".html") {
+        return Err(PluginError::Manifest("page must be an .html file".into()));
+    }
+    Ok(())
 }
 
 /// 宽松版本号比较：与 host 自更新 C# 端 `ParseVersion` 行为一致。
@@ -363,13 +416,124 @@ mod tests {
     #[test]
     fn native_manifest_still_valid() {
         let json = r#"{
-            "id":"com.spark.echo","name":"Echo","version":"0.1.0","api_version":1,
-            "runtime":"native","main":"echo.exe",
-            "commands":[{"name":"echo","title":"Echo","mode":"list","prefix":"echo "}]
+            "id":"com.spark.echo","name":"Echo","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"echo.exe","page":"page.html"
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         m.validate().unwrap();
         assert_eq!(m.runtime, PluginRuntime::Native);
+        assert_eq!(m.page.as_deref(), Some("page.html"));
+    }
+
+    #[test]
+    fn native_requires_page() {
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe"
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn native_rejects_commands() {
+        // 纯应用模型：native 不得声明 commands（搜索框入口），否则拒绝加载。
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"page.html",
+            "commands":[{"name":"x","title":"X","mode":"list","prefix":"x "}]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn native_rejects_keywords() {
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"page.html","keywords":["x"]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn native_accepts_features_page_mode() {
+        // 纯应用模型保留 features 关键字入口：搜索框搜到 → 打开页面（同 webview UX）。
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"page.html",
+            "features":[{"type":"keyword","keyword":"x","title":"X","mode":"page"}]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        m.validate().unwrap();
+        assert_eq!(m.features[0].keyword(), Some("x"));
+    }
+
+    #[test]
+    fn native_rejects_features_list_mode() {
+        // native feature 只许 page 模式：list 意味着 exe 直接产出搜索结果，
+        // 正是纯应用模型移除的能力。
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"page.html",
+            "features":[{"type":"keyword","keyword":"x","title":"X","mode":"list"}]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn native_page_path_rejects_absolute() {
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"C:\\evil\\page.html"
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn native_page_path_rejects_drive_prefix_and_rooted() {
+        // is_absolute() 拦不住的形状：盘符相对路径（C:evil）与根相对（/evil），
+        // 都被 all-Normal 约束拒绝。
+        for page in ["C:evil/page.html", "/evil/page.html", "../page.html"] {
+            let json = format!(
+                r#"{{
+                    "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+                    "runtime":"native","main":"x.exe","page":"{page}"
+                }}"#
+            );
+            let m: PluginManifest = serde_json::from_str(&json).unwrap();
+            assert!(m.validate().is_err(), "page {page:?} must be rejected");
+        }
+        // 纯 "." 组件（./page.html）同样被拒（Normal 约束）。
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"./page.html"
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn native_page_path_rejects_parent_dir() {
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"..\\evil\\page.html"
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn native_page_path_rejects_non_html() {
+        let json = r#"{
+            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
+            "runtime":"native","main":"x.exe","page":"assets/page.exe"
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.validate().is_err());
     }
 
     #[test]
@@ -385,8 +549,7 @@ mod tests {
         // 旧规范版本（如 native 时代的 1）在新 host 上仍可加载。
         let json = r#"{
             "id":"com.spark.old","name":"Old","version":"0.1.0","api_version":1,
-            "runtime":"native","main":"old.exe",
-            "commands":[{"name":"old","title":"Old","mode":"list","prefix":"old "}]
+            "runtime":"native","main":"old.exe","page":"page.html"
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         m.validate().unwrap();

@@ -56,6 +56,13 @@ public sealed class PluginInfoDto
     public List<PluginFeatureDto> Features { get; set; } = new();
 
     /// <summary>
+    /// 插件是否拥有可打开的页面（webview：有 mode:page feature；native：声明 page 字段）。
+    /// UI 据此决定插件卡片是否显示「打开」按钮。
+    /// </summary>
+    [JsonPropertyName("has_page")]
+    public bool HasPage { get; set; }
+
+    /// <summary>
     /// 签名状态：host <c>PluginInfo.sign_state</c> 的 snake_case 形状。
     /// <c>official</c> / <c>third_party</c> / <c>unsigned</c> / <c>invalid</c>。
     /// 用字符串承接反序列化（与 <see cref="Runtime"/>/<see cref="Source"/> 一致），

@@ -3849,10 +3849,38 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>插件卡片"打开"按钮：打开插件页面窗口。native 纯应用插件的免打字入口
+    /// （native 也声明 features 关键字进搜索框，卡片打开是快捷路径），
+    /// webview 插件同样可用（免打关键字直达页面）。
+    /// devMode 只随开发者模式/开发目录，区别于强制 devMode 的"调试"按钮。
+    /// 不 CloseIfOpen：已开则 OpenOrFocus 聚焦复用（关旧开新会让旧窗的关停通知
+    /// 晚到，误杀新页首次 rpc 懒启动的 exe）。</summary>
+    private async void OnOpenPluginPage(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
+        try
+        {
+            var info = await _host.PluginOpenAsync(row.Id, "", "");
+            if (info is null)
+            {
+                SetPluginStatus($"无法打开：{row.Name}（插件未启用或无可打开页面）");
+                return;
+            }
+            var devMode = LocalState.Ui.DeveloperMode || await IsDevPluginAsync(row.Id);
+            PluginWindowHost.OpenOrFocus(info, "", "", "", devMode);
+            SetPluginStatus($"已打开插件页面：{row.Name}");
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginOpen", ex);
+            SetPluginStatus($"打开失败：{row.Name}");
+        }
+    }
+
     /// <summary>插件卡片"调试"按钮：以 devMode=true 打开插件窗口（DevTools/右键菜单/加速键全开），
     /// 与正式安装/dev 目录无关——只要开发者模式开着就能调试任意已启用插件。
-    /// 若该插件窗口已打开，先收掉再重开：OpenOrFocus 命中旧窗口时不会重应用 dev 设置，
-    /// 直接聚焦会拿到 DevTools 未启用的旧实例，必须重开才能保证调试生效。</summary>
+    /// 已开窗口复用并即时补开 dev 设置（FocusWith(devMode:true)），不 CloseIfOpen 关旧开新：
+    /// 旧窗的关停通知晚到会误杀新页首次 rpc 懒启动的 exe（与「打开」路径同一竞态）。</summary>
     private async void OnDebugPlugin(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
@@ -3861,11 +3889,10 @@ public sealed partial class MainWindow : Window
             var info = await _host.PluginOpenAsync(row.Id, "", "");
             if (info is null)
             {
-                SetPluginStatus($"无法打开调试：{row.Name}（插件未启用或非 WebView 类型）");
+                SetPluginStatus($"无法打开调试：{row.Name}（插件未启用或无可打开页面）");
                 return;
             }
-            PluginWindowHost.CloseIfOpen(row.Id);
-            PluginWindowHost.OpenOrFocus(info, _host, "", "", "", devMode: true);
+            PluginWindowHost.OpenOrFocus(info, "", "", "", devMode: true);
             SetPluginStatus($"已打开调试窗口：{row.Name}");
         }
         catch (Exception ex)
@@ -5625,9 +5652,9 @@ public sealed partial class MainWindow : Window
                 return;
             }
             // 开发目录加载的插件开 DevTools，正式安装的看通用设置的开发者模式总开关（规范 §9.2）。
-            // 注意：OpenOrFocus 命中旧窗口时不会重应用 dev 设置，开关切换后已开的窗口需重开才生效。
+            // OpenOrFocus 命中旧窗口时按 devMode 即时补应用 dev 设置（FocusWith 内处理）。
             var devMode = LocalState.Ui.DeveloperMode || await IsDevPluginAsync(pluginId);
-            PluginWindowHost.OpenOrFocus(info, _host, input, command, rawQuery, devMode);
+            PluginWindowHost.OpenOrFocus(info, input, command, rawQuery, devMode);
             Footer.Text = "已打开：" + title;
         }
         catch (Exception ex)

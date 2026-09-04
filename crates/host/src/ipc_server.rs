@@ -306,24 +306,16 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                     &JsonRpcResponse::error(id, -32602, "invalid query parameters"),
                 );
             }
-            // 三段式（PERF-SEARCH ③）：native RPC 是秒级阻塞操作，绝不能在 host
-            // 全局锁内执行（会拖死所有 IPC）。① 锁内：索引+页面插件候选+native 快照；
-            // ② 锁外：native RPC ≤300ms（超时保留进程，未就绪自动后台预热），
-            // 缺席结果以 partial=true 如实上报，UI 延迟补查；③ 合并截断（纯数据，无需锁）。
+            // ① 锁内搜索（索引 + webview 插件候选），② 合并截断（纯数据，无需锁）。
+            // native 插件是纯应用模型，不进搜索链路（manifest 层已禁声明入口）。
             let mut prep = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
                 g.search_prep(&params.text, params.limit)
             };
-            let mut partial = false;
-            if let Some(native_req) = prep.native.take() {
-                let (native_result, native_partial) = native_req.execute();
-                prep.hits.extend(native_result.items);
-                partial = native_partial;
-            }
             prep.hits.truncate(prep.limit as usize);
             let result = QueryResult {
                 items: prep.hits,
-                partial,
+                partial: false,
             };
             JsonRpcResponse::result(id, serde_json::to_value(result)?)
         }
@@ -546,11 +538,43 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                     &JsonRpcResponse::error(id, -32602, "invalid api params"),
                 );
             }
-            let data = {
+            // ① 锁内：鉴权 + 快照构造（native rpc 只返回 deferred 请求）；
+            // ② 锁外：native rpc 的等待（懒启动最坏 15s）——绝不占 host 锁，
+            // 否则一次慢插件 RPC 会冻结全部 IPC（含主窗口 host.query 热路径）。
+            let outcome = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
                 g.plugin_api(&params)?
             };
+            let data = match outcome {
+                crate::app::PluginApiOutcome::Done(v) => v,
+                // 执行段错误同样带 UNAVAILABLE 前缀：与准备段（app.rs rpc 分支）一致，
+                // 页面按 "CODE: detail" 还原 error.code（见 Native插件开发.md §7）。
+                crate::app::PluginApiOutcome::NativePage(page_req) => page_req
+                    .execute()
+                    .map_err(|e| anyhow::anyhow!("UNAVAILABLE: {e}"))?,
+            };
             JsonRpcResponse::result(id, serde_json::json!({ "ok": true, "data": data }))
+        }
+        m if m == HostMethod::PluginPageClosed.as_str() => {
+            let params: PluginIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
+            };
+            if params.id.is_empty() || params.id.len() > 256 {
+                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid id"));
+            }
+            // fire-and-forget 关停（native 纯应用插件 exe 随页面退出；webview 无操作）：
+            // host 锁内只花一次通道 send，等待发生在 native runtime 专职线程。
+            {
+                let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                g.plugin_page_closed(&params.id);
+            }
+            // UI 以 notification（无 id）发送时不回包——关窗通知不占请求预算。
+            if id.is_some() {
+                JsonRpcResponse::result(id, serde_json::json!({ "ok": true }))
+            } else {
+                return Ok(());
+            }
         }
         other => JsonRpcResponse::error(id, -32601, format!("method not found: {other}")),
     };

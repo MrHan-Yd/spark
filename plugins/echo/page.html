@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Echo 页面</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; margin: 24px; background: transparent; color: var(--sp-fg, #ddd); }
+    h1 { font-size: 16px; margin: 0 0 12px; }
+    input { width: 100%; box-sizing: border-box; padding: 6px 10px; margin-bottom: 8px; }
+    button { padding: 6px 16px; cursor: pointer; }
+    pre { white-space: pre-wrap; word-break: break-all; background: rgba(128,128,128,.15); padding: 10px; border-radius: 6px; min-height: 60px; }
+  </style>
+</head>
+<body>
+  <h1>Echo 页面（spark.rpc 回显）</h1>
+  <input id="text" placeholder="输入任意文本，回车或点发送" />
+  <button id="send">发送</button>
+  <pre id="out">（插件 exe 未收到任何调用前不会启动）</pre>
+  <script>
+    const out = document.getElementById('out');
+    async function send() {
+      const text = document.getElementById('text').value;
+      try {
+        // 首次调用会触发 host 懒启动插件 exe 并完成握手
+        const r = await spark.rpc('echo', { text, at: Date.now() });
+        out.textContent = JSON.stringify(r, null, 2);
+      } catch (e) {
+        out.textContent = '错误: ' + ((e && e.message) || e);
+      }
+    }
+    document.getElementById('send').addEventListener('click', send);
+    document.getElementById('text').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') send();
+    });
+    // 窗口标题由页面自定（spark.window 能力宿主本地处理）
+    spark.window.setTitle('Echo 页面').catch(() => {});
+  </script>
+</body>
+</html>

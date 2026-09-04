@@ -1254,6 +1254,15 @@
 
                             <!-- 操作按钮 -->
                             <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                              <Button Click="OnOpenPluginPage" Padding="12,5" FontSize="11"
+                                      Visibility="{Binding OpenVisibility}"
+                                      Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+                                      BorderThickness="1" CornerRadius="8" Foreground="{StaticResource AccentBrush}">
+                                <StackPanel Orientation="Horizontal" Spacing="5">
+                                  <FontIcon Glyph="&#xE8A7;" FontSize="11" Foreground="{StaticResource AccentBrush}"/>
+                                  <TextBlock Text="打开" Foreground="{StaticResource AccentBrush}"/>
+                                </StackPanel>
+                              </Button>
                               <Button Click="OnDebugPlugin" Padding="12,5" FontSize="11"
                                       Visibility="{Binding DebugVisibility}"
                                       Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"

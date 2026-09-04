@@ -221,13 +221,25 @@ spark.onResize(cb => (w, h))
 spark.onClose(cb)                   // 窗口即将关闭前触发，可做存盘
 ```
 
-### 6.7 开发模式 `spark.dev` ✅（仅开发目录加载时）
+### 6.7 调用插件原生逻辑 `spark.rpc` ✅（仅 native 插件页面）
+
+native 纯应用插件专属：经 host 转发 `plugin.page` RPC 调用插件 exe 的自定义逻辑，
+返回插件自定义 JSON。不设权限（页面与 exe 同源同信任）；**webview 插件调用返回
+`UNAVAILABLE`**。超时 5s；错误以 Promise reject（`"CODE: detail"` 形状）。
+
+```js
+const result = await spark.rpc('get_config', { key: 'value' })   // args 任意 JSON
+```
+
+详见 [Native插件开发.md](./Native插件开发.md) §4.2/§5。
+
+### 6.8 开发模式 `spark.dev` ✅（仅开发目录加载时）
 
 ```js
 spark.dev.openDevTools()
 ```
 
-### 6.8 待实现 🚧
+### 6.9 待实现 🚧
 
 以下在规范中已定义，一期未实现，调用会抛 `UNAVAILABLE`：
 

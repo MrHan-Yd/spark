@@ -1,0 +1,8 @@
+launcher hwnd=0xA0882
+uia windows of pid: 0
+uia children of pid (any type): 1
+  el type=ControlType.Pane name='Spark' class='WinUIDesktopWin32WindowClass' id=''
+  aid 'BtnSettings' found=True
+  aid 'NavPlugins' found=False
+  aid 'PluginList' found=False
+  aid 'QueryBox' found=True

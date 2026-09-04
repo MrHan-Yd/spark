@@ -1,19 +1,20 @@
 {
   "id": "com.spark.echo",
   "name": "Echo",
-  "version": "0.1.0",
-  "api_version": 1,
+  "version": "0.2.0",
+  "api_version": 2,
   "main": "spark-plugin-echo.exe",
   "runtime": "native",
-  "description": "示例插件：回显输入",
-  "keywords": ["echo", "demo"],
-  "commands": [
+  "description": "示例插件：纯应用模型（页面 + spark.rpc 回显）",
+  "page": "page.html",
+  "features": [
     {
-      "name": "echo",
+      "type": "keyword",
+      "keyword": "echo",
       "title": "Echo",
-      "subtitle": "回显输入",
-      "mode": "list",
-      "prefix": "echo "
+      "subtitle": "示例插件：页面 + spark.rpc 回显",
+      "mode": "page",
+      "placeholder": "输入任意文本…"
     }
   ],
   "permissions": []

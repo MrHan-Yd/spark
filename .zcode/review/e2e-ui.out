@@ -1,0 +1,12 @@
+UI pid=33172
+PASS summon: launcher visible
+retry pass 1: FAIL uia: launcher window / NavPlugins not found
+retry pass 2: FAIL uia: launcher window / NavPlugins not found
+retry pass 3: FAIL uia: launcher window / NavPlugins not found
+FAIL uia: card open flow failed after 3 passes
+ËùÔÚÎ»ÖÃ D:\demo\test01\spark\.zcode\review\e2e-ui.ps1:156 ×Ö·û: 20
++ ... ot $uiaOk) { throw 'FAIL uia: card open flow failed after 3 passes' }
++                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (FAIL uia: card ... after 3 passes:String) [], RuntimeException
+    + FullyQualifiedErrorId : FAIL uia: card open flow failed after 3 passes
+ 

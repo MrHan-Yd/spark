@@ -1,0 +1,12 @@
+fg before: hwnd=0x70AC8 pid=22376 name=chrome
+hidden-state: uia windows of pid = 0
+t+0.4s: hwnd=0xA0882 pid=33172 name=Spark
+t+0.8s: hwnd=0xA0882 pid=33172 name=Spark
+t+1.2s: hwnd=0xA0882 pid=33172 name=Spark
+t+1.6s: hwnd=0xA0882 pid=33172 name=Spark
+t+2s: hwnd=0xA0882 pid=33172 name=Spark
+t+2.4s: hwnd=0xA0882 pid=33172 name=Spark
+t+2.8s: hwnd=0xA0882 pid=33172 name=Spark
+t+3.2s: hwnd=0xA0882 pid=33172 name=Spark
+t+3.6s: hwnd=0xA0882 pid=33172 name=Spark
+t+4s: hwnd=0xA0882 pid=33172 name=Spark

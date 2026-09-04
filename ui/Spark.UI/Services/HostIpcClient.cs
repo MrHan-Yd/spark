@@ -38,8 +38,11 @@ public sealed class HostIpcClient : IAsyncDisposable
     /// host 冷启动期间 QueryAsync 会回退 DemoData，host 上线不补查的话用户会一直看到演示结果。</summary>
     public event Action? Connected;
 
-    /// <summary>上次尝试拉起 host 进程的时刻（节流，防失败重试风暴重复 spawn）。</summary>
-    private long _lastSpawnAttemptTicks;
+    /// <summary>上次尝试拉起 host 进程的时刻（节流，防失败重试风暴重复 spawn）。
+    /// static：每个插件页窗口持有独立 HostIpcClient，节流必须跨实例共享，
+    /// 否则多连接并发重连可各自 spawn（host 的 SingleInstance 护栏虽让第二个
+    /// --no-ui 实例直接退出，仍是无谓 spawn + 日志噪音）。</summary>
+    private static long _lastSpawnAttemptTicks;
     /// <summary>已记过 QueryFallback 日志的连接代（-1 = 尚未记过）。断连期间打字每键一条
     /// 同步文件 IO 会拖慢输入，同一断连段只记一条，重连成功后复位。</summary>
     private long _fallbackLoggedGen = -1;
@@ -114,32 +117,70 @@ public sealed class HostIpcClient : IAsyncDisposable
 
     /// <summary>host 进程缺失时由 UI 拉起（节流 20s）：开机自启/手动场景 host 可能没在跑，
     /// UI 只管连接从不 spawn 的话，冷启动窗口内所有查询都静默降级成演示数据。
-    /// --no-ui：UI 本尊已在运行，明确告诉 host 别再管 UI 拉起；spawn 失败仅记日志，
-    /// 后续连接失败仍走原有降级路径。</summary>
+    /// --no-ui：UI 本尊已在运行，明确告诉 host 别再管 UI 拉起；开发布局（host 在
+    /// target/{debug,release} 下）补 --plugins-dir 指向仓库 plugins——host 默认从 exe
+    /// 同目录加载插件（安装布局正确），开发时那会是 target\{profile}\plugins，仓库
+    /// 插件全部消失（与 dev_host.ps1 的注入保持一致，双 spawn 源参数不分叉）。
+    /// spawn 失败仅记日志，后续连接失败仍走原有降级路径。</summary>
     private void TrySpawnHostIfMissing()
     {
         var now = Environment.TickCount64;
-        if (now - Interlocked.Read(ref _lastSpawnAttemptTicks) < 20_000) return;
-        Interlocked.Exchange(ref _lastSpawnAttemptTicks, now);
+        var last = Interlocked.Read(ref _lastSpawnAttemptTicks);
+        if (now - last < 20_000) return;
+        // CAS 占位：并发重连期（多窗口各自 EnsureConnectedAsync）至多一个实例通过闸门
+        if (Interlocked.CompareExchange(ref _lastSpawnAttemptTicks, now, last) != last) return;
         try
         {
+            // host 进程在但管道不可达（启动中/僵死）：再 spawn 只会被 SingleInstance 弹回
+            if (Process.GetProcessesByName("spark-host").Length > 0)
+            {
+                App.Log("Ipc", "host process alive but pipe unreachable; skip spawn");
+                return;
+            }
             var exe = FindHostExe();
             if (string.IsNullOrEmpty(exe)) return;
-            // Dispose 只释放本进程的句柄跟踪对象，不影响已启动的 host 子进程
-            using (var proc = Process.Start(new ProcessStartInfo(exe)
+            var psi = new ProcessStartInfo(exe)
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                Arguments = "--no-ui",
-            }))
+                ArgumentList = { "--no-ui" },
+            };
+            if (TryDevRepoRoot(exe, out var repoRoot))
             {
-                App.Log("Ipc", $"host not running; spawned by UI (--no-ui, pid={proc?.Id})");
+                var devPlugins = Path.Combine(repoRoot, "plugins");
+                if (Directory.Exists(devPlugins))
+                {
+                    psi.ArgumentList.Add("--plugins-dir");
+                    psi.ArgumentList.Add(devPlugins);
+                }
+            }
+            // Dispose 只释放本进程的句柄跟踪对象，不影响已启动的 host 子进程
+            using (var proc = Process.Start(psi))
+            {
+                App.Log("Ipc", $"host not running; spawned by UI ({string.Join(' ', psi.ArgumentList)}, pid={proc?.Id})");
             }
         }
         catch (Exception ex)
         {
             App.Log("HostSpawn", ex);
         }
+    }
+
+    /// <summary>host exe 位于仓库 target/{debug,release} 下视为开发布局，返回仓库根；
+    /// 安装布局（host 与 UI 同目录）返回 false。</summary>
+    private static bool TryDevRepoRoot(string hostExe, out string repoRoot)
+    {
+        repoRoot = "";
+        var profileDir = Path.GetDirectoryName(hostExe);
+        var targetDir = profileDir is null ? null : Path.GetDirectoryName(profileDir);
+        if (profileDir is null || targetDir is null) return false;
+        var profile = Path.GetFileName(profileDir);
+        if ((profile != "debug" && profile != "release") || Path.GetFileName(targetDir) != "target")
+            return false;
+        var root = Path.GetDirectoryName(targetDir);
+        if (root is null) return false;
+        repoRoot = root;
+        return true;
     }
 
     /// <summary>
@@ -448,9 +489,35 @@ public sealed class HostIpcClient : IAsyncDisposable
     public Task<bool> PluginSetDirAsync(string path, bool migrate, CancellationToken ct = default) =>
         PluginOkCallAsync("host.plugin.set_dir", new { path, migrate }, ct);
 
+    /// <summary>插件页面窗口关闭通知（JSON-RPC notification，无 id 不占请求预算）：
+    /// native 纯应用插件的 exe 生命周期与页面绑定，host 收到后优雅关停其进程
+    /// （webview 插件无进程，host 侧无操作）。仅在连接已建立时写入——未连接则
+    /// 该插件 exe 必然未曾经本连接的 rpc 懒启动，无需通知。</summary>
+    public async Task PluginPageClosedNotifyAsync(string id)
+    {
+        if (!IsConnected) return;
+        try
+        {
+            var req = new Dictionary<string, object?>
+            {
+                ["jsonrpc"] = "2.0",
+                ["method"] = "host.plugin.page_closed",
+                ["params"] = new { id }
+            };
+            await WriteLineBoundedAsync(JsonSerializer.Serialize(req));
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginPageClosed", ex);
+        }
+    }
+
     /// <summary>
     /// spark.* 特权能力桥：把插件页的调用转给 host 执行，返回 <c>data</c> 字段。
     /// host 侧鉴权（未授权返回 error），失败以异常抛出供 preload 转成 Promise reject。
+    /// capability=rpc（native 插件页面转发）预算放宽到 20s：host 侧懒启动 + 握手 +
+    /// plugin.page 的最坏等待 15s，超出全局 8s。rpc 走插件页窗口的独立连接，
+    /// 排队再慢也不阻塞主窗口的搜索连接。
     /// </summary>
     public async Task<JsonElement> PluginApiAsync(string pluginId, string capability, string method,
         JsonElement args, CancellationToken ct = default)
@@ -459,7 +526,8 @@ public sealed class HostIpcClient : IAsyncDisposable
         if (!IsConnected) throw HostErrorText.HostUnavailable();
 
         var el = await CallAsync("host.plugin.api",
-            new { plugin_id = pluginId, capability, method, args }, ct);
+            new { plugin_id = pluginId, capability, method, args }, ct,
+            capability == "rpc" ? 20 : 8);
         if (el.ValueKind != JsonValueKind.Object)
             throw new InvalidOperationException("后台返回了无法识别的能力调用结果");
         return el.TryGetProperty("data", out var data) ? data.Clone() : default;
@@ -507,7 +575,17 @@ public sealed class HostIpcClient : IAsyncDisposable
         }
     }
 
-    private async Task<JsonElement> CallAsync(string method, object paramsObj, CancellationToken ct)
+    /// <summary>有界写：探针/关窗通知路径没有外层请求预算兜底，若管道写缓冲满且 host
+    /// 读循环长期停在某个 dispatch 内，无超时写会无限期悬挂调用方——统一 2s 上限，
+    /// 超时按写入失败处理（探针→拆连接重建；通知→记日志跳过）。</summary>
+    private async Task WriteLineBoundedAsync(string line, int timeoutSeconds = 2)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        await WriteLineAsync(line, cts.Token);
+    }
+
+    private async Task<JsonElement> CallAsync(string method, object paramsObj, CancellationToken ct,
+        int timeoutSeconds = 8)
     {
         if (!IsConnected || _writer is null)
             return default;
@@ -532,7 +610,7 @@ public sealed class HostIpcClient : IAsyncDisposable
             await WriteLineAsync(json, ct);
 
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeout.CancelAfter(TimeSpan.FromSeconds(8));
+            timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
             using var reg = timeout.Token.Register(() =>
             {
                 if (_pending.TryRemove(id, out var p))
@@ -545,7 +623,19 @@ public sealed class HostIpcClient : IAsyncDisposable
             }
             catch (TimeoutException)
             {
-                await TearDownAsync();
+                // 超时只判这一请求失败，不拆整条连接：host 侧 rpc 最坏等待 15s 会把同连接
+                // 上的请求排队超时，拆掉共享连接会把所有在途请求一并取消、主窗口查询静默
+                // 回退 DemoData。晚到的响应在读循环里因 pending 已移除被安全忽略；
+                // 仅写探针失败（管道损坏）才走重建路径。
+                try
+                {
+                    await WriteLineBoundedAsync(
+                        "{\"jsonrpc\":\"2.0\",\"id\":-1,\"method\":\"host.ping\"}");
+                }
+                catch
+                {
+                    await TearDownAsync();
+                }
                 throw;
             }
         }

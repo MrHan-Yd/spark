@@ -30,6 +30,7 @@ pub enum HostMethod {
     PluginOpen,
     PluginApi,
     PluginSetDir,
+    PluginPageClosed,
 }
 
 impl HostMethod {
@@ -52,6 +53,7 @@ impl HostMethod {
             Self::PluginOpen => "host.plugin.open",
             Self::PluginApi => "host.plugin.api",
             Self::PluginSetDir => "host.plugin.set_dir",
+            Self::PluginPageClosed => "host.plugin.page_closed",
         }
     }
 }
@@ -63,6 +65,7 @@ pub enum PluginMethod {
     Query,
     Invoke,
     Cancel,
+    Page,
 }
 
 impl PluginMethod {
@@ -73,6 +76,7 @@ impl PluginMethod {
             Self::Query => "plugin.query",
             Self::Invoke => "plugin.invoke",
             Self::Cancel => "plugin.cancel",
+            Self::Page => "plugin.page",
         }
     }
 }
@@ -300,7 +304,7 @@ pub struct PluginOpenParams {
 #[serde(deny_unknown_fields)]
 pub struct PluginApiParams {
     pub plugin_id: String,
-    /// clipboard | notify | db | net | fs | shell
+    /// clipboard | notify | db | rpc（rpc 仅 native 插件：转发 plugin.page）
     pub capability: String,
     /// read_text / write_text / show / set / get ...
     pub method: String,
@@ -316,4 +320,17 @@ pub struct PluginSetDirParams {
     /// 是否迁移现有插件到新目录。
     #[serde(default)]
     pub migrate: bool,
+}
+
+/// `plugin.page` 请求参数（host → native 插件）：插件页面经
+/// `spark.rpc(method, args)` 发起的自定义调用，原样转发给插件 exe 处理。
+/// 响应 result 为插件自定义 JSON（原样回传页面）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPageParams {
+    /// 插件自定义方法名（如 "get_config" / "set_config"）。
+    pub method: String,
+    /// 插件自定义参数（任意 JSON，默认 null）。
+    #[serde(default)]
+    pub args: serde_json::Value,
 }

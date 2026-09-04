@@ -13,18 +13,20 @@ public static class PluginWindowHost
 
     /// <summary>
     /// 打开或聚焦插件窗口。<paramref name="info"/> 由 host.plugin.open 返回。
-    /// 必须在 UI 线程调用。
+    /// 必须在 UI 线程调用。devMode=true 且窗口已开时即时补开 DevTools（不关旧开新——
+    /// 旧窗的关停通知晚到会误杀新页首次 rpc 懒启动的 exe）。每个插件窗口持有自己的
+    /// IPC 连接，慢 rpc 不与主窗口搜索共用管道。
     /// </summary>
-    public static void OpenOrFocus(PluginOpenInfoDto info, HostIpcClient host,
+    public static void OpenOrFocus(PluginOpenInfoDto info,
         string input, string command, string rawQuery, bool devMode)
     {
         if (_open.TryGetValue(info.Id, out var existing))
         {
-            existing.FocusWith(input, command, rawQuery);
+            existing.FocusWith(input, command, rawQuery, devMode);
             return;
         }
 
-        var win = new PluginWindow(info, host, input, command, rawQuery, devMode);
+        var win = new PluginWindow(info, input, command, rawQuery, devMode);
         _open[info.Id] = win;
         win.Closed += (_, _) => _open.Remove(info.Id);
         win.Activate();

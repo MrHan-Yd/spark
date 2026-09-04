@@ -130,6 +130,15 @@ public sealed class PluginRowVm : INotifyPropertyChanged
     public Visibility DebugVisibility =>
         LocalState.Ui.DeveloperMode ? Visibility.Visible : Visibility.Collapsed;
 
+    /// <summary>插件是否拥有可打开的页面（host has_page：webview 有 mode:page feature /
+    /// native 声明 page 字段）。</summary>
+    public bool HasPage => _info.HasPage;
+
+    /// <summary>「打开」按钮可见性：有页面的插件才显示——native 纯应用插件的主要入口，
+    /// webview 插件免打关键字直达页面。</summary>
+    public Visibility OpenVisibility =>
+        HasPage ? Visibility.Visible : Visibility.Collapsed;
+
     /// <summary>开发目录加载的插件不能"卸载"（文件不归 Spark 管），只能禁用。</summary>
     public Visibility UninstallVisibility => IsDev ? Visibility.Collapsed : Visibility.Visible;
 

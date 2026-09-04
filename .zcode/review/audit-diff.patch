@@ -1,0 +1,2826 @@
+diff --git a/crates/host/src/app.rs b/crates/host/src/app.rs
+index 7465c4d..4b0e921 100644
+--- a/crates/host/src/app.rs
++++ b/crates/host/src/app.rs
+@@ -9,7 +9,7 @@ use spark_core::{ensure_data_dir, Action, Candidate, Query, Source};
+ use spark_index::{AppIndex, SearchIndex};
+ use spark_ipc::{InvokeParams, InvokeResult, PluginApiParams, TrustedPubkeyEntry};
+ use spark_plugin_manager::{
+-    KeyKind, KeywordMatch, NativeSearchRequest, PluginInfo, PluginInstallOutcome, PluginManager,
++    KeyKind, KeywordMatch, NativePageRequest, PluginInfo, PluginInstallOutcome, PluginManager,
+     PluginOpenInfo, TrustedKey,
+ };
+ use std::borrow::Cow;
+@@ -80,18 +80,34 @@ impl HostApp {
+     }
+ }
+ 
+-/// IPC 搜索三段式的锁内准备结果（PERF-SEARCH ③）。
++/// IPC 搜索三段式的锁内准备结果。
+ pub struct SearchPrep {
+     pub hits: Vec<Candidate>,
+-    /// native 命中快照；调用方放锁后 `execute`（≤300ms），再并回 hits。
+-    pub native: Option<NativeSearchRequest>,
+     /// 生效 limit（params.limit==0 时取 config.max_results；锁内定好免二次取锁）。
+     pub limit: u32,
+ }
+ 
++/// `plugin_api` 的执行计划：`Done` = 已在 host 锁内完成、data 即回包；
++/// `NativePage` = native 页面转发请求，调用方**放锁后** `execute`（native RPC
++/// 等待最坏 15s，绝不占 host 锁）。
++pub enum PluginApiOutcome {
++    Done(serde_json::Value),
++    NativePage(NativePageRequest),
++}
++
++/// 手动实现 Debug：deferred 请求持有子进程句柄（不可 derive），委托其手动 Debug。
++impl std::fmt::Debug for PluginApiOutcome {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Done(v) => f.debug_tuple("Done").field(v).finish(),
++            Self::NativePage(req) => f.debug_tuple("NativePage").field(req).finish(),
++        }
++    }
++}
++
+ impl HostApp {
+     /// 搜索核心（调用方持有 host 锁）：索引 + 内置命令 + webview 关键字/前缀候选。
+-    /// 不含 native RPC——native RPC 最坏可达秒级，必须留在全局锁外（③-a）。
++    /// native 插件是纯应用模型，不进搜索链路（manifest 层已禁止声明搜索入口）。
+     fn search_core(&mut self, text: &str) -> Vec<Candidate> {
+         let q = Query {
+             text: text.into(),
+@@ -120,39 +136,20 @@ impl HostApp {
+         hits
+     }
+ 
+-    /// 同步搜索（`--query` 诊断模式 / invoke 兜底路径）：native 命中时阻塞等待
+-    /// （既有语义：懒启动 + 5s + 失败即杀）。IPC 搜索路径改走 `search_prep` 三段式。
++    /// 同步搜索（`--query` 诊断模式 / invoke 兜底路径）。
+     pub fn search(&mut self, text: &str) -> Vec<Candidate> {
+-        let mut hits = self.search_core(text);
+-        // native 插件（mode:list）：命中关键字时把插件返回的结果项并入列表。
+-        // 诊断/兜底路径允许阻塞等待；超时/崩溃自动降级为空结果。
+-        if let Some(m) = self.plugins.find_native_match(text) {
+-            let result =
+-                self.plugins
+-                    .native_query_blocking(&m.plugin_id, &m.input, self.config.max_results);
+-            hits.extend(result.items);
+-        }
+-        hits
++        self.search_core(text)
+     }
+ 
+-    /// IPC 搜索三段式的锁内段：核心搜索 + native 命中快照 + 生效 limit。
+-    /// 调用方随后**放锁**执行 native RPC，再合并截断（见 ipc_server host.query）。
++    /// IPC 搜索三段式的锁内段：核心搜索 + 生效 limit。
+     pub fn search_prep(&mut self, text: &str, client_limit: u32) -> SearchPrep {
+         let hits = self.search_core(text);
+-        let native = self.plugins.find_native_match(text).and_then(|m| {
+-            self.plugins
+-                .native_search_request(&m.plugin_id, &m.input, self.config.max_results)
+-        });
+         let limit = if client_limit == 0 {
+             self.config.max_results
+         } else {
+             client_limit.min(self.config.max_results)
+         };
+-        SearchPrep {
+-            hits,
+-            native,
+-            limit,
+-        }
++        SearchPrep { hits, limit }
+     }
+ 
+     /// 由关键字匹配构造一个 page-mode 候选项。
+@@ -240,15 +237,6 @@ impl HostApp {
+             })
+             .ok_or_else(|| anyhow::anyhow!("item not found: {}", params.item_id))?;
+ 
+-        // native 插件结果项：plugin_id 命中 native 插件时走 native_invoke，
+-        // 不经 shell/索引（native 项 target 通常为空）。
+-        if let Some(pid) = item.plugin_id.as_deref() {
+-            if self.plugins.native_plugin(pid).is_some() {
+-                let result = self.plugins.native_invoke(pid, params.clone())?;
+-                return Ok(result);
+-            }
+-        }
+-
+         let action = if params.action_id.is_empty() {
+             "open"
+         } else {
+@@ -361,6 +349,16 @@ impl HostApp {
+         Ok(self.plugins.open(id)?)
+     }
+ 
++    /// 插件页面窗口关闭通知（UI → host）：native 纯应用插件的 exe 生命周期与页面
++    /// 绑定——关窗即优雅关停进程，"不打开就是不用"。webview 插件无进程，无操作。
++    ///
++    /// 不看 `enabled`：禁用流程先 toggle 再关窗，关停请求到达时插件可能已
++    /// disabled——关停对未运行进程是幂等 no-op，闸门只会造成进程泄漏。
++    /// fire-and-forget（不等待、不占 host 锁）：覆盖更新/卸载路径另有同步关停兜底。
++    pub fn plugin_page_closed(&self, id: &str) {
++        self.plugins.native_shutdown_plugin(id);
++    }
++
+     /// 更换插件目录并迁移；同步写回 config.plugins_dir 并保存。
+     pub fn plugin_set_dir(&mut self, path: &str, migrate: bool) -> Result<()> {
+         let new_dir = PathBuf::from(path);
+@@ -376,9 +374,11 @@ impl HostApp {
+         self.plugins.plugins_dir()
+     }
+ 
+-    /// `spark.*` 特权能力桥：校验声明+授权后执行 clipboard/notify/db。
+-    /// 返回值的 data 字段直接回传给插件页 JS。
+-    pub fn plugin_api(&mut self, params: &PluginApiParams) -> Result<serde_json::Value> {
++    /// `spark.*` 特权能力桥的**锁内准备段**：校验声明+授权后执行 clipboard/notify/db；
++    /// native `rpc` 只做快照构造返回 deferred 请求，由调用方**放锁后**
++    /// `NativePageRequest::execute`——native RPC 等待（懒启动最坏 15s）绝不占
++    /// host 锁（native.rs 模块注释的锁序纪律）。
++    pub fn plugin_api(&mut self, params: &PluginApiParams) -> Result<PluginApiOutcome> {
+         let declared = self.plugins.declared_permissions(&params.plugin_id);
+         let granted = self.plugins.granted(&params.plugin_id);
+         // 权限必须清单声明且用户授权（db 默认开放）。
+@@ -386,22 +386,42 @@ impl HostApp {
+             |perm: &str| declared.iter().any(|p| p == perm) && granted.iter().any(|p| p == perm);
+ 
+         match params.capability.as_str() {
+-            "db" => Ok(self.plugins.plugin_db(
++            "db" => Ok(PluginApiOutcome::Done(self.plugins.plugin_db(
+                 &params.plugin_id,
+                 &params.method,
+                 params.args.clone(),
+-            )?),
++            )?)),
+             "clipboard" => {
+                 if !has("clipboard") {
+                     bail!("PERMISSION_DENIED: clipboard");
+                 }
+-                self.plugin_api_clipboard(&params.method, &params.args)
++                Ok(PluginApiOutcome::Done(
++                    self.plugin_api_clipboard(&params.method, &params.args)?,
++                ))
+             }
+             "notify" => {
+                 if !has("notify") {
+                     bail!("PERMISSION_DENIED: notify");
+                 }
+-                self.plugin_api_notify(&params.args)
++                Ok(PluginApiOutcome::Done(
++                    self.plugin_api_notify(&params.args)?,
++                ))
++            }
++            "rpc" => {
++                // native 纯应用模型专属：页面 spark.rpc → host → 插件 exe 的
++                // plugin.page。不设新权限——native exe 本就拥有完整 OS 能力，
++                // 页面与 exe 同源同信任级（与 db 默认开放同理由）；
++                // webview 插件没有 exe，明确 UNAVAILABLE 而非静默失败。
++                match self.plugins.native_page_request(
++                    &params.plugin_id,
++                    &params.method,
++                    params.args.clone(),
++                ) {
++                    Ok(req) => Ok(PluginApiOutcome::NativePage(req)),
++                    // 错误码语义与 preload 的 ClassifyError 对齐：不可用类失败
++                    // 统一 UNAVAILABLE 前缀。
++                    Err(e) => bail!("UNAVAILABLE: {e}"),
++                }
+             }
+             other => bail!("UNAVAILABLE: capability {other}"),
+         }
+@@ -548,12 +568,19 @@ mod tests {
+ 
+     /// 空 app 索引的 HostApp：只测 search 的插件候选插入粘合，不建真实 Start Menu 索引。
+     fn host_with_empty_index() -> HostApp {
++        host_with_dirs(
++            PathBuf::from("./__tests_plugins"),
++            PathBuf::from("./__tests_data"),
++        )
++    }
++
++    /// 同上，但插件/数据目录由调用方指定：会写 enabled/granted 状态的测试必须用
++    /// 独立 data 目录——PluginState 持久化在 data/plugins-state.json，共享目录会让
++    /// 测试间/多次运行互相污染（先跑的 disable 毒化后跑的 enabled 断言）。
++    fn host_with_dirs(plugins: PathBuf, data: PathBuf) -> HostApp {
+         HostApp {
+             index: AppIndex::new(),
+-            plugins: PluginManager::with_dirs(
+-                PathBuf::from("./__tests_plugins"),
+-                PathBuf::from("./__tests_data"),
+-            ),
++            plugins: PluginManager::with_dirs(plugins, data),
+             config: HostConfig::default(),
+             tray: None,
+         }
+@@ -571,6 +598,80 @@ mod tests {
+         app
+     }
+ 
++    /// native 纯应用插件 fixture（page 模型：无 commands，必有 page + 占位 html）。
++    fn write_native_page_plugin(dir: &Path, id: &str) {
++        fs::create_dir_all(dir).unwrap();
++        let json = format!(
++            r#"{{ "id": "{id}", "name": "N", "version": "0.1.0", "api_version": 2,
++                 "runtime": "native", "main": "{id}.exe", "page": "page.html" }}"#
++        );
++        fs::write(dir.join("plugin.json"), json).unwrap();
++        fs::write(dir.join("page.html"), "<html></html>").unwrap();
++    }
++
++    fn api_params(plugin_id: &str, capability: &str, method: &str) -> PluginApiParams {
++        PluginApiParams {
++            plugin_id: plugin_id.into(),
++            capability: capability.into(),
++            method: method.into(),
++            args: serde_json::Value::Null,
++        }
++    }
++
++    #[test]
++    fn plugin_api_rpc_returns_deferred_for_native_only() {
++        // rpc 准备段：native 插件返回 deferred 请求（等待在锁外执行，本测试不执行）；
++        // webview 插件无 exe 可转发，明确 UNAVAILABLE。
++        let tmp = std::env::temp_dir().join("spark_host_rpc_deferred");
++        let _ = std::fs::remove_dir_all(&tmp);
++        let mut app = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
++        write_native_page_plugin(&tmp.join("com.spark.np"), "com.spark.np");
++        app.plugins.load_dev_dir(&tmp.join("com.spark.np")).unwrap();
++
++        let outcome = app
++            .plugin_api(&api_params("com.spark.np", "rpc", "get_config"))
++            .unwrap();
++        assert!(matches!(outcome, PluginApiOutcome::NativePage(_)));
++
++        // disabled 的 native 插件：准备段即 UNAVAILABLE（旧页面在途调用由关窗 shutdown 收尾）。
++        let mut app2 = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
++        app2.plugins
++            .load_dev_dir(&tmp.join("com.spark.np"))
++            .unwrap();
++        app2.plugins.set_enabled("com.spark.np", false).unwrap();
++        let err2 = app2
++            .plugin_api(&api_params("com.spark.np", "rpc", "get_config"))
++            .unwrap_err();
++        assert!(err2.to_string().contains("UNAVAILABLE"), "{err2}");
++
++        // webview 插件无 exe 可转发：UNAVAILABLE（独立 data 目录，防 state 污染）。
++        let mut app3 = host_with_dirs(tmp.join("plugins"), tmp.join("data3"));
++        write_webview_plugin(&tmp.join("com.spark.wv"), "com.spark.wv", "wv");
++        app3.plugins
++            .load_dev_dir(&tmp.join("com.spark.wv"))
++            .unwrap();
++        let err3 = app3
++            .plugin_api(&api_params("com.spark.wv", "rpc", "get_config"))
++            .unwrap_err();
++        assert!(err3.to_string().contains("UNAVAILABLE"), "{err3}");
++    }
++
++    #[test]
++    fn plugin_page_closed_ignores_enabled_gate() {
++        // 关窗关停不看 enabled：禁用流程先 toggle 再关窗，闸门会造成进程泄漏。
++        // 关停对未运行进程是幂等 no-op——断言点是无闸门可调用且不 panic。
++        let tmp = std::env::temp_dir().join("spark_host_page_closed");
++        let _ = std::fs::remove_dir_all(&tmp);
++        let mut app = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
++        write_native_page_plugin(&tmp.join("com.spark.np"), "com.spark.np");
++        app.plugins.load_dev_dir(&tmp.join("com.spark.np")).unwrap();
++        app.plugins.set_enabled("com.spark.np", false).unwrap();
++
++        app.plugin_page_closed("com.spark.np"); // disabled 仍发出关停（fire-and-forget）
++        app.plugin_page_closed("com.spark.absent"); // 未知 id 同样 no-op 不 panic
++        app.plugin_page_closed("com.spark.wv-none"); // webview/未知 id 无操作
++    }
++
+     #[test]
+     fn search_exact_hit_then_prefix_suggestion_ordering() {
+         // 精确命中 + 前缀候选：精确(100)置顶，前缀候选紧随其后排在应用结果前面。
+diff --git a/crates/host/src/ipc_server.rs b/crates/host/src/ipc_server.rs
+index b409026..89bcc02 100644
+--- a/crates/host/src/ipc_server.rs
++++ b/crates/host/src/ipc_server.rs
+@@ -306,24 +306,16 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
+                     &JsonRpcResponse::error(id, -32602, "invalid query parameters"),
+                 );
+             }
+-            // 三段式（PERF-SEARCH ③）：native RPC 是秒级阻塞操作，绝不能在 host
+-            // 全局锁内执行（会拖死所有 IPC）。① 锁内：索引+页面插件候选+native 快照；
+-            // ② 锁外：native RPC ≤300ms（超时保留进程，未就绪自动后台预热），
+-            // 缺席结果以 partial=true 如实上报，UI 延迟补查；③ 合并截断（纯数据，无需锁）。
++            // ① 锁内搜索（索引 + webview 插件候选），② 合并截断（纯数据，无需锁）。
++            // native 插件是纯应用模型，不进搜索链路（manifest 层已禁声明入口）。
+             let mut prep = {
+                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                 g.search_prep(&params.text, params.limit)
+             };
+-            let mut partial = false;
+-            if let Some(native_req) = prep.native.take() {
+-                let (native_result, native_partial) = native_req.execute();
+-                prep.hits.extend(native_result.items);
+-                partial = native_partial;
+-            }
+             prep.hits.truncate(prep.limit as usize);
+             let result = QueryResult {
+                 items: prep.hits,
+-                partial,
++                partial: false,
+             };
+             JsonRpcResponse::result(id, serde_json::to_value(result)?)
+         }
+@@ -546,12 +538,44 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
+                     &JsonRpcResponse::error(id, -32602, "invalid api params"),
+                 );
+             }
+-            let data = {
++            // ① 锁内：鉴权 + 快照构造（native rpc 只返回 deferred 请求）；
++            // ② 锁外：native rpc 的等待（懒启动最坏 15s）——绝不占 host 锁，
++            // 否则一次慢插件 RPC 会冻结全部 IPC（含主窗口 host.query 热路径）。
++            let outcome = {
+                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                 g.plugin_api(&params)?
+             };
++            let data = match outcome {
++                crate::app::PluginApiOutcome::Done(v) => v,
++                // 执行段错误同样带 UNAVAILABLE 前缀：与准备段（app.rs rpc 分支）一致，
++                // 页面按 "CODE: detail" 还原 error.code（见 Native插件开发.md §7）。
++                crate::app::PluginApiOutcome::NativePage(page_req) => page_req
++                    .execute()
++                    .map_err(|e| anyhow::anyhow!("UNAVAILABLE: {e}"))?,
++            };
+             JsonRpcResponse::result(id, serde_json::json!({ "ok": true, "data": data }))
+         }
++        m if m == HostMethod::PluginPageClosed.as_str() => {
++            let params: PluginIdParams = match serde_json::from_value(req.params) {
++                Ok(p) => p,
++                Err(e) => return reply(pipe, &JsonRpcResponse::error(id, -32602, e.to_string())),
++            };
++            if params.id.is_empty() || params.id.len() > 256 {
++                return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid id"));
++            }
++            // fire-and-forget 关停（native 纯应用插件 exe 随页面退出；webview 无操作）：
++            // host 锁内只花一次通道 send，等待发生在 native runtime 专职线程。
++            {
++                let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
++                g.plugin_page_closed(&params.id);
++            }
++            // UI 以 notification（无 id）发送时不回包——关窗通知不占请求预算。
++            if id.is_some() {
++                JsonRpcResponse::result(id, serde_json::json!({ "ok": true }))
++            } else {
++                return Ok(());
++            }
++        }
+         other => JsonRpcResponse::error(id, -32601, format!("method not found: {other}")),
+     };
+     reply(pipe, &resp)
+diff --git a/crates/ipc/src/lib.rs b/crates/ipc/src/lib.rs
+index f1a905e..ef2aca5 100644
+--- a/crates/ipc/src/lib.rs
++++ b/crates/ipc/src/lib.rs
+@@ -14,7 +14,7 @@ pub use message::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+ pub use protocol::{
+     HostMethod, InvokeParams, InvokeResult, JsonRpcNotification, PluginApiParams,
+     PluginDevLoadParams, PluginGrantParams, PluginIdParams, PluginInitializeParams,
+-    PluginInitializeResult, PluginInstallParams, PluginMethod, PluginOpenParams,
++    PluginInitializeResult, PluginInstallParams, PluginMethod, PluginOpenParams, PluginPageParams,
+     PluginSetDirParams, PluginToggleParams, QueryParams, QueryResult, SetConfigParams,
+     TrustedPubkeyEntry, UiMethod, API_VERSION, PIPE_NAME, PIPE_PATH,
+ };
+diff --git a/crates/ipc/src/protocol.rs b/crates/ipc/src/protocol.rs
+index d954a35..484468e 100644
+--- a/crates/ipc/src/protocol.rs
++++ b/crates/ipc/src/protocol.rs
+@@ -30,6 +30,7 @@ pub enum HostMethod {
+     PluginOpen,
+     PluginApi,
+     PluginSetDir,
++    PluginPageClosed,
+ }
+ 
+ impl HostMethod {
+@@ -52,6 +53,7 @@ impl HostMethod {
+             Self::PluginOpen => "host.plugin.open",
+             Self::PluginApi => "host.plugin.api",
+             Self::PluginSetDir => "host.plugin.set_dir",
++            Self::PluginPageClosed => "host.plugin.page_closed",
+         }
+     }
+ }
+@@ -63,6 +65,7 @@ pub enum PluginMethod {
+     Query,
+     Invoke,
+     Cancel,
++    Page,
+ }
+ 
+ impl PluginMethod {
+@@ -73,6 +76,7 @@ impl PluginMethod {
+             Self::Query => "plugin.query",
+             Self::Invoke => "plugin.invoke",
+             Self::Cancel => "plugin.cancel",
++            Self::Page => "plugin.page",
+         }
+     }
+ }
+@@ -300,7 +304,7 @@ pub struct PluginOpenParams {
+ #[serde(deny_unknown_fields)]
+ pub struct PluginApiParams {
+     pub plugin_id: String,
+-    /// clipboard | notify | db | net | fs | shell
++    /// clipboard | notify | db | rpc（rpc 仅 native 插件：转发 plugin.page）
+     pub capability: String,
+     /// read_text / write_text / show / set / get ...
+     pub method: String,
+@@ -317,3 +321,16 @@ pub struct PluginSetDirParams {
+     #[serde(default)]
+     pub migrate: bool,
+ }
++
++/// `plugin.page` 请求参数（host → native 插件）：插件页面经
++/// `spark.rpc(method, args)` 发起的自定义调用，原样转发给插件 exe 处理。
++/// 响应 result 为插件自定义 JSON（原样回传页面）。
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct PluginPageParams {
++    /// 插件自定义方法名（如 "get_config" / "set_config"）。
++    pub method: String,
++    /// 插件自定义参数（任意 JSON，默认 null）。
++    #[serde(default)]
++    pub args: serde_json::Value,
++}
+diff --git a/crates/plugin-manager/src/lib.rs b/crates/plugin-manager/src/lib.rs
+index eca905d..77ef78c 100644
+--- a/crates/plugin-manager/src/lib.rs
++++ b/crates/plugin-manager/src/lib.rs
+@@ -1,7 +1,9 @@
+ //! Plugin discovery, manifest handling, install/lifecycle, and state.
+ //!
+-//! 一期：webview 插件清单解析 + 安装/卸载/启停/授权 + 目录迁移 + 关键字路由匹配。
+-//! native 插件的进程 spawn 仍是后续工作。
++//! webview 插件：features 关键字路由 + 搜索框 `plugin:page:` 候选开窗。
++//! native 插件：**纯应用**模型——无 commands/keywords（清单校验直接拒绝），不进
++//! 搜索框；必须有 `page`（HTML 入口），从插件卡片打开，exe 只经 `plugin.page`
++//! RPC 服务于页面（native.rs 模块注释）。
+ 
+ mod db;
+ mod error;
+@@ -15,9 +17,7 @@ pub use manifest::{
+     cmp_version, FeatureType, PluginCommand, PluginFeature, PluginManifest, PluginRuntime,
+     PluginWindow,
+ };
+-pub use native::{
+-    NativeMatch, NativeRuntime, NativeRuntimeHandle, NativeSearchRequest, NativeSpawnInfo,
+-};
++pub use native::{NativePageRequest, NativeRuntimeHandle, NativeSpawnInfo};
+ pub use signing::{
+     canonical_bytes, collect_file_entries, verify_dir, verify_with_keys, FileEntry, KeyKind,
+     Revocation, SignState, TrustedKey, VerifyError, REVOKED, TRUSTED_KEYS,
+@@ -66,6 +66,9 @@ pub struct PluginInfo {
+     pub enabled: bool,
+     pub source: String,
+     pub features: Vec<PluginFeature>,
++    /// 插件是否拥有可打开的页面（webview：有 mode:page feature；native：声明了
++    /// page 字段）。UI 据此决定插件卡片是否显示「打开」按钮。
++    pub has_page: bool,
+     /// 签名状态：`official` / `third_party` / `unsigned` / `invalid`（snake_case 序列化）。
+     pub sign_state: SignState,
+ }
+@@ -145,7 +148,8 @@ pub struct PluginManager {
+     data_dir: PathBuf,
+     state: PluginState,
+     /// native 插件进程运行时句柄：runtime 状态生活在专职线程（native.rs 模块注释），
+-    /// host 锁内只做通道 send，RPC 等待在 host 锁外（PERF-SEARCH ③-a）。
++    /// host 锁内只做通道 send / 快照构造，RPC 等待一律在 host 锁外（见
++    /// `NativePageRequest` 与 native_shutdown_plugin 的注释）。
+     native: NativeRuntimeHandle,
+     /// 运行时可信密钥表 = 内置官方表（`TRUSTED_KEYS`）+ 用户导入的三方密钥。
+     /// 验签一律走此合并表：官方判定只看内置 `KeyKind::Official` 条目，
+@@ -448,7 +452,13 @@ impl PluginManager {
+         // 覆盖更新：暂存拷贝 + 备份交换，保证拷贝失败不破坏现有插件
+         // （与 set_dir 迁移的"先拷后删+失败回滚"安全模式一致）。
+         // 同步等待进程退出：.exe 被占用时覆盖会失败（见 shutdown_plugin_sync）。
+-        self.native.shutdown_plugin_sync(&id);
++        // 未确认退出（3s 盖帽，如 runtime 线程被在途 PageCall 占住）即中止——
++        // 后面的 rename+备份覆盖事务不会发生，旧插件保持完整可用。
++        if !self.native.shutdown_plugin_sync(&id) {
++            return Err(PluginError::Manifest(format!(
++                "plugin {id} process did not exit within 3s, update aborted"
++            )));
++        }
+         let staging = self.plugins_dir.join(format!(".{id}.staging"));
+         let backup = self.plugins_dir.join(format!(".{id}.bak"));
+         // 清理上次崩溃可能残留的暂存/备份目录（best-effort）。
+@@ -517,6 +527,15 @@ impl PluginManager {
+             .iter()
+             .position(|p| p.manifest.id == id && p.source == PluginSource::Standard)
+             .ok_or_else(|| PluginError::Manifest(format!("plugin not found: {id}")))?;
++        // native exe 可能仍在运行（关窗的 page_closed 通知是异步的，可能还在路上）：
++        // 先同步关停进程，否则 remove_dir_all 删不掉被占用的 .exe。webview 无进程，空操作。
++        // 未确认退出即中止删除——remove_dir_all 半删会留下损坏目录（plugin.json 已删、
++        // exe 残留），返回错误让 UI 提示稍后重试。
++        if !self.native.shutdown_plugin_sync(id) {
++            return Err(PluginError::Manifest(format!(
++                "plugin {id} process did not exit within 3s, uninstall aborted"
++            )));
++        }
+         let root = self.plugins[pos].root.clone();
+         fs::remove_dir_all(&root)?;
+         self.plugins.remove(pos);
+@@ -572,23 +591,41 @@ impl PluginManager {
+                     PluginSource::Dev => "dev".into(),
+                 },
+                 features: p.manifest.features.clone(),
++                has_page: Self::has_page(p),
+                 sign_state: p.sign_state,
+             })
+             .collect()
+     }
+ 
++    /// 插件是否拥有可打开的页面（list() 与「打开」按钮判定共用）。
++    fn has_page(p: &LoadedPlugin) -> bool {
++        match p.manifest.runtime {
++            PluginRuntime::Native => p.manifest.page.is_some(),
++            _ => p.manifest.features.iter().any(|f| f.mode == "page"),
++        }
++    }
++
+     pub fn open(&self, id: &str) -> Result<PluginOpenInfo, PluginError> {
+         let p = self
+             .plugins
+             .iter()
+             .find(|p| p.manifest.id == id && p.enabled)
+             .ok_or_else(|| PluginError::Manifest(format!("plugin not found or disabled: {id}")))?;
+-        if !matches!(p.manifest.runtime, PluginRuntime::Webview) {
+-            return Err(PluginError::Manifest(format!(
+-                "plugin {id} is not a webview plugin"
+-            )));
+-        }
+-        let main_abs = p.root.join(&p.manifest.main);
++        // 入口 HTML：webview 用 main，native（纯应用）用 page。
++        let entry_rel = match p.manifest.runtime {
++            PluginRuntime::Webview => p.manifest.main.clone(),
++            PluginRuntime::Native => p
++                .manifest
++                .page
++                .clone()
++                .ok_or_else(|| PluginError::Manifest(format!("plugin {id} has no page")))?,
++            PluginRuntime::Wasm => {
++                return Err(PluginError::Manifest(format!(
++                    "plugin {id} runtime is not openable"
++                )));
++            }
++        };
++        let main_abs = p.root.join(entry_rel);
+         if !main_abs.is_file() {
+             return Err(PluginError::Manifest(format!(
+                 "plugin main not found: {}",
+@@ -837,53 +874,37 @@ impl PluginManager {
+         self.native_plugin(id).map(NativeSpawnInfo::from_plugin)
+     }
+ 
+-    /// 搜索路径（PERF-SEARCH ③）：锁内只取 native 查询快照（句柄克隆 + spawn 信息），
+-    /// RPC 由调用方在 **host 锁外** `NativeSearchRequest::execute`（≤300ms，超时保留
+-    /// 进程，未就绪自动后台预热）。插件不存在/未启用 → None（调用方按无 native 命中处理）。
+-    pub fn native_search_request(
++    /// native 页面转发调用的**锁内准备段**（纯应用模型唯一 RPC）：鉴权后的调用方
++    /// 在 host 锁内只做快照构造，随后**放锁**再 `NativePageRequest::execute`——
++    /// 懒启动 spawn + 5s RPC + 15s 盖帽的等待全部在 host 锁外（native.rs 模块
++    /// 注释的锁序纪律）。插件不存在/未启用 → Err（host 侧转 UNAVAILABLE）。
++    pub fn native_page_request(
+         &self,
+         id: &str,
+-        input: &str,
+-        limit: u32,
+-    ) -> Option<NativeSearchRequest> {
+-        let info = self.native_spawn_info(id)?;
+-        Some(NativeSearchRequest::new(
++        method: &str,
++        args: serde_json::Value,
++    ) -> Result<NativePageRequest, PluginError> {
++        let info = self
++            .native_spawn_info(id)
++            .ok_or_else(|| PluginError::Manifest(format!("native plugin not found: {id}")))?;
++        Ok(NativePageRequest::new(
+             self.native.clone(),
+             info,
+-            input.to_string(),
+-            limit,
++            method.to_string(),
++            args,
+         ))
+     }
+ 
+-    /// 同步阻塞查询（既有语义：懒启动 + 5s + 失败即杀，本次失败降级空结果）。
+-    /// 仅 `--query` 诊断与 invoke 兜底路径使用——阻塞等待绝不发生在 IPC 搜索路径。
+-    pub fn native_query_blocking(
+-        &self,
+-        id: &str,
+-        text: &str,
+-        limit: u32,
+-    ) -> spark_ipc::QueryResult {
+-        let Some(info) = self.native_spawn_info(id) else {
+-            return spark_ipc::QueryResult {
+-                items: vec![],
+-                partial: false,
+-            };
+-        };
+-        self.native.query_blocking(info, text.to_string(), limit)
++    /// 关停指定 native 插件进程，**不等待**（页面关闭通知路径）：host 锁内只花
++    /// 一次通道 send。进程未运行（含 webview id）为 no-op。
++    pub fn native_shutdown_plugin(&self, id: &str) {
++        self.native.shutdown_plugin(id);
+     }
+ 
+-    /// native 执行：用户选中某结果项动作时调用（既有语义：懒启动 + 5s + 失败即杀；
+-    /// 用户主动执行可等待。ipc_server 在 host 锁内调用——native 线程对 host 锁无
+-    /// 依赖，单向等待无死锁环，见 native.rs 模块注释）。
+-    pub fn native_invoke(
+-        &self,
+-        id: &str,
+-        params: spark_ipc::InvokeParams,
+-    ) -> Result<spark_ipc::InvokeResult, PluginError> {
+-        let info = self
+-            .native_spawn_info(id)
+-            .ok_or_else(|| PluginError::Manifest(format!("native plugin not found: {id}")))?;
+-        self.native.invoke(info, params)
++    /// 关停指定 native 插件进程并**同步等待**（覆盖更新/卸载前：确认 .exe 已不被占用）。
++    /// 返回 false = 3s 内未确认退出，调用方应中止删改。
++    pub fn native_shutdown_plugin_sync(&self, id: &str) -> bool {
++        self.native.shutdown_plugin_sync(id)
+     }
+ 
+     /// host 退出前调用：向所有 native 进程发 shutdown 并 wait，收割 runtime 线程。
+@@ -960,6 +981,17 @@ mod tests {
+         fs::write(dir.join("index.html"), "<html></html>").unwrap();
+     }
+ 
++    /// native 纯应用插件 fixture（page 模型：无 commands，必有 page）。
++    fn make_native_page_plugin(dir: &Path, id: &str) {
++        fs::create_dir_all(dir).unwrap();
++        let json = format!(
++            r#"{{ "id": "{id}", "name": "N", "version": "0.1.0", "api_version": 2,
++                 "runtime": "native", "main": "{id}.exe", "page": "page.html" }}"#
++        );
++        fs::write(dir.join("plugin.json"), json).unwrap();
++        fs::write(dir.join("page.html"), "<html></html>").unwrap();
++    }
++
+     #[test]
+     fn keyword_match_exact_and_prefix() {
+         let tmp = std::env::temp_dir().join("spark_pm_kw");
+@@ -1128,6 +1160,76 @@ mod tests {
+         assert_eq!(info.window.width, 480); // default
+     }
+ 
++    #[test]
++    fn open_native_page_plugin() {
++        // native 纯应用：open 返回 page.html 入口；page 文件缺失时拒绝（exe 缺失不管，
++        // exe 只在页面首次 RPC 时才需要）。
++        let tmp = std::env::temp_dir().join("spark_pm_open_native");
++        let _ = fs::remove_dir_all(&tmp);
++        let dir = tmp.join("com.spark.np");
++        fs::create_dir_all(&dir).unwrap();
++        let json = r#"{
++            "id":"com.spark.np","name":"N","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"np.exe","page":"page.html"
++        }"#;
++        fs::write(dir.join("plugin.json"), json).unwrap();
++        fs::write(dir.join("page.html"), "<html></html>").unwrap();
++        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
++        pm.load_dev_dir(&dir).unwrap();
++        let info = pm.open("com.spark.np").unwrap();
++        assert!(info.main_abs.ends_with("page.html"));
++        // list DTO 的 has_page 对 native 纯应用恒为 true（「打开」按钮依据）。
++        assert!(pm
++            .list()
++            .iter()
++            .any(|p| p.id == "com.spark.np" && p.has_page));
++
++        // page 文件缺失 → 拒绝开窗。
++        fs::remove_file(dir.join("page.html")).unwrap();
++        let mut pm2 = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
++        pm2.load_dev_dir(&dir).unwrap();
++        assert!(pm2.open("com.spark.np").is_err());
++        // 禁用 → 拒绝。
++        pm2.set_enabled("com.spark.np", false).unwrap();
++        assert!(pm2.open("com.spark.np").is_err());
++    }
++
++    #[test]
++    fn native_page_request_rejects_non_native() {
++        // rpc 能力仅 native 插件可用：webview 插件无 exe 可转发，准备段即报错
++        // （快照构造不涉及 spawn/RPC 等待，可直接在测试中调用）。
++        let tmp = std::env::temp_dir().join("spark_pm_pagereq_nonnative");
++        let _ = fs::remove_dir_all(&tmp);
++        make_webview_plugin(&tmp.join("com.spark.w"), "com.spark.w", "w");
++        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
++        pm.load_dev_dir(&tmp.join("com.spark.w")).unwrap();
++        let err = pm
++            .native_page_request("com.spark.w", "m", serde_json::Value::Null)
++            .unwrap_err();
++        assert!(matches!(err, PluginError::Manifest(_)));
++        assert!(pm
++            .native_page_request("com.spark.absent", "m", serde_json::Value::Null)
++            .is_err());
++    }
++
++    #[test]
++    fn native_page_request_disabled_plugin_rejected() {
++        // 禁用的 native 插件不再接受页面转发（开新页面已被 open() 拦，旧页面
++        // 的在途调用由关窗 shutdown 收尾）。
++        let tmp = std::env::temp_dir().join("spark_pm_pagereq_disabled");
++        let _ = fs::remove_dir_all(&tmp);
++        make_native_page_plugin(&tmp.join("com.spark.nd"), "com.spark.nd");
++        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
++        pm.load_dev_dir(&tmp.join("com.spark.nd")).unwrap();
++        pm.set_enabled("com.spark.nd", false).unwrap();
++        assert!(pm
++            .native_page_request("com.spark.nd", "m", serde_json::Value::Null)
++            .is_err());
++        // 关停请求对禁用/未运行插件是幂等 no-op（关窗通知不依赖 enabled）。
++        pm.native_shutdown_plugin("com.spark.nd");
++        pm.native_shutdown_plugin_sync("com.spark.nd");
++    }
++
+     #[test]
+     fn set_dir_migrate_copies_plugins_and_rescans() {
+         let tmp = std::env::temp_dir().join("spark_pm_setdir");
+diff --git a/crates/plugin-manager/src/manifest.rs b/crates/plugin-manager/src/manifest.rs
+index f85f472..e76638f 100644
+--- a/crates/plugin-manager/src/manifest.rs
++++ b/crates/plugin-manager/src/manifest.rs
+@@ -136,9 +136,10 @@ pub struct PluginManifest {
+     /// webview 插件可选的自定义预加载脚本相对路径。
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub preload: Option<String>,
++    /// 旧版 native 关键字（已废弃：native 纯应用模型下校验直接拒绝）。
+     #[serde(default)]
+     pub keywords: Vec<String>,
+-    /// native 插件命令（向后兼容）。
++    /// 旧版 native 命令（已废弃：native 纯应用模型下校验直接拒绝）。
+     #[serde(default)]
+     pub commands: Vec<PluginCommand>,
+     /// webview 插件触发入口（一期主推）。
+@@ -148,6 +149,10 @@ pub struct PluginManifest {
+     pub permissions: Vec<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub window: Option<PluginWindow>,
++    /// native 插件页面入口（相对插件根目录的 HTML 路径）；native 必填。
++    /// native 是"纯应用"模型：不进搜索框，页面从插件卡片打开，exe 只服务于页面。
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub page: Option<String>,
+ }
+ 
+ impl PluginManifest {
+@@ -173,10 +178,10 @@ impl PluginManifest {
+         if self.main.is_empty() {
+             return Err(PluginError::Manifest("main is required".into()));
+         }
+-        // 入口至少有一种：native 用 commands，webview 用 features。
+-        if self.commands.is_empty() && self.features.is_empty() {
++        // 入口至少有一种：webview 用 features，native 用 page（纯应用模型）。
++        if self.features.is_empty() && self.page.is_none() {
+             return Err(PluginError::Manifest(
+-                "either commands or features must be present".into(),
++                "either features or page must be present".into(),
+             ));
+         }
+         match self.runtime {
+@@ -196,11 +201,28 @@ impl PluginManifest {
+                 }
+             }
+             PluginRuntime::Native => {
+-                if self.commands.is_empty() {
++                // native 纯应用模型：不给任何搜索框声明入口，插件无法影响主窗口。
++                if !self.commands.is_empty() {
++                    return Err(PluginError::Manifest(
++                        "native plugin no longer supports 'commands' (pure-app model: use 'page')"
++                            .into(),
++                    ));
++                }
++                if !self.keywords.is_empty() {
++                    return Err(PluginError::Manifest(
++                        "native plugin no longer supports 'keywords' (pure-app model: use 'page')"
++                            .into(),
++                    ));
++                }
++                if !self.features.is_empty() {
+                     return Err(PluginError::Manifest(
+-                        "native plugin requires at least one command".into(),
++                        "native plugin does not support 'features' (webview only)".into(),
+                     ));
+                 }
++                let page = self.page.as_deref().ok_or_else(|| {
++                    PluginError::Manifest("native plugin requires 'page' (HTML entry)".into())
++                })?;
++                validate_page_path(page)?;
+             }
+             PluginRuntime::Wasm => {}
+         }
+@@ -208,6 +230,28 @@ impl PluginManifest {
+     }
+ }
+ 
++/// native `page` 路径校验：仅允许"普通相对路径"——所有组件必须是 `Normal`
++/// （拒绝绝对路径/盘符前缀/根路径/`..` 上跳/`.` 当前目录）。页面由 WebView2 以
++/// 虚拟主机映射加载，路径越界会读到插件目录之外的内容；`C:evil`（有前缀无根）、
++/// `\evil`（有根无前缀）这类 `is_absolute()` 拦不住的形状也被 Normal 约束覆盖。
++fn validate_page_path(page: &str) -> Result<(), PluginError> {
++    if page.is_empty() {
++        return Err(PluginError::Manifest("page must not be empty".into()));
++    }
++    let all_normal = Path::new(page)
++        .components()
++        .all(|c| matches!(c, std::path::Component::Normal(_)));
++    if !all_normal {
++        return Err(PluginError::Manifest(
++            "page must be a plain relative path (no '..' / drive / rooted components)".into(),
++        ));
++    }
++    if !page.to_ascii_lowercase().ends_with(".html") {
++        return Err(PluginError::Manifest("page must be an .html file".into()));
++    }
++    Ok(())
++}
++
+ /// 宽松版本号比较：与 host 自更新 C# 端 `ParseVersion` 行为一致。
+ ///
+ /// 规则：跳过前导非数字（兼容 `v0.1.0`）→ 按 `.` 分段取前 3 段为 `u32`
+@@ -363,13 +407,109 @@ mod tests {
+     #[test]
+     fn native_manifest_still_valid() {
+         let json = r#"{
+-            "id":"com.spark.echo","name":"Echo","version":"0.1.0","api_version":1,
+-            "runtime":"native","main":"echo.exe",
+-            "commands":[{"name":"echo","title":"Echo","mode":"list","prefix":"echo "}]
++            "id":"com.spark.echo","name":"Echo","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"echo.exe","page":"page.html"
+         }"#;
+         let m: PluginManifest = serde_json::from_str(json).unwrap();
+         m.validate().unwrap();
+         assert_eq!(m.runtime, PluginRuntime::Native);
++        assert_eq!(m.page.as_deref(), Some("page.html"));
++    }
++
++    #[test]
++    fn native_requires_page() {
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe"
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
++    }
++
++    #[test]
++    fn native_rejects_commands() {
++        // 纯应用模型：native 不得声明 commands（搜索框入口），否则拒绝加载。
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe","page":"page.html",
++            "commands":[{"name":"x","title":"X","mode":"list","prefix":"x "}]
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
++    }
++
++    #[test]
++    fn native_rejects_keywords() {
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe","page":"page.html","keywords":["x"]
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
++    }
++
++    #[test]
++    fn native_rejects_features() {
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe","page":"page.html",
++            "features":[{"type":"keyword","keyword":"x","title":"X","mode":"page"}]
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
++    }
++
++    #[test]
++    fn native_page_path_rejects_absolute() {
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe","page":"C:\\evil\\page.html"
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
++    }
++
++    #[test]
++    fn native_page_path_rejects_drive_prefix_and_rooted() {
++        // is_absolute() 拦不住的形状：盘符相对路径（C:evil）与根相对（/evil），
++        // 都被 all-Normal 约束拒绝。
++        for page in ["C:evil/page.html", "/evil/page.html", "../page.html"] {
++            let json = format!(
++                r#"{{
++                    "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++                    "runtime":"native","main":"x.exe","page":"{page}"
++                }}"#
++            );
++            let m: PluginManifest = serde_json::from_str(&json).unwrap();
++            assert!(m.validate().is_err(), "page {page:?} must be rejected");
++        }
++        // 纯 "." 组件（./page.html）同样被拒（Normal 约束）。
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe","page":"./page.html"
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
++    }
++
++    #[test]
++    fn native_page_path_rejects_parent_dir() {
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe","page":"..\\evil\\page.html"
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
++    }
++
++    #[test]
++    fn native_page_path_rejects_non_html() {
++        let json = r#"{
++            "id":"com.spark.x","name":"X","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"x.exe","page":"assets/page.exe"
++        }"#;
++        let m: PluginManifest = serde_json::from_str(json).unwrap();
++        assert!(m.validate().is_err());
+     }
+ 
+     #[test]
+@@ -385,8 +525,7 @@ mod tests {
+         // 旧规范版本（如 native 时代的 1）在新 host 上仍可加载。
+         let json = r#"{
+             "id":"com.spark.old","name":"Old","version":"0.1.0","api_version":1,
+-            "runtime":"native","main":"old.exe",
+-            "commands":[{"name":"old","title":"Old","mode":"list","prefix":"old "}]
++            "runtime":"native","main":"old.exe","page":"page.html"
+         }"#;
+         let m: PluginManifest = serde_json::from_str(json).unwrap();
+         m.validate().unwrap();
+diff --git a/crates/plugin-manager/src/native.rs b/crates/plugin-manager/src/native.rs
+index 28170f6..da4063e 100644
+--- a/crates/plugin-manager/src/native.rs
++++ b/crates/plugin-manager/src/native.rs
+@@ -1,28 +1,27 @@
+ //! Native 插件运行时：host 侧 spawn 插件 exe + stdin/stdout 管道 RPC。
+ //!
+-//! 一个 [`NativeRuntime`] 持有按插件 id 索引的 [`NativeProcess`]。进程**懒启动**：
+-//! invoke/诊断路径首次命中时 spawn 并 `plugin.initialize` 握手；之后常驻，
+-//! 直到崩溃、超时或 host 退出。搜索路径**不懒启动**——未就绪返回 NotReady 由
+-//! 调用方触发 [`NativeRuntime::warm`] 后台预热（spawn 无界，不能落在查询路径）。
++//! native 插件是**纯应用**模型：清单不带 commands/keywords，不进搜索框、不产生
++//! 主窗口候选；exe 的唯一调用方是插件页面（PluginWindow/WebView2）经 host 转发的
++//! `plugin.page` RPC。进程**懒启动**：页面首次 RPC 时 spawn 并 `plugin.initialize`
++//! 握手；页面关闭时调用方 `shutdown_plugin` 优雅关停——"不打开就是不用"。
+ //!
+ //! 线程模型：每个活跃进程跑一个独立**读帧线程**，把 stdout 帧泵入 mpsc 通道；
+ //! RPC 调用方发请求后 `recv_timeout` 取响应。读不阻塞调用方、超时可控、崩溃
+ //! （EOF）能被检测。写（发请求）只在调用方线程，单写者，无需同步。
+ //!
+-//! 锁结构（PERF-SEARCH ③-a）：runtime 状态整体生活在 [`spawn_runtime_thread`]
+-//! 创建的**专职线程**，host 线程经 [`NativeRuntimeHandle`] 消息通信。为什么：
+-//! 搜索/invoke 在 host 全局锁（`SharedHost = Arc<Mutex<HostApp>>`）内执行，
+-//! native RPC 最坏可达秒级——RPC 等待必须移出 host 锁，而 runtime 状态需要
+-//! 单写者，专职线程把"单写者"收敛为一个点，锁内只剩通道 send（微秒级）。
+-//! **锁序纪律**：native 线程从不取 host 锁；host 线程等待本线程应答一律在
+-//! host 锁外（invoke 路径例外地持锁等待——单向依赖无死锁环，见 ipc_server
+-//! host.invoke 注释）。
++//! 锁结构：runtime 状态整体生活在 [`spawn_runtime_thread`] 创建的**专职线程**，
++//! host 线程经 [`NativeRuntimeHandle`] 消息通信。为什么：page RPC 最坏可达秒级，
++//! 而 host 侧调用发生在全局锁（`SharedHost = Arc<Mutex<HostApp>>`）内——RPC 等待
++//! 必须移出 host 锁，而 runtime 状态需要单写者，专职线程把"单写者"收敛为一个点，
++//! 锁内只剩通道 send（微秒级）。**锁序纪律**：native 线程从不取 host 锁；host
++//! 线程等待本线程应答一律在 host 锁外。**经批准的唯一例外**：卸载/覆盖安装路径
++//! 的 `shutdown_plugin_sync`（删除/替换 .exe 前必须确认进程退出，有界 3s）——
++//! 低频设置页操作，页面转发路径不走它（见 `NativePageRequest`）。
+ 
+ use crate::{LoadedPlugin, PluginError, PluginManager, PluginRuntime};
+ use spark_ipc::{
+-    decode_line, encode_line, read_frame, write_frame, InvokeParams, InvokeResult, JsonRpcResponse,
+-    PluginInitializeParams, PluginInitializeResult, PluginMethod, QueryParams, QueryResult,
+-    API_VERSION,
++    decode_line, encode_line, read_frame, write_frame, JsonRpcResponse, PluginInitializeParams,
++    PluginInitializeResult, PluginMethod, PluginPageParams, API_VERSION,
+ };
+ use std::collections::HashMap;
+ use std::io::{self, Write};
+@@ -65,17 +64,13 @@ impl NativeSpawnInfo {
+     }
+ }
+ 
+-/// 单次 RPC 默认超时（invoke / 诊断路径）。native 插件是重型组件，给足时间但
+-/// 避免永久挂起拖死 host。搜索路径走更短的 [`SEARCH_RPC_TIMEOUT`]。
++/// 单次 RPC 默认超时（页面转发路径）。native 插件是重型组件，给足时间但
++/// 避免永久挂起拖死 host。
+ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+ 
+-/// 搜索路径 RPC 上限（PERF-SEARCH ③-b）：用户在打字，逐键查询必须快进快出。
+-/// 超时**保留进程**（"慢但健康"的插件不被逐键 kill+respawn 造成进程风暴），
+-/// 本轮按 partial 降级交 UI 补查。300ms = 打字节奏（防抖 80ms）之上仍可感知不到。
+-pub(crate) const SEARCH_RPC_TIMEOUT: Duration = Duration::from_millis(300);
+-
+-/// RPC 失败分类：Timeout = 插件没在时限内回话（进程可能"慢但健康"）；
+-/// Fatal = 进程级故障（EOF/写失败/应答错误），必须丢弃重建。
++/// RPC 失败分类：Timeout = 插件没在时限内回话；Fatal = 进程级故障（EOF/写失败/
++/// 应答错误）。**当前两者同策略处理**（`rpc_sync` 拍平 → `with_proc` 丢弃进程重建），
++/// 保留分类只为错误信息可读；若未来引入"慢但健康"保留策略，在此分叉。
+ enum RpcFailure {
+     Timeout(PluginError),
+     Fatal(PluginError),
+@@ -177,19 +172,9 @@ impl NativeProcess {
+         Ok(result)
+     }
+ 
+-    /// query：发 plugin.query，等 QueryResult（既有阻塞语义，invoke/诊断路径用）。
+-    fn query(&mut self, params: QueryParams) -> Result<QueryResult, PluginError> {
+-        let resp = self.rpc_sync(PluginMethod::Query.as_str(), serde_json::to_value(&params)?)?;
+-        Ok(serde_json::from_value(resp)?)
+-    }
+-
+-    /// invoke：发 plugin.invoke，等 InvokeResult（既有阻塞语义）。
+-    fn invoke(&mut self, params: InvokeParams) -> Result<InvokeResult, PluginError> {
+-        let resp = self.rpc_sync(
+-            PluginMethod::Invoke.as_str(),
+-            serde_json::to_value(&params)?,
+-        )?;
+-        Ok(serde_json::from_value(resp)?)
++    /// page：发 plugin.page，等插件自定义 JSON 结果（页面 spark.rpc 转发路径）。
++    fn page_call(&mut self, params: PluginPageParams) -> Result<serde_json::Value, PluginError> {
++        self.rpc_sync(PluginMethod::Page.as_str(), serde_json::to_value(&params)?)
+     }
+ 
+     /// 既有语义的 RPC：默认超时，任何失败都按进程级故障处理（with_proc 丢弃）。
+@@ -204,13 +189,12 @@ impl NativeProcess {
+         }
+     }
+ 
+-    /// 发一帧请求并等**对应 id** 的响应（超时由调用方按路径给：搜索 300ms / 其余 5s）。
++    /// 发一帧请求并等**对应 id** 的响应（超时由调用方按路径给）。
+     ///
+     /// 响应只接受与本次请求 id 完全一致的帧；不一致（此前被放弃请求的迟到响应、
+-    /// 自发帧）一律**忽略并继续等**——搜索路径超时后进程被保留（SEARCH_RPC_TIMEOUT
+-    /// 注释），被放弃请求的迟到应答会滞留在读通道里，若沿用旧"不符即杀"会把
+-    /// 保留的进程误杀成逐键重 spawn。只收精确匹配 id，错位应答不可能被静默
+-    /// 路由到错误请求上（与旧逻辑同级别的防串号保证）。
++    /// 自发帧）一律**忽略并继续等**——被放弃请求的迟到应答会滞留在读通道里，
++    /// 若沿用旧"不符即杀"会把保留的进程误杀。只收精确匹配 id，错位应答不可能被
++    /// 静默路由到错误请求上。
+     fn rpc(
+         &mut self,
+         method: &str,
+@@ -372,136 +356,22 @@ fn spawn_reader(stdout: ChildStdout, tx: mpsc::Sender<FrameEvent>) {
+ #[derive(Default)]
+ pub struct NativeRuntime {
+     procs: HashMap<String, NativeProcess>,
+-    /// 在途预热标记（审计 Issue #1 修复）：Warm 到达时已就绪**或在途**都直接忽略——
+-    /// 搜索路径不懒启动，spawn+握手完成前 procs 恒空，没有这个标记逐键 Warm 会
+-    /// 并发拉起十几个插件进程（进程风暴）+ 失败路径逐键 warn（日志风暴）。
+-    /// WarmDone 归位（成败都算）时移除，保证后续可重试；标记只在 runtime 线程
+-    /// 消息循环内读写（warm/insert_warm），无跨线程同步需求。
+-    warming: std::collections::HashSet<String>,
+-}
+-
+-/// native 插件的关键字/前缀路由匹配结果。
+-#[derive(Debug, Clone)]
+-pub struct NativeMatch {
+-    pub plugin_id: String,
+-    /// 去掉前缀后的用户输入。
+-    pub input: String,
+-    /// 匹配到的 command name（invoke 时用于区分）。
+-    pub command: String,
+ }
+ 
+ impl NativeRuntime {
+-    /// 执行一次 native query：确保进程已启动，发 query，返回结果项。
+-    /// 进程崩溃/超时 → 丢弃进程，下次自动重 spawn；本次返回空结果。
+-    /// （既有阻塞语义，仅诊断/兜底路径使用；搜索路径走 query_for_search。）
+-    pub fn query(
+-        &mut self,
+-        info: &NativeSpawnInfo,
+-        text: &str,
+-        limit: u32,
+-    ) -> Result<QueryResult, PluginError> {
+-        let params = QueryParams {
+-            text: text.to_string(),
+-            limit,
+-        };
+-        self.with_proc(info, |proc| proc.query(params))
+-            .or_else(|e| {
+-                warn!(?e, id = %info.id, "native query failed");
+-                Ok(QueryResult {
+-                    items: vec![],
+-                    partial: false,
+-                })
+-            })
+-    }
+-
+-    /// 执行 native invoke。
+-    pub fn invoke(
+-        &mut self,
+-        info: &NativeSpawnInfo,
+-        params: InvokeParams,
+-    ) -> Result<InvokeResult, PluginError> {
+-        self.with_proc(info, |proc| proc.invoke(params))
+-    }
+-
+-    /// 搜索路径查询（PERF-SEARCH ③-b 语义）：**不懒启动**、`SEARCH_RPC_TIMEOUT`
+-    /// 上限、**超时保留进程**。未就绪返回 NotReady，由调用方触发 [`Self::warm`]。
+-    pub fn query_for_search(
++    /// 页面转发调用：确保进程已启动，发 plugin.page，返回插件自定义 JSON。
++    /// 进程崩溃/超时 → 丢弃进程，下次自动重 spawn；本次返回错误（页面收到错误码）。
++    pub fn page_call(
+         &mut self,
+         info: &NativeSpawnInfo,
+-        text: &str,
+-        limit: u32,
+-    ) -> Result<QueryResult, SearchQueryError> {
+-        let Some(proc) = self.procs.get_mut(&info.id) else {
+-            return Err(SearchQueryError::NotReady);
+-        };
+-        let params = QueryParams {
+-            text: text.to_string(),
+-            limit,
++        method: &str,
++        args: serde_json::Value,
++    ) -> Result<serde_json::Value, PluginError> {
++        let params = PluginPageParams {
++            method: method.to_string(),
++            args,
+         };
+-        let body = serde_json::to_value(&params)
+-            .map_err(|e| SearchQueryError::Failed(PluginError::Manifest(e.to_string())))?;
+-        match proc.rpc(PluginMethod::Query.as_str(), body, SEARCH_RPC_TIMEOUT) {
+-            Ok(v) => serde_json::from_value(v)
+-                .map_err(|e| SearchQueryError::Failed(PluginError::Manifest(e.to_string()))),
+-            Err(RpcFailure::Timeout(e)) => {
+-                // 进程保留：下一键查询再给它 300ms；进程真死了走 EOF 被清理
+-                warn!(?e, id = %info.id, "native search query timeout; process kept");
+-                Err(SearchQueryError::Timeout)
+-            }
+-            Err(RpcFailure::Fatal(e)) => {
+-                self.procs.remove(&info.id);
+-                warn!(?e, id = %info.id, "native search query failed; process dropped");
+-                Err(SearchQueryError::Failed(e))
+-            }
+-        }
+-    }
+-
+-    /// 后台预热：spawn+握手（秒级、无界）放独立线程，完成后经 WarmDone 消息归位。
+-    /// 已就绪**或在途**则 no-op（在途去重见 warming 字段注释）；线程创建失败不标记，
+-    /// 下一次 Warm 可重试。WarmDone 必达性：spawn 线程无论成败都会 send WarmDone，
+-    /// runtime 循环按序处理 → warming 标记不会永久卡死插件就绪。
+-    fn warm(&mut self, info: NativeSpawnInfo, done_tx: &mpsc::Sender<RuntimeMsg>) {
+-        if self.procs.contains_key(&info.id) || self.warming.contains(&info.id) {
+-            return;
+-        }
+-        let tx = done_tx.clone();
+-        let flag_id = info.id.clone();
+-        let log_id = info.id.clone();
+-        let spawned = thread::Builder::new()
+-            .name("spark-native-warm".into())
+-            .spawn(move || {
+-                let id = info.id.clone();
+-                let res = NativeProcess::spawn(&info);
+-                let _ = tx.send(RuntimeMsg::WarmDone { id, res });
+-            });
+-        match spawned {
+-            Ok(_handle) => {
+-                // WarmDone 由 runtime 循环按序消费，不存在"标记先于归位被旁路"的竞态
+-                self.warming.insert(flag_id);
+-            }
+-            Err(e) => warn!(?e, id = %log_id, "native warm thread spawn failed"),
+-        }
+-    }
+-
+-    /// WarmDone 归位：先清在途标记（成败都清，失败保证后续可重试），再插入预热完成
+-    /// 的进程；竞态下已有进程则丢弃后到者（drop 会 kill）。
+-    /// 孤儿进程归属：WarmDone 归位时插件可能已被卸载/禁用（runtime 线程不持 host 锁，
+-    /// 不回查插件表）——该进程与既有"卸载不关进程"行为同款，留在进程表直到 host 退出
+-    /// 被 shutdown_all 收割；后续搜索不会再命中它（插件表已无该 id 的路由匹配）。
+-    fn insert_warm(&mut self, id: String, res: Result<NativeProcess, PluginError>) {
+-        self.warming.remove(&id);
+-        match res {
+-            Ok(proc) => {
+-                if self.procs.contains_key(&id) {
+-                    debug!(id = %id, "warm spawn raced with existing process; dropped");
+-                    drop(proc);
+-                    return;
+-                }
+-                info!(id = %id, "native plugin warmed up");
+-                self.procs.insert(id, proc);
+-            }
+-            Err(e) => warn!(?e, id = %id, "native warm spawn failed"),
+-        }
++        self.with_proc(info, |proc| proc.page_call(params))
+     }
+ 
+     /// 取/启动某插件进程，执行一次调用。失败时清理该插件进程（下次重 spawn）。
+@@ -540,8 +410,8 @@ impl NativeRuntime {
+         }
+     }
+ 
+-    /// 关停指定插件 id 的 native 进程（覆盖更新前调用：占用中的 .exe 无法删除）。
+-    /// 未运行则无操作。
++    /// 关停指定插件 id 的 native 进程（页面关闭 / 覆盖更新前调用：占用中的
++    /// .exe 无法删除）。未运行则无操作。
+     pub fn shutdown_plugin(&mut self, id: &str) {
+         if let Some(mut proc) = self.procs.remove(id) {
+             proc.shutdown();
+@@ -555,55 +425,29 @@ impl Drop for NativeRuntime {
+     }
+ }
+ 
+-/// 搜索路径查询失败分类（[`NativeRuntime::query_for_search`]）。
+-pub enum SearchQueryError {
+-    /// 进程未就绪（搜索路径不懒启动）：调用方应触发 Warm 后台预热并按 partial 降级。
+-    NotReady,
+-    /// RPC 超时：进程保留（"慢但健康"的判断交给后续请求）。
+-    Timeout,
+-    /// 进程级故障（进程已被丢弃，下次查询重 spawn）。
+-    Failed(PluginError),
+-}
+-
+ /// 专职 native 线程的消息。runtime 状态（进程句柄/stdin/req-id，需 `&mut`）只能被
+ /// 该线程触碰；host 锁内只做通道 send，RPC 等待全部发生在 host 锁外（见模块注释）。
+ enum RuntimeMsg {
+-    /// 搜索路径查询（不懒启动 / 300ms / 超时保留进程）。
+-    QuerySearch {
++    /// 页面转发调用（懒启动 / 5s / 失败即杀）。
++    PageCall {
+         info: NativeSpawnInfo,
+-        text: String,
+-        limit: u32,
+-        reply: mpsc::Sender<Result<QueryResult, SearchQueryError>>,
++        method: String,
++        args: serde_json::Value,
++        reply: mpsc::Sender<Result<serde_json::Value, PluginError>>,
+     },
+-    /// 同步阻塞查询（懒启动 / 5s / 失败即杀）：`--query` 诊断与 invoke 兜底路径。
+-    QueryBlocking {
+-        info: NativeSpawnInfo,
+-        text: String,
+-        limit: u32,
+-        reply: mpsc::Sender<QueryResult>,
+-    },
+-    /// 插件执行（懒启动 / 5s / 失败即杀，既有语义）。
+-    Invoke {
+-        info: NativeSpawnInfo,
+-        params: InvokeParams,
+-        reply: mpsc::Sender<Result<InvokeResult, PluginError>>,
+-    },
+-    /// 后台预热 spawn+握手完成，进程归位。
+-    WarmDone {
+-        id: String,
+-        res: Result<NativeProcess, PluginError>,
+-    },
+-    /// 预热请求：runtime 线程派生独立 spawn 线程（spawn 无界，不能占 runtime 线程）。
+-    Warm { info: NativeSpawnInfo },
+-    /// 关停单插件（同步等待回复：覆盖更新前必须确认 .exe 已不被占用）。
++    /// 关停单插件，同步等待回复（覆盖更新/卸载前必须确认 .exe 已不被占用）。
+     ShutdownPlugin { id: String, reply: mpsc::Sender<()> },
++    /// 关停单插件，不等待（页面关闭通知）：runtime 线程串行执行，最多占用
++    /// runtime 线程自身 ≤1s，不占 host 锁。进程未运行则为 no-op。
++    ShutdownPluginFire { id: String },
+     /// 优雅关闭全部进程并退出 runtime 线程（join 收割）。
+     ShutdownAll,
+ }
+ 
+ /// native 运行时句柄（可克隆，只共享发送端）。join 句柄放 `Arc<Mutex<Option<_>>>`
+ /// 供 [`Self::shutdown_all`] 收割。锁序纪律见模块注释：native 线程从不取 host 锁，
+-/// host 线程等待本线程应答一律在 host 锁外。
++/// host 线程等待本线程应答一律在 host 锁外（唯一例外：卸载/覆盖路径的
++/// `shutdown_plugin_sync`，有界 3s）。
+ #[derive(Clone)]
+ pub struct NativeRuntimeHandle {
+     tx: mpsc::Sender<RuntimeMsg>,
+@@ -620,45 +464,27 @@ impl Default for NativeRuntimeHandle {
+ /// [`NativeRuntimeHandle::shutdown_all`]（host 退出路径显式调用）。
+ pub fn spawn_runtime_thread() -> NativeRuntimeHandle {
+     let (tx, rx) = mpsc::channel::<RuntimeMsg>();
+-    let warm_tx = tx.clone();
+     let join = thread::Builder::new()
+         .name("spark-native-runtime".into())
+         .spawn(move || {
+             let mut rt = NativeRuntime::default();
+             while let Ok(msg) = rx.recv() {
+                 match msg {
+-                    RuntimeMsg::QuerySearch {
+-                        info,
+-                        text,
+-                        limit,
+-                        reply,
+-                    } => {
+-                        let _ = reply.send(rt.query_for_search(&info, &text, limit));
+-                    }
+-                    RuntimeMsg::QueryBlocking {
++                    RuntimeMsg::PageCall {
+                         info,
+-                        text,
+-                        limit,
++                        method,
++                        args,
+                         reply,
+                     } => {
+-                        let _ = reply.send(rt.query(&info, &text, limit).unwrap_or(QueryResult {
+-                            items: vec![],
+-                            partial: false,
+-                        }));
++                        let _ = reply.send(rt.page_call(&info, &method, args));
+                     }
+-                    RuntimeMsg::Invoke {
+-                        info,
+-                        params,
+-                        reply,
+-                    } => {
+-                        let _ = reply.send(rt.invoke(&info, params));
+-                    }
+-                    RuntimeMsg::Warm { info } => rt.warm(info, &warm_tx),
+-                    RuntimeMsg::WarmDone { id, res } => rt.insert_warm(id, res),
+                     RuntimeMsg::ShutdownPlugin { id, reply } => {
+                         rt.shutdown_plugin(&id);
+                         let _ = reply.send(());
+                     }
++                    RuntimeMsg::ShutdownPluginFire { id } => {
++                        rt.shutdown_plugin(&id);
++                    }
+                     RuntimeMsg::ShutdownAll => {
+                         rt.shutdown_all();
+                         break;
+@@ -674,97 +500,33 @@ pub fn spawn_runtime_thread() -> NativeRuntimeHandle {
+ }
+ 
+ impl NativeRuntimeHandle {
+-    /// 搜索路径查询（宿主在 **host 锁外**调用）：RPC 上限 `SEARCH_RPC_TIMEOUT`。
+-    /// 返回 (结果, partial)：NotReady（自动触发后台预热）/超时/故障 → (空, true)。
+-    pub fn query_search(
++    /// 页面转发调用（既有 invoke 语义：懒启动 + 5s + 失败即杀）。用户主动打开
++    /// 页面触发，可等待。
++    pub fn page_call(
+         &self,
+         info: NativeSpawnInfo,
+-        text: String,
+-        limit: u32,
+-    ) -> (QueryResult, bool) {
+-        let empty = || QueryResult {
+-            items: vec![],
+-            partial: false,
+-        };
+-        let (tx, rx) = mpsc::channel();
+-        if self
+-            .tx
+-            .send(RuntimeMsg::QuerySearch {
+-                info: info.clone(),
+-                text,
+-                limit,
+-                reply: tx,
+-            })
+-            .is_err()
+-        {
+-            // runtime 线程已退出（关停中或 panic 消亡）：按无插件结果处理。
+-            // 正常关停后 UI 不应再来查询；若因 panic 消亡，这条 warn 是唯一线索
+-            warn!(id = %info.id, "native runtime thread gone; query dropped");
+-            return (empty(), false);
+-        }
+-        // 留 1s 余量给通道排队；runtime 线程自身先于本上限应答
+-        match rx.recv_timeout(SEARCH_RPC_TIMEOUT + Duration::from_secs(1)) {
+-            Ok(Ok(qr)) => (qr, false),
+-            Ok(Err(SearchQueryError::NotReady)) => {
+-                self.warm(info);
+-                (empty(), true)
+-            }
+-            Ok(Err(_)) => (empty(), true),
+-            Err(_) => (empty(), true),
+-        }
+-    }
+-
+-    /// 同步阻塞查询（既有语义：懒启动 + 5s + 失败即杀）。`--query` 诊断 / invoke 兜底。
+-    pub fn query_blocking(&self, info: NativeSpawnInfo, text: String, limit: u32) -> QueryResult {
+-        let (tx, rx) = mpsc::channel();
+-        if self
+-            .tx
+-            .send(RuntimeMsg::QueryBlocking {
+-                info,
+-                text,
+-                limit,
+-                reply: tx,
+-            })
+-            .is_err()
+-        {
+-            return QueryResult {
+-                items: vec![],
+-                partial: false,
+-            };
+-        }
+-        // 懒启动最坏 = 无界 spawn + 5s 握手 + 5s 查询；15s 盖帽防调用方悬挂
+-        rx.recv_timeout(Duration::from_secs(15))
+-            .unwrap_or(QueryResult {
+-                items: vec![],
+-                partial: false,
+-            })
+-    }
+-
+-    /// 插件执行（既有语义：懒启动 + 5s + 失败即杀）。用户主动执行，可等待。
+-    pub fn invoke(
+-        &self,
+-        info: NativeSpawnInfo,
+-        params: InvokeParams,
+-    ) -> Result<InvokeResult, PluginError> {
++        method: String,
++        args: serde_json::Value,
++    ) -> Result<serde_json::Value, PluginError> {
+         let (tx, rx) = mpsc::channel();
+         self.tx
+-            .send(RuntimeMsg::Invoke {
++            .send(RuntimeMsg::PageCall {
+                 info,
+-                params,
++                method,
++                args,
+                 reply: tx,
+             })
+             .map_err(|_| io_other("native runtime thread gone"))?;
++        // 懒启动最坏 = 无界 spawn + 5s 握手 + 5s 调用；15s 盖帽防调用方悬挂
+         rx.recv_timeout(Duration::from_secs(15))
+-            .map_err(|_| io_other("native invoke wait timeout"))?
++            .map_err(|_| io_other("native page call wait timeout"))?
+     }
+ 
+-    /// 后台预热（fire-and-forget）：spawn+握手在独立线程，完成归位 runtime 进程表。
+-    pub fn warm(&self, info: NativeSpawnInfo) {
+-        let _ = self.tx.send(RuntimeMsg::Warm { info });
+-    }
+-
+-    /// 关停单插件并**同步等待**：覆盖更新路径要求进程确已退出，.exe 才可覆盖。
+-    pub fn shutdown_plugin_sync(&self, id: &str) {
++    /// 关停单插件并**同步等待**：覆盖更新/卸载路径要求进程确已退出，.exe 才可
++    /// 覆盖/删除。返回 false = 3s 内未确认退出（如 runtime 线程被在途 PageCall 占住），
++    /// 调用方必须中止删改——否则半删目录（plugin.json 已删、exe 残留）需手动恢复。
++    /// 页面关闭通知勿用本方法（见 [`Self::shutdown_plugin`]）。
++    pub fn shutdown_plugin_sync(&self, id: &str) -> bool {
+         let (tx, rx) = mpsc::channel();
+         if self
+             .tx
+@@ -774,10 +536,20 @@ impl NativeRuntimeHandle {
+             })
+             .is_err()
+         {
+-            return;
++            // runtime 线程已退出：其 Drop 已 shutdown_all 收割全部子进程，无占用风险
++            return true;
+         }
+         // shutdown 内部最多 1s 轮询 + kill；3s 盖帽
+-        let _ = rx.recv_timeout(Duration::from_secs(3));
++        rx.recv_timeout(Duration::from_secs(3)).is_ok()
++    }
++
++    /// 关停单插件，**不等待**（fire-and-forget）：页面关闭通知路径。等待发生在
++    /// runtime 专职线程（≤1s/进程），调用方立即返回——host 锁内只花一次 send。
++    /// 进程未运行（含 webview id）则为 no-op。
++    pub fn shutdown_plugin(&self, id: &str) {
++        let _ = self
++            .tx
++            .send(RuntimeMsg::ShutdownPluginFire { id: id.to_string() });
+     }
+ 
+     /// 优雅关闭全部进程并收割 runtime 线程。host 退出路径显式调用
+@@ -794,98 +566,60 @@ impl NativeRuntimeHandle {
+     }
+ }
+ 
+-/// 搜索路径的 native 查询快照：host 锁内由 PluginManager 构造（owned，Send），
+-/// 调用方在 **host 锁外** [`Self::execute`]。缺省无插件结果时 partial=false。
+-pub struct NativeSearchRequest {
++/// 页面转发调用的锁内快照：host 锁内由 [`PluginManager::native_page_request`]
++/// 构造（owned，Send），调用方在 **host 锁外** [`Self::execute`]——懒启动 spawn、
++/// 握手与 `plugin.page` 的等待（最坏 15s）全部发生在 host 锁外，绝不占 host 锁。
++pub struct NativePageRequest {
+     handle: NativeRuntimeHandle,
+     info: NativeSpawnInfo,
+-    input: String,
+-    limit: u32,
++    method: String,
++    args: serde_json::Value,
+ }
+ 
+-impl NativeSearchRequest {
+-    /// PluginManager::native_search_request 专用构造（字段对 crate 外不透明）。
++impl NativePageRequest {
++    /// PluginManager::native_page_request 专用构造（字段对 crate 外不透明）。
+     pub(crate) fn new(
+         handle: NativeRuntimeHandle,
+         info: NativeSpawnInfo,
+-        input: String,
+-        limit: u32,
++        method: String,
++        args: serde_json::Value,
+     ) -> Self {
+         Self {
+             handle,
+             info,
+-            input,
+-            limit,
++            method,
++            args,
+         }
+     }
+ 
+-    /// 锁外执行：≤ `SEARCH_RPC_TIMEOUT`；未就绪自动后台预热。
+-    /// 返回 (结果, partial)：partial=true 表示本轮 native 结果缺席，host 侧如实上报 UI 补查。
+-    pub fn execute(self) -> (QueryResult, bool) {
+-        self.handle.query_search(self.info, self.input, self.limit)
++    /// 锁外执行：懒启动 + 5s RPC（15s 盖帽）+ 失败即杀。
++    ///
++    /// 陈旧快照兜底：锁外期间插件被禁用/卸载时调用仍会完成——进程表由 runtime
++    /// 线程持有、不回查插件表（与"卸载不关已运行进程"的既有孤儿语义一致）；
++    /// exe 已被删则 spawn 直接失败回传页面，残留进程由随后的关窗/卸载 shutdown
++    /// 或 host 退出路径收割。
++    pub fn execute(self) -> Result<serde_json::Value, PluginError> {
++        self.handle.page_call(self.info, self.method, self.args)
+     }
+ }
+ 
+-impl PluginManager {
+-    /// native 插件关键字/前缀路由：在 enabled 的 native 插件 `mode=="list"` commands 中匹配。
+-    ///
+-    /// 匹配规则：command.prefix 非空时按前缀匹配（大小写不敏感），命中后按字节偏移
+-    /// 截取原始输入（**保留用户原大小写**，与 webview `find_keyword_match` 对齐）；
+-    /// prefix 为空时退化为 command.name 精确匹配。首个命中插件胜出。
+-    /// 仅路由 `mode=="list"`：`page` 模式 native 自建窗口属二期，不在此发 query。
+-    pub fn find_native_match(&self, text: &str) -> Option<NativeMatch> {
+-        let trimmed = text.trim();
+-        if trimmed.is_empty() {
+-            return None;
+-        }
+-        for p in &self.plugins {
+-            if !p.enabled || !matches!(p.manifest.runtime, PluginRuntime::Native) {
+-                continue;
+-            }
+-            for cmd in &p.manifest.commands {
+-                // 只路由 list 模式；page 模式 native 二期未实现。
+-                if cmd.mode != "list" {
+-                    continue;
+-                }
+-                if let Some(prefix) = cmd.prefix.as_deref().filter(|s| !s.is_empty()) {
+-                    let pfx_lower = prefix.to_ascii_lowercase();
+-                    if trimmed
+-                        .to_ascii_lowercase()
+-                        .strip_prefix(&pfx_lower)
+-                        .is_some()
+-                    {
+-                        // prefix 为 ASCII，按字节偏移截原始输入，保留原大小写。
+-                        let input = trimmed[prefix.len()..].to_string();
+-                        return Some(NativeMatch {
+-                            plugin_id: p.manifest.id.clone(),
+-                            input,
+-                            command: cmd.name.clone(),
+-                        });
+-                    }
+-                } else if trimmed.to_ascii_lowercase() == cmd.name.to_ascii_lowercase() {
+-                    return Some(NativeMatch {
+-                        plugin_id: p.manifest.id.clone(),
+-                        input: String::new(),
+-                        command: cmd.name.clone(),
+-                    });
+-                }
+-            }
+-        }
+-        None
++/// 手动实现 Debug：句柄背后是子进程/管道（不可 derive），只暴露 id 与方法名。
++impl std::fmt::Debug for NativePageRequest {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("NativePageRequest")
++            .field("plugin_id", &self.info.id)
++            .field("method", &self.method)
++            .finish_non_exhaustive()
+     }
++}
+ 
+-    /// 查找 enabled 的 native 插件（供 host 路由后取 manifest/root）。
++impl PluginManager {
++    /// 查找 enabled 的 native 插件（供 host 取 spawn 信息 / 鉴权路由）。
+     pub fn native_plugin(&self, id: &str) -> Option<&LoadedPlugin> {
+         self.plugins.iter().find(|p| {
+             p.manifest.id == id && p.enabled && matches!(p.manifest.runtime, PluginRuntime::Native)
+         })
+     }
+-
+-    pub fn native_plugin_mut(&mut self, id: &str) -> Option<&mut LoadedPlugin> {
+-        self.plugins.iter_mut().find(|p| {
+-            p.manifest.id == id && p.enabled && matches!(p.manifest.runtime, PluginRuntime::Native)
+-        })
+-    }
+ }
+ 
+ #[cfg(test)]
+@@ -895,104 +629,44 @@ mod tests {
+     use std::fs;
+     use std::path::Path;
+ 
+-    fn make_native_plugin(dir: &Path, id: &str, prefix: &str) {
++    /// 写一个最小 native 纯应用清单（page 模型：无 commands，必有 page）。
++    fn make_native_plugin(dir: &Path, id: &str) {
+         fs::create_dir_all(dir).unwrap();
+         let json = format!(
+             r#"{{
+-                "id": "{id}", "name": "N", "version": "0.1.0", "api_version": 1,
+-                "runtime": "native", "main": "{id}.exe",
+-                "commands":[{{"name":"echo","title":"Echo","mode":"list","prefix":"{prefix}"}}]
++                "id": "{id}", "name": "N", "version": "0.1.0", "api_version": 2,
++                "runtime": "native", "main": "{id}.exe", "page": "page.html"
+             }}"#
+         );
+         fs::write(dir.join("plugin.json"), json).unwrap();
+     }
+ 
+     #[test]
+-    fn find_native_match_by_prefix() {
+-        let tmp = std::env::temp_dir().join("spark_native_match");
+-        let _ = fs::remove_dir_all(&tmp);
+-        make_native_plugin(&tmp.join("com.spark.echo"), "com.spark.echo", "echo ");
+-        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+-        pm.load_dev_dir(&tmp.join("com.spark.echo")).unwrap();
+-
+-        let m = pm.find_native_match("echo hello world").unwrap();
+-        assert_eq!(m.plugin_id, "com.spark.echo");
+-        assert_eq!(m.input, "hello world");
+-        assert_eq!(m.command, "echo");
+-    }
+-
+-    #[test]
+-    fn find_native_match_preserves_input_case() {
+-        // 回归：input 必须保留用户原大小写（曾因 to_ascii_lowercase 截取而丢失）。
+-        let tmp = std::env::temp_dir().join("spark_native_case");
+-        let _ = fs::remove_dir_all(&tmp);
+-        make_native_plugin(&tmp.join("com.spark.e"), "com.spark.e", "echo ");
+-        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+-        pm.load_dev_dir(&tmp.join("com.spark.e")).unwrap();
+-
+-        let m = pm.find_native_match("echo Hello World").unwrap();
+-        assert_eq!(m.input, "Hello World");
+-    }
+-
+-    #[test]
+-    fn find_native_match_skips_page_mode() {
+-        // page 模式 native command 不应路由到 query（二期）。
+-        let tmp = std::env::temp_dir().join("spark_native_page");
++    fn native_plugin_lookup_filters_runtime() {
++        let tmp = std::env::temp_dir().join("spark_native_lookup");
+         let _ = fs::remove_dir_all(&tmp);
+-        let dir = tmp.join("com.spark.pg");
+-        fs::create_dir_all(&dir).unwrap();
+-        let json = r#"{
+-            "id":"com.spark.pg","name":"N","version":"0.1.0","api_version":1,
+-            "runtime":"native","main":"pg.exe",
+-            "commands":[{"name":"pg","title":"Pg","mode":"page","prefix":"pg "}]
+-        }"#;
+-        fs::write(dir.join("plugin.json"), json).unwrap();
++        make_native_plugin(&tmp.join("com.spark.n"), "com.spark.n");
+         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+-        pm.load_dev_dir(&dir).unwrap();
+-        assert!(pm.find_native_match("pg hi").is_none());
++        pm.load_dev_dir(&tmp.join("com.spark.n")).unwrap();
++        assert!(pm.native_plugin("com.spark.n").is_some());
++        assert!(pm.native_plugin("com.spark.does-not-exist").is_none());
+     }
+ 
+     #[test]
+-    fn find_native_match_no_prefix_falls_back_to_name() {
+-        let tmp = std::env::temp_dir().join("spark_native_name");
++    fn native_manifest_with_commands_fails_to_load() {
++        // 纯应用模型：声明 commands 的 native 清单加载即被拒（无法进搜索框）。
++        let tmp = std::env::temp_dir().join("spark_native_cmds_rejected");
+         let _ = fs::remove_dir_all(&tmp);
+-        let dir = tmp.join("com.spark.np");
++        let dir = tmp.join("com.spark.cmd");
+         fs::create_dir_all(&dir).unwrap();
+         let json = r#"{
+-            "id":"com.spark.np","name":"N","version":"0.1.0","api_version":1,
+-            "runtime":"native","main":"np.exe",
+-            "commands":[{"name":"calc","title":"Calc","mode":"list"}]
++            "id":"com.spark.cmd","name":"N","version":"0.1.0","api_version":2,
++            "runtime":"native","main":"cmd.exe","page":"page.html",
++            "commands":[{"name":"c","title":"C","mode":"list","prefix":"c "}]
+         }"#;
+         fs::write(dir.join("plugin.json"), json).unwrap();
+         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+-        pm.load_dev_dir(&dir).unwrap();
+-
+-        let m = pm.find_native_match("calc").unwrap();
+-        assert_eq!(m.plugin_id, "com.spark.np");
+-        assert!(m.input.is_empty());
+-    }
+-
+-    #[test]
+-    fn find_native_match_skips_disabled_and_webview() {
+-        let tmp = std::env::temp_dir().join("spark_native_skip");
+-        let _ = fs::remove_dir_all(&tmp);
+-        make_native_plugin(&tmp.join("com.spark.e"), "com.spark.e", "e ");
+-        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+-        pm.load_dev_dir(&tmp.join("com.spark.e")).unwrap();
+-        pm.set_enabled("com.spark.e", false).unwrap();
+-        assert!(pm.find_native_match("e hi").is_none());
+-    }
+-
+-    #[test]
+-    fn native_plugin_lookup_filters_runtime() {
+-        let tmp = std::env::temp_dir().join("spark_native_lookup");
+-        let _ = fs::remove_dir_all(&tmp);
+-        make_native_plugin(&tmp.join("com.spark.n"), "com.spark.n", "n ");
+-        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+-        pm.load_dev_dir(&tmp.join("com.spark.n")).unwrap();
+-        assert!(pm.native_plugin("com.spark.n").is_some());
+-        assert!(pm.native_plugin("com.spark.does-not-exist").is_none());
+-        assert!(pm.native_plugin_mut("com.spark.n").is_some());
++        assert!(pm.load_dev_dir(&dir).is_err());
+     }
+ 
+     // 注：进程 spawn / 管道 RPC 属集成测试，需真实 echo exe；此处不跑，
+diff --git a/crates/sdk/src/lib.rs b/crates/sdk/src/lib.rs
+index b6785c6..7205faf 100644
+--- a/crates/sdk/src/lib.rs
++++ b/crates/sdk/src/lib.rs
+@@ -1,23 +1,32 @@
+ //! Spark 官方 Rust SDK：native 插件入口。
+ //!
++//! native 插件是**纯应用**模型：无 commands/keywords，不进搜索框；页面
++//! （WebView2）经 host 转发的 `plugin.page` 是插件的主要交互入口。
+ //! 插件作者实现 [`Plugin`] trait，main 里调 [`run_loop`] 即可。
+ //! `run_loop` 负责：帧编解码、`plugin.initialize` 握手、`query`/`invoke`/`cancel`
+-//! 分发、`plugin.shutdown` 退出。stdout 必须纯净协议帧，日志走 stderr。
++//! /`page` 分发、`plugin.shutdown` 退出。stdout 必须纯净协议帧，日志走 stderr。
+ 
+ use serde_json::Value;
+ use spark_core::Candidate;
+ use spark_ipc::{
+     decode_line, encode_line, read_frame, write_frame, InvokeParams, InvokeResult, JsonRpcRequest,
+-    JsonRpcResponse, PluginInitializeParams, PluginInitializeResult, PluginMethod, QueryParams,
+-    QueryResult,
++    JsonRpcResponse, PluginInitializeParams, PluginInitializeResult, PluginMethod,
++    PluginPageParams, QueryParams, QueryResult,
+ };
+ use std::io::{self, BufReader};
+ use thiserror::Error;
+ 
+ pub trait Plugin {
+     fn id(&self) -> &str;
++    /// 既有搜索入口：纯应用模型下 host 不再调用，保留仅为协议兼容。
+     fn query(&mut self, params: QueryParams) -> QueryResult;
++    /// 既有执行入口：纯应用模型下 host 不再调用，保留仅为协议兼容。
+     fn invoke(&mut self, params: InvokeParams) -> InvokeResult;
++    /// 页面 `spark.rpc(method, args)` 的宿主（native 纯应用模型唯一入口）。
++    /// 返回值原样回传页面 JS；默认返回 null，插件按需覆写（如配置读写）。
++    fn page(&mut self, _params: PluginPageParams) -> Value {
++        Value::Null
++    }
+ }
+ 
+ /// Helper: single-item list result.
+@@ -130,6 +139,11 @@ fn dispatch_request(
+             let result = plugin.invoke(params);
+             JsonRpcResponse::result(id, serde_json::to_value(result)?)
+         }
++        m if m == PluginMethod::Page.as_str() => {
++            let params: PluginPageParams = serde_json::from_value(req.params)?;
++            let result = plugin.page(params);
++            JsonRpcResponse::result(id, result)
++        }
+         m if m == PluginMethod::Cancel.as_str() => {
+             // cancel 是 notification（无 id）：不回帧，保持 stdout 纯净。
+             // 一期插件不实现真正的中断；host 也不会等待 cancel 响应。
+@@ -270,6 +284,27 @@ mod tests {
+         assert!(matches!(r, DispatchOutcome::Shutdown));
+     }
+ 
++    #[test]
++    fn dispatch_page_returns_plugin_value() {
++        // 未覆写 page() 的插件默认回 null；覆写后原样回传（回显见 echo 插件 e2e）。
++        let mut p = Echo;
++        let r = dispatch_request(
++            &mut p,
++            req(
++                PluginMethod::Page.as_str(),
++                Some(4),
++                serde_json::json!({ "method": "get_config", "args": { "k": "v" } }),
++            ),
++        )
++        .unwrap();
++        match r {
++            DispatchOutcome::Reply(resp) => {
++                assert_eq!(resp.result.unwrap(), Value::Null);
++            }
++            DispatchOutcome::Shutdown | DispatchOutcome::NoReply => panic!("expected reply"),
++        }
++    }
++
+     #[test]
+     fn dispatch_unknown_method_returns_error() {
+         let mut p = Echo;
+diff --git a/plugins/echo/plugin.json b/plugins/echo/plugin.json
+index 2fd7e86..9acc090 100644
+--- a/plugins/echo/plugin.json
++++ b/plugins/echo/plugin.json
+@@ -1,20 +1,11 @@
+ {
+   "id": "com.spark.echo",
+   "name": "Echo",
+-  "version": "0.1.0",
+-  "api_version": 1,
++  "version": "0.2.0",
++  "api_version": 2,
+   "main": "spark-plugin-echo.exe",
+   "runtime": "native",
+-  "description": "示例插件：回显输入",
+-  "keywords": ["echo", "demo"],
+-  "commands": [
+-    {
+-      "name": "echo",
+-      "title": "Echo",
+-      "subtitle": "回显输入",
+-      "mode": "list",
+-      "prefix": "echo "
+-    }
+-  ],
++  "description": "示例插件：纯应用模型（页面 + spark.rpc 回显）",
++  "page": "page.html",
+   "permissions": []
+ }
+diff --git a/plugins/echo/src/main.rs b/plugins/echo/src/main.rs
+index 53f1995..bc8290e 100644
+--- a/plugins/echo/src/main.rs
++++ b/plugins/echo/src/main.rs
+@@ -1,5 +1,6 @@
++use serde_json::Value;
+ use spark_core::{Action, Candidate, Source};
+-use spark_ipc::{InvokeParams, InvokeResult, QueryParams, QueryResult};
++use spark_ipc::{InvokeParams, InvokeResult, PluginPageParams, QueryParams, QueryResult};
+ use spark_sdk::{single_item, Plugin};
+ 
+ struct Echo;
+@@ -9,6 +10,8 @@ impl Plugin for Echo {
+         "com.spark.echo"
+     }
+ 
++    // 纯应用模型下 host 不再调用 query/invoke，以下仅为满足 trait（协议兼容保留）。
++
+     fn query(&mut self, params: QueryParams) -> QueryResult {
+         let text = params.text;
+         single_item(Candidate {
+@@ -32,11 +35,19 @@ impl Plugin for Echo {
+     fn invoke(&mut self, params: InvokeParams) -> InvokeResult {
+         InvokeResult::CopyText { text: params.text }
+     }
++
++    // 页面 spark.rpc 的宿主：原样回显 method/args，验证 host→exe 转发链路。
++    fn page(&mut self, params: PluginPageParams) -> Value {
++        serde_json::json!({
++            "echoed_method": params.method,
++            "args": params.args,
++        })
++    }
+ }
+ 
+ fn main() {
+-    // 阻塞运行：从 stdin 读 JSON-RPC 帧 → query/invoke → 向 stdout 写响应。
+-    // stdout 必须纯净协议帧，日志走 stderr。
++    // 阻塞运行：从 stdin 读 JSON-RPC 帧 → page（页面关闭时 host 发 shutdown）→
++    // 向 stdout 写响应。stdout 必须纯净协议帧，日志走 stderr。
+     let mut plugin = Echo;
+     if let Err(e) = spark_sdk::run_loop(&mut plugin) {
+         eprintln!("spark-plugin-echo: run_loop exited: {e}");
+diff --git a/ui/Spark.UI/Assets/plugin.preload.js b/ui/Spark.UI/Assets/plugin.preload.js
+index 779fb7f..0302abc 100644
+--- a/ui/Spark.UI/Assets/plugin.preload.js
++++ b/ui/Spark.UI/Assets/plugin.preload.js
+@@ -133,6 +133,13 @@
+       clear: function () { return call('db', 'clear'); }
+     },
+ 
++    // native 纯应用插件专属：调用插件 exe 的自定义逻辑（host 经 plugin.page RPC
++    // 转发，返回插件自定义 JSON）。不设权限——exe 与页面同源同信任级；
++    // webview 插件调用会得到 UNAVAILABLE（没有 exe 可转发）。
++    rpc: function (method, args) {
++      return call('rpc', String(method || ''), args === undefined ? null : args);
++    },
++
+     // 以下能力 host 端尚未实现：preload 提供 API 桩，调用统一返回 UNAVAILABLE。
+     // 这样开发者照规范写不会拿到 TypeError，而是清晰的“未实现”错误。
+     net: {
+diff --git a/ui/Spark.UI/MainWindow.xaml b/ui/Spark.UI/MainWindow.xaml
+index 8892393..c78c569 100644
+--- a/ui/Spark.UI/MainWindow.xaml
++++ b/ui/Spark.UI/MainWindow.xaml
+@@ -1254,6 +1254,15 @@
+ 
+                             <!-- 操作按钮 -->
+                             <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
++                              <Button Click="OnOpenPluginPage" Padding="12,5" FontSize="11"
++                                      Visibility="{Binding OpenVisibility}"
++                                      Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
++                                      BorderThickness="1" CornerRadius="8" Foreground="{StaticResource AccentBrush}">
++                                <StackPanel Orientation="Horizontal" Spacing="5">
++                                  <FontIcon Glyph="&#xE8A7;" FontSize="11" Foreground="{StaticResource AccentBrush}"/>
++                                  <TextBlock Text="打开" Foreground="{StaticResource AccentBrush}"/>
++                                </StackPanel>
++                              </Button>
+                               <Button Click="OnDebugPlugin" Padding="12,5" FontSize="11"
+                                       Visibility="{Binding DebugVisibility}"
+                                       Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
+diff --git a/ui/Spark.UI/MainWindow.xaml.cs b/ui/Spark.UI/MainWindow.xaml.cs
+index db63e5c..03cce9a 100644
+--- a/ui/Spark.UI/MainWindow.xaml.cs
++++ b/ui/Spark.UI/MainWindow.xaml.cs
+@@ -3849,10 +3849,37 @@ public sealed partial class MainWindow : Window
+         }
+     }
+ 
++    /// <summary>插件卡片"打开"按钮：打开插件页面窗口。native 纯应用插件的唯一入口
++    /// （native 不进搜索框），webview 插件同样可用（免打关键字直达页面）。
++    /// devMode 只随开发者模式/开发目录，区别于强制 devMode 的"调试"按钮。
++    /// 不 CloseIfOpen：已开则 OpenOrFocus 聚焦复用（关旧开新会让旧窗的关停通知
++    /// 晚到，误杀新页首次 rpc 懒启动的 exe）。</summary>
++    private async void OnOpenPluginPage(object sender, RoutedEventArgs e)
++    {
++        if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
++        try
++        {
++            var info = await _host.PluginOpenAsync(row.Id, "", "");
++            if (info is null)
++            {
++                SetPluginStatus($"无法打开：{row.Name}（插件未启用或无可打开页面）");
++                return;
++            }
++            var devMode = LocalState.Ui.DeveloperMode || await IsDevPluginAsync(row.Id);
++            PluginWindowHost.OpenOrFocus(info, "", "", "", devMode);
++            SetPluginStatus($"已打开插件页面：{row.Name}");
++        }
++        catch (Exception ex)
++        {
++            App.Log("PluginOpen", ex);
++            SetPluginStatus($"打开失败：{row.Name}");
++        }
++    }
++
+     /// <summary>插件卡片"调试"按钮：以 devMode=true 打开插件窗口（DevTools/右键菜单/加速键全开），
+     /// 与正式安装/dev 目录无关——只要开发者模式开着就能调试任意已启用插件。
+-    /// 若该插件窗口已打开，先收掉再重开：OpenOrFocus 命中旧窗口时不会重应用 dev 设置，
+-    /// 直接聚焦会拿到 DevTools 未启用的旧实例，必须重开才能保证调试生效。</summary>
++    /// 已开窗口复用并即时补开 dev 设置（FocusWith(devMode:true)），不 CloseIfOpen 关旧开新：
++    /// 旧窗的关停通知晚到会误杀新页首次 rpc 懒启动的 exe（与「打开」路径同一竞态）。</summary>
+     private async void OnDebugPlugin(object sender, RoutedEventArgs e)
+     {
+         if ((sender as FrameworkElement)?.DataContext is not PluginRowVm row) return;
+@@ -3861,11 +3888,10 @@ public sealed partial class MainWindow : Window
+             var info = await _host.PluginOpenAsync(row.Id, "", "");
+             if (info is null)
+             {
+-                SetPluginStatus($"无法打开调试：{row.Name}（插件未启用或非 WebView 类型）");
++                SetPluginStatus($"无法打开调试：{row.Name}（插件未启用或无可打开页面）");
+                 return;
+             }
+-            PluginWindowHost.CloseIfOpen(row.Id);
+-            PluginWindowHost.OpenOrFocus(info, _host, "", "", "", devMode: true);
++            PluginWindowHost.OpenOrFocus(info, "", "", "", devMode: true);
+             SetPluginStatus($"已打开调试窗口：{row.Name}");
+         }
+         catch (Exception ex)
+@@ -5625,9 +5651,9 @@ public sealed partial class MainWindow : Window
+                 return;
+             }
+             // 开发目录加载的插件开 DevTools，正式安装的看通用设置的开发者模式总开关（规范 §9.2）。
+-            // 注意：OpenOrFocus 命中旧窗口时不会重应用 dev 设置，开关切换后已开的窗口需重开才生效。
++            // OpenOrFocus 命中旧窗口时按 devMode 即时补应用 dev 设置（FocusWith 内处理）。
+             var devMode = LocalState.Ui.DeveloperMode || await IsDevPluginAsync(pluginId);
+-            PluginWindowHost.OpenOrFocus(info, _host, input, command, rawQuery, devMode);
++            PluginWindowHost.OpenOrFocus(info, input, command, rawQuery, devMode);
+             Footer.Text = "已打开：" + title;
+         }
+         catch (Exception ex)
+diff --git a/ui/Spark.UI/Models/PluginDto.cs b/ui/Spark.UI/Models/PluginDto.cs
+index c6cfedc..f737027 100644
+--- a/ui/Spark.UI/Models/PluginDto.cs
++++ b/ui/Spark.UI/Models/PluginDto.cs
+@@ -55,6 +55,13 @@ public sealed class PluginInfoDto
+     [JsonPropertyName("features")]
+     public List<PluginFeatureDto> Features { get; set; } = new();
+ 
++    /// <summary>
++    /// 插件是否拥有可打开的页面（webview：有 mode:page feature；native：声明 page 字段）。
++    /// UI 据此决定插件卡片是否显示「打开」按钮。
++    /// </summary>
++    [JsonPropertyName("has_page")]
++    public bool HasPage { get; set; }
++
+     /// <summary>
+     /// 签名状态：host <c>PluginInfo.sign_state</c> 的 snake_case 形状。
+     /// <c>official</c> / <c>third_party</c> / <c>unsigned</c> / <c>invalid</c>。
+diff --git a/ui/Spark.UI/Services/HostIpcClient.cs b/ui/Spark.UI/Services/HostIpcClient.cs
+index c4006c2..823ef57 100644
+--- a/ui/Spark.UI/Services/HostIpcClient.cs
++++ b/ui/Spark.UI/Services/HostIpcClient.cs
+@@ -38,8 +38,11 @@ public sealed class HostIpcClient : IAsyncDisposable
+     /// host 冷启动期间 QueryAsync 会回退 DemoData，host 上线不补查的话用户会一直看到演示结果。</summary>
+     public event Action? Connected;
+ 
+-    /// <summary>上次尝试拉起 host 进程的时刻（节流，防失败重试风暴重复 spawn）。</summary>
+-    private long _lastSpawnAttemptTicks;
++    /// <summary>上次尝试拉起 host 进程的时刻（节流，防失败重试风暴重复 spawn）。
++    /// static：每个插件页窗口持有独立 HostIpcClient，节流必须跨实例共享，
++    /// 否则多连接并发重连可各自 spawn（host 的 SingleInstance 护栏虽让第二个
++    /// --no-ui 实例直接退出，仍是无谓 spawn + 日志噪音）。</summary>
++    private static long _lastSpawnAttemptTicks;
+     /// <summary>已记过 QueryFallback 日志的连接代（-1 = 尚未记过）。断连期间打字每键一条
+     /// 同步文件 IO 会拖慢输入，同一断连段只记一条，重连成功后复位。</summary>
+     private long _fallbackLoggedGen = -1;
+@@ -119,10 +122,18 @@ public sealed class HostIpcClient : IAsyncDisposable
+     private void TrySpawnHostIfMissing()
+     {
+         var now = Environment.TickCount64;
+-        if (now - Interlocked.Read(ref _lastSpawnAttemptTicks) < 20_000) return;
+-        Interlocked.Exchange(ref _lastSpawnAttemptTicks, now);
++        var last = Interlocked.Read(ref _lastSpawnAttemptTicks);
++        if (now - last < 20_000) return;
++        // CAS 占位：并发重连期（多窗口各自 EnsureConnectedAsync）至多一个实例通过闸门
++        if (Interlocked.CompareExchange(ref _lastSpawnAttemptTicks, now, last) != last) return;
+         try
+         {
++            // host 进程在但管道不可达（启动中/僵死）：再 spawn 只会被 SingleInstance 弹回
++            if (Process.GetProcessesByName("spark-host").Length > 0)
++            {
++                App.Log("Ipc", "host process alive but pipe unreachable; skip spawn");
++                return;
++            }
+             var exe = FindHostExe();
+             if (string.IsNullOrEmpty(exe)) return;
+             // Dispose 只释放本进程的句柄跟踪对象，不影响已启动的 host 子进程
+@@ -448,9 +459,35 @@ public sealed class HostIpcClient : IAsyncDisposable
+     public Task<bool> PluginSetDirAsync(string path, bool migrate, CancellationToken ct = default) =>
+         PluginOkCallAsync("host.plugin.set_dir", new { path, migrate }, ct);
+ 
++    /// <summary>插件页面窗口关闭通知（JSON-RPC notification，无 id 不占请求预算）：
++    /// native 纯应用插件的 exe 生命周期与页面绑定，host 收到后优雅关停其进程
++    /// （webview 插件无进程，host 侧无操作）。仅在连接已建立时写入——未连接则
++    /// 该插件 exe 必然未曾经本连接的 rpc 懒启动，无需通知。</summary>
++    public async Task PluginPageClosedNotifyAsync(string id)
++    {
++        if (!IsConnected) return;
++        try
++        {
++            var req = new Dictionary<string, object?>
++            {
++                ["jsonrpc"] = "2.0",
++                ["method"] = "host.plugin.page_closed",
++                ["params"] = new { id }
++            };
++            await WriteLineBoundedAsync(JsonSerializer.Serialize(req));
++        }
++        catch (Exception ex)
++        {
++            App.Log("PluginPageClosed", ex);
++        }
++    }
++
+     /// <summary>
+     /// spark.* 特权能力桥：把插件页的调用转给 host 执行，返回 <c>data</c> 字段。
+     /// host 侧鉴权（未授权返回 error），失败以异常抛出供 preload 转成 Promise reject。
++    /// capability=rpc（native 插件页面转发）预算放宽到 20s：host 侧懒启动 + 握手 +
++    /// plugin.page 的最坏等待 15s，超出全局 8s。rpc 走插件页窗口的独立连接，
++    /// 排队再慢也不阻塞主窗口的搜索连接。
+     /// </summary>
+     public async Task<JsonElement> PluginApiAsync(string pluginId, string capability, string method,
+         JsonElement args, CancellationToken ct = default)
+@@ -459,7 +496,8 @@ public sealed class HostIpcClient : IAsyncDisposable
+         if (!IsConnected) throw HostErrorText.HostUnavailable();
+ 
+         var el = await CallAsync("host.plugin.api",
+-            new { plugin_id = pluginId, capability, method, args }, ct);
++            new { plugin_id = pluginId, capability, method, args }, ct,
++            capability == "rpc" ? 20 : 8);
+         if (el.ValueKind != JsonValueKind.Object)
+             throw new InvalidOperationException("后台返回了无法识别的能力调用结果");
+         return el.TryGetProperty("data", out var data) ? data.Clone() : default;
+@@ -507,7 +545,17 @@ public sealed class HostIpcClient : IAsyncDisposable
+         }
+     }
+ 
+-    private async Task<JsonElement> CallAsync(string method, object paramsObj, CancellationToken ct)
++    /// <summary>有界写：探针/关窗通知路径没有外层请求预算兜底，若管道写缓冲满且 host
++    /// 读循环长期停在某个 dispatch 内，无超时写会无限期悬挂调用方——统一 2s 上限，
++    /// 超时按写入失败处理（探针→拆连接重建；通知→记日志跳过）。</summary>
++    private async Task WriteLineBoundedAsync(string line, int timeoutSeconds = 2)
++    {
++        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
++        await WriteLineAsync(line, cts.Token);
++    }
++
++    private async Task<JsonElement> CallAsync(string method, object paramsObj, CancellationToken ct,
++        int timeoutSeconds = 8)
+     {
+         if (!IsConnected || _writer is null)
+             return default;
+@@ -532,7 +580,7 @@ public sealed class HostIpcClient : IAsyncDisposable
+             await WriteLineAsync(json, ct);
+ 
+             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+-            timeout.CancelAfter(TimeSpan.FromSeconds(8));
++            timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+             using var reg = timeout.Token.Register(() =>
+             {
+                 if (_pending.TryRemove(id, out var p))
+@@ -545,7 +593,19 @@ public sealed class HostIpcClient : IAsyncDisposable
+             }
+             catch (TimeoutException)
+             {
+-                await TearDownAsync();
++                // 超时只判这一请求失败，不拆整条连接：host 侧 rpc 最坏等待 15s 会把同连接
++                // 上的请求排队超时，拆掉共享连接会把所有在途请求一并取消、主窗口查询静默
++                // 回退 DemoData。晚到的响应在读循环里因 pending 已移除被安全忽略；
++                // 仅写探针失败（管道损坏）才走重建路径。
++                try
++                {
++                    await WriteLineBoundedAsync(
++                        "{\"jsonrpc\":\"2.0\",\"id\":-1,\"method\":\"host.ping\"}");
++                }
++                catch
++                {
++                    await TearDownAsync();
++                }
+                 throw;
+             }
+         }
+diff --git a/ui/Spark.UI/Services/PluginWindowHost.cs b/ui/Spark.UI/Services/PluginWindowHost.cs
+index 18b8505..d317027 100644
+--- a/ui/Spark.UI/Services/PluginWindowHost.cs
++++ b/ui/Spark.UI/Services/PluginWindowHost.cs
+@@ -13,18 +13,20 @@ public static class PluginWindowHost
+ 
+     /// <summary>
+     /// 打开或聚焦插件窗口。<paramref name="info"/> 由 host.plugin.open 返回。
+-    /// 必须在 UI 线程调用。
++    /// 必须在 UI 线程调用。devMode=true 且窗口已开时即时补开 DevTools（不关旧开新——
++    /// 旧窗的关停通知晚到会误杀新页首次 rpc 懒启动的 exe）。每个插件窗口持有自己的
++    /// IPC 连接，慢 rpc 不与主窗口搜索共用管道。
+     /// </summary>
+-    public static void OpenOrFocus(PluginOpenInfoDto info, HostIpcClient host,
++    public static void OpenOrFocus(PluginOpenInfoDto info,
+         string input, string command, string rawQuery, bool devMode)
+     {
+         if (_open.TryGetValue(info.Id, out var existing))
+         {
+-            existing.FocusWith(input, command, rawQuery);
++            existing.FocusWith(input, command, rawQuery, devMode);
+             return;
+         }
+ 
+-        var win = new PluginWindow(info, host, input, command, rawQuery, devMode);
++        var win = new PluginWindow(info, input, command, rawQuery, devMode);
+         _open[info.Id] = win;
+         win.Closed += (_, _) => _open.Remove(info.Id);
+         win.Activate();
+diff --git a/ui/Spark.UI/ViewModels/PluginRowVm.cs b/ui/Spark.UI/ViewModels/PluginRowVm.cs
+index 9140a8c..3c05a68 100644
+--- a/ui/Spark.UI/ViewModels/PluginRowVm.cs
++++ b/ui/Spark.UI/ViewModels/PluginRowVm.cs
+@@ -130,6 +130,15 @@ public sealed class PluginRowVm : INotifyPropertyChanged
+     public Visibility DebugVisibility =>
+         LocalState.Ui.DeveloperMode ? Visibility.Visible : Visibility.Collapsed;
+ 
++    /// <summary>插件是否拥有可打开的页面（host has_page：webview 有 mode:page feature /
++    /// native 声明 page 字段）。</summary>
++    public bool HasPage => _info.HasPage;
++
++    /// <summary>「打开」按钮可见性：有页面的插件才显示——native 纯应用插件的主要入口，
++    /// webview 插件免打关键字直达页面。</summary>
++    public Visibility OpenVisibility =>
++        HasPage ? Visibility.Visible : Visibility.Collapsed;
++
+     /// <summary>开发目录加载的插件不能"卸载"（文件不归 Spark 管），只能禁用。</summary>
+     public Visibility UninstallVisibility => IsDev ? Visibility.Collapsed : Visibility.Visible;
+ 
+diff --git a/ui/Spark.UI/Views/PluginWindow.xaml.cs b/ui/Spark.UI/Views/PluginWindow.xaml.cs
+index 0ac9656..291c972 100644
+--- a/ui/Spark.UI/Views/PluginWindow.xaml.cs
++++ b/ui/Spark.UI/Views/PluginWindow.xaml.cs
+@@ -23,7 +23,9 @@ public sealed partial class PluginWindow : Window
+     private const string VirtualHost = "plugin.spark.invalid";
+ 
+     private readonly PluginOpenInfoDto _info;
+-    private readonly HostIpcClient _host;
++    /// <summary>本窗口专属 IPC 连接：rpc 经 host 转发的最坏等待 15s 会占住 host 读循环，
++    /// 绝不与主窗口搜索共用一条管道，否则同连接上的 host.query 排队超时、连带拆连接。</summary>
++    private readonly HostIpcClient _host = new();
+     private readonly bool _devMode;
+     private readonly AppWindow _appWindow;
+     private readonly IntPtr _hwnd;
+@@ -40,11 +42,10 @@ public sealed partial class PluginWindow : Window
+ 
+     public string PluginId => _info.Id;
+ 
+-    public PluginWindow(PluginOpenInfoDto info, HostIpcClient host, string input, string command,
++    public PluginWindow(PluginOpenInfoDto info, string input, string command,
+         string rawQuery, bool devMode)
+     {
+         _info = info;
+-        _host = host;
+         _devMode = devMode;
+ 
+         App.Log("PluginWindow", $"ctor start id={info.Id} name={info.Name} icon_abs={info.IconAbs ?? "(null)"}");
+@@ -341,7 +342,7 @@ public sealed partial class PluginWindow : Window
+     /// </summary>
+     private void ShowPermissionDenied(string capability, string method)
+     {
+-        // 在途 IPC 长达 8s，续体可能晚于关窗恢复——与 PostReply 同语义短路，
++        // 在途 IPC 最长 8s（rpc 能力 20s），续体可能晚于关窗恢复——与 PostReply 同语义短路，
+         // 不触碰已拆树的 PermBar（async void 异常会直接崩进程）。
+         if (_closing) return;
+         var name = PermissionDisplayName(capability, method);
+@@ -505,11 +506,30 @@ public sealed partial class PluginWindow : Window
+         // 关窗前给页面一次存盘机会（规范 §8.5 onClose）；WebView2 随窗口销毁。
+         if (_webReady) PostEvent("close", null);
+         try { Web.Close(); } catch (Exception ex) { App.Log("PluginWebClose", ex); }
++        // native 纯应用插件：exe 生命周期与页面绑定，关窗即以无 id notification 通知 host
++        // 关停进程（host 侧对 webview 插件无操作）。fire-and-forget，不阻塞窗口销毁；
++        // 通知写入先于连接释放，管道缓冲数据 host 仍可读。
++        _ = NotifyPageClosedAsync();
+     }
+ 
+-    /// <summary>被再次触发时聚焦已有窗口并刷新输入上下文（默认单开）。</summary>
+-    public void FocusWith(string input, string command, string rawQuery)
++    private async Task NotifyPageClosedAsync()
+     {
++        try { await _host.PluginPageClosedNotifyAsync(_info.Id); }
++        catch (Exception ex) { App.Log("PluginPageClosed", ex); }
++        finally { await _host.DisposeAsync(); }
++    }
++
++    /// <summary>被再次触发时聚焦已有窗口并刷新输入上下文（默认单开）。
++    /// devMode=true 时即时补开 DevTools/右键菜单/加速键——「调试」按钮对已开窗口
++    /// 复用而非关旧开新（关旧开新会让旧窗的关停通知晚到，误杀新页首次 rpc 懒启动的 exe）。</summary>
++    public void FocusWith(string input, string command, string rawQuery, bool devMode = false)
++    {
++        if (devMode && Web.CoreWebView2 is { } core)
++        {
++            core.Settings.AreDevToolsEnabled = true;
++            core.Settings.AreDefaultContextMenusEnabled = true;
++            core.Settings.AreBrowserAcceleratorKeysEnabled = true;
++        }
+         _appWindow.Show();
+         SetForegroundWindow(_hwnd);
+         if (_webReady)
+diff --git a/插件开发/Native插件开发.md b/插件开发/Native插件开发.md
+index 21b541f..eb33d43 100644
+--- a/插件开发/Native插件开发.md
++++ b/插件开发/Native插件开发.md
+@@ -1,6 +1,6 @@
+ # Native 插件开发
+ 
+-> 状态：**运行时已实现**（2026-08-21）
++> 状态：**纯应用模型已实现**（2026-09-04 改版；旧 `commands`/list 模式已移除）
+ > Wire 协议版本：`API_VERSION = 1`（`spark-ipc`）
+ > 清单版本：`api_version: 2`
+ > 面向：Rust / 原生语言开发者
+@@ -10,33 +10,36 @@
+ 
+ ## 0. 实现现状（必读）
+ 
+-**Native 插件运行时已落地**：host 侧 spawn 插件进程 + stdin/stdout 管道 RPC，SDK 侧 `run_loop` 阻塞分发。内置 `echo` 示例端到端可跑（编译 exe 放入插件目录即可触发 `echo <文本>` 体验回显+复制）。
++**Native 插件是"纯应用"模型**：
+ 
+-当前状态：
++- **不进搜索框**——清单不支持（也不再支持）`commands`/`keywords`，插件无法向主搜索窗口注入任何候选或入口。
++- **页面即全部 UI**——插件必须提供 HTML 页面（`page` 字段），Spark 用与 webview 插件同款的插件窗口（WebView2）代开；入口是设置 → 插件卡片的「打开」按钮（开发者模式另有「调试」）。
++- **exe 生命周期 = 页面生命周期**——懒启动（页面首次 RPC 才 spawn + 握手）；**关闭页面 host 即优雅关停进程**。"不打开就是不用"字面成立。
++- 页面 JS 经 `spark.rpc(method, args)` 调用 exe 的原生逻辑（host 转发 `plugin.page` RPC），exe 也可以只用页面本地能力（db/clipboard 等）不实现任何自定义方法。
+ 
+ | 部分 | 状态 |
+ |------|------|
+-| 通信协议数据结构（`QueryParams`/`InvokeParams`/`QueryResult`/`InvokeResult`/`PluginMethod`） | ✅ `crates/ipc/src/protocol.rs` |
+-| 帧编解码（4 字节小端长度前缀 + UTF-8 JSON） | ✅ `crates/ipc/src/frame.rs`（`read_frame`/`write_frame`，16 MiB 上限） |
+-| 插件 SDK trait（`Plugin::query/invoke`） + `run_loop` | ✅ `crates/sdk/src/lib.rs`（`run_loop` + 可单测 `dispatch_request`） |
+-| host 侧 spawn native 进程 + 管道通信循环 | ✅ `crates/plugin-manager/src/native.rs`（`NativeRuntime`：懒启动/常驻/崩溃重建/超时/shutdown） |
+-| 关键字前缀路由（`mode:"list"`） | ✅ `PluginManager::find_native_match`（保留原大小写） |
+-| `echo` 示例插件 | ✅ `plugins/echo/src/main.rs` 用 `run_loop`，编译产物 `spark-plugin-echo.exe` |
++| 帧编解码（4 字节小端长度前缀 + UTF-8 JSON） | ✅ `crates/ipc/src/frame.rs`（16 MiB 上限） |
++| `plugin.page` RPC（页面 → host → exe） | ✅ `crates/ipc/src/protocol.rs` + `crates/plugin-manager/src/native.rs` |
++| 插件 SDK trait（`Plugin::page`） + `run_loop` | ✅ `crates/sdk/src/lib.rs` |
++| host 侧 spawn / 懒启动 / 崩溃重建 / 关窗关停 | ✅ `crates/plugin-manager/src/native.rs`（`NativeRuntime`） |
++| UI 卡片「打开」/「调试」按钮 + `spark.rpc` | ✅ `ui/Spark.UI`（`PluginWindowHost` 复用 webview 窗口基建） |
++| `echo` 示例插件（纯页面） | ✅ `plugins/echo/`（page.html + `page()` 回显） |
+ 
+-**已知 v1 权衡**：native query 是**阻塞 RPC（5s 超时）在 host 锁内**调用，重型插件超时/崩溃自动降级为空结果，不阻断搜索主流程。`mode: "page"`（native 自建窗口）仍属二期，未实现。
++**已移除**：`commands`/list 路由、搜索结果合并、native invoke、进程预热——搜索链路中不再有任何 native 参与（旧版插件声明 `commands` 会被清单校验直接拒绝，加载失败）。
+ 
+ ---
+ 
+ ## 1. 是什么
+ 
+-**Native 插件 = 一个独立 exe，通过 stdin/stdout 的 JSON-RPC 与 Spark host 通信。**
++**Native 插件 = 一个独立 exe + 一个 HTML 页面，是 Spark 里的一个"小应用"。**
+ 
+-- 插件目录含 `plugin.json` + 编译好的 `xxx.exe`（exe 由开发者随插件分发，Spark 不编译）。
+-- host 按需 spawn 插件进程，通过管道收发 JSON-RPC 帧。
+-- 插件返回 `Candidate` 结果项融入主搜索列表（`mode: list`），或自建顶层窗口（`mode: page`，二期）。
+-- 适合：OCR、截图选区、大量 IO、特定语言生态、需要任意原生 OS 能力的重型插件。
++- 插件目录含 `plugin.json` + 编译好的 `xxx.exe`（`main` 指向）+ HTML 页面（`page` 指向）。
++- 用户从插件卡片「打开」页面；页面跑在 WebView2 里，可调用 `spark.*` 能力。
++- 页面需要原生计算/IO 时，经 `spark.rpc` → host → 管道 RPC 调用 exe；exe 天然拥有完整 OS 能力。
++- 适合：设置页复杂的管理型工具、OCR、截图、大量 IO、需要任意原生 OS 能力的重型插件。
+ 
+-普通前端工具请走 [WebView插件开发.md](./WebView插件开发.md)。
++只要前端逻辑的请走 [WebView插件开发.md](./WebView插件开发.md)（webview 插件有关键字路由，可以进搜索框；native 没有）。
+ 
+ ---
+ 
+@@ -45,7 +48,8 @@
+ ```
+ my-native-plugin/
+   plugin.json            # 清单（必须）
+-  my-native-plugin.exe   # 可执行文件（必须，main 指向它）
++  my-native-plugin.exe   # 可执行文件（必须，main 指向它；页面不用 rpc 时可暂不放）
++  page.html              # 页面入口（必须，page 指向它）
+   icon.png               # 图标（可选）
+   README.md              # 说明（可选）
+ ```
+@@ -64,7 +68,7 @@ my-native-plugin/
+ 
+ ## 3. 清单 `plugin.json`
+ 
+-Native 插件用**旧清单格式**（`commands` + `keywords`），向后兼容。UTF-8 无 BOM。
++UTF-8 无 BOM。**native 不允许 `commands`/`keywords`/`features`**（声明即校验失败、拒绝加载）。
+ 
+ | 字段 | 类型 | 必填 | 说明 |
+ |------|------|------|------|
+@@ -74,47 +78,29 @@ Native 插件用**旧清单格式**（`commands` + `keywords`），向后兼容
+ | `api_version` | number | 是 | 当前 `2` |
+ | `runtime` | string | 是 | 固定 `"native"` |
+ | `main` | string | 是 | exe 文件名，如 `spark-plugin-echo.exe` |
++| `page` | string | 是 | 页面入口，相对路径 `.html`（禁止绝对路径与 `..`） |
+ | `icon` / `author` / `description` / `homepage` | — | 否 | 元信息 |
+-| `permissions` | string[] | 否 | 能力白名单（native 通常用 OS 能力，权限模型二期细化） |
+-| `commands` | object[] | 是 | 命令描述（native 用 `commands`，**不是** webview 的 `features`），至少 1 个 |
+-| `keywords` | string[] | 否 | 触发关键字列表（兼容字段） |
++| `permissions` | string[] | 否 | 能力白名单（`spark.rpc` 不需要权限，见 §4.3） |
++| `window` | object | 否 | 页面窗口规格（宽高/可缩放/置顶/边框，同 webview） |
++| `preload` | string | 否 | 自定义预加载脚本（同 webview，可选） |
+ 
+-### 3.1 `commands` 项
+-
+-| 字段 | 类型 | 必填 | 说明 |
+-|------|------|------|------|
+-| `name` | string | 是 | 命令标识 |
+-| `title` | string | 是 | 列表项标题 |
+-| `subtitle` | string | 否 | 副标题 |
+-| `mode` | string | 是 | `list`（返回结果项融入主列表，一期）或 `page`（自建窗口，二期） |
+-| `prefix` | string | 否 | 触发前缀，如 `"echo "` |
+-
+-### 3.2 完整示例
++### 3.1 完整示例
+ 
+ ```json
+ {
+   "id": "com.spark.echo",
+   "name": "Echo",
+-  "version": "0.1.0",
++  "version": "0.2.0",
+   "api_version": 2,
+   "runtime": "native",
+   "main": "spark-plugin-echo.exe",
+-  "description": "示例插件：回显输入",
+-  "keywords": ["echo", "demo"],
+-  "commands": [
+-    {
+-      "name": "echo",
+-      "title": "Echo",
+-      "subtitle": "回显输入",
+-      "mode": "list",
+-      "prefix": "echo "
+-    }
+-  ],
++  "page": "page.html",
++  "description": "示例插件：纯应用模型（页面 + spark.rpc 回显）",
+   "permissions": []
+ }
+ ```
+ 
+-> 清单校验规则（`manifest.rs`）：native 插件必须 `commands` 非空；webview 插件必须 `features` 非空。两者不可混用。
++> 清单校验规则（`manifest.rs`）：native 声明 `commands`/`keywords`/`features` 之一即报错；`page` 必填且须为相对 `.html` 路径。
+ 
+ ---
+ 
+@@ -128,58 +114,28 @@ Native 插件用**旧清单格式**（`commands` + `keywords`），向后兼容
+ 
+ | 方法 | 方向 | 说明 |
+ |------|------|------|
+-| `plugin.initialize` | host → 插件 | 启动握手，传插件 id/权限/运行环境；插件回 `PluginInitializeResult { plugin_id, sdk_version }` |
+-| `plugin.shutdown` | host → 插件 | 优雅退出（可带 id 等 ack，或作 notification 直接退出） |
+-| `plugin.query` | host → 插件 | 查询：根据用户输入返回候选结果项 |
+-| `plugin.invoke` | host → 插件 | 执行：用户选中某结果项的动作 |
+-| `plugin.cancel` | host → 插件 | 取消进行中的 query（notification，无 `id`，不回响应） |
++| `plugin.initialize` | host → 插件 | spawn 后握手，传插件 id/权限/协议版本；插件回 `{ plugin_id, sdk_version }` |
++| `plugin.page` | host → 插件 | 页面 `spark.rpc(method, args)` 的转发；插件回**自定义 JSON**（原样回传页面） |
++| `plugin.shutdown` | host → 插件 | 优雅退出（页面关闭 / 覆盖更新 / host 退出时发送） |
++| `plugin.query` / `plugin.invoke` / `plugin.cancel` | — | 旧 list 模式方法，**协议保留但 host 不再发送** |
+ 
+-每条请求带 `id`（host 侧递增 u64），插件返回对应 `id` 的 `JsonRpcResponse`；`cancel` 为 notification（无 `id`，不回帧）。host 侧**校验响应 id 与请求 id 一致**，不符即视为协议错误丢弃进程重建——故插件 stdout 必须纯净，不要回多余/自发帧。
++每条请求带 `id`（host 侧递增 u64），插件返回对应 `id` 的 `JsonRpcResponse`。host 校验响应 id 与请求 id 一致，不符即忽略——stdout 必须纯净，不要回多余/自发帧。
+ 
+-### 4.2 数据结构
++### 4.2 `plugin.page` 数据结构
+ 
+-**`plugin.query` 请求参数 `QueryParams`**：
++**请求参数 `PluginPageParams`**（页面 JS `spark.rpc('get_config', {...})` 转发而来）：
+ ```jsonc
+-{ "text": "echo hello", "limit": 50 }
++{ "method": "get_config", "args": { "key": "value" } }
+ ```
+ 
+-**`plugin.query` 响应 `QueryResult`**：
++**响应 result**：插件自定义 JSON，原样回传页面：
+ ```jsonc
+-{
+-  "items": [
+-    {
+-      "id": "echo:hello",
+-      "title": "hello",
+-      "subtitle": "Echo · Enter 复制",
+-      "target": null,
+-      "icon": null,
+-      "score": 1.0,
+-      "source": "plugin",
+-      "plugin_id": "com.spark.echo",
+-      "actions": [
+-        { "id": "copy", "title": "复制", "is_default": true, "target": null }
+-      ]
+-    }
+-  ],
+-  "partial": false
+-}
++{ "drives": { "C:": true }, "max_results": 50 }
+ ```
+-（`items` 元素即 `spark_core::Candidate`。）
+ 
+-**`plugin.invoke` 请求参数 `InvokeParams`**：
+-```jsonc
+-{ "item_id": "echo:hello", "action_id": "copy", "text": "hello" }
+-```
++### 4.3 权限说明
+ 
+-**`plugin.invoke` 响应 `InvokeResult`**（`tag = "type"`）：
+-| type | 字段 | 说明 |
+-|------|------|------|
+-| `close` | `message?` | 执行后关主窗，可选提示 |
+-| `keep` | `message?` | 执行后保留主窗，可选提示 |
+-| `copy_text` | `text` | 复制文本到剪贴板 |
+-| `open_url` | `url` | 用系统默认浏览器打开 URL |
+-| `show_error` | `message` | 显示错误提示 |
+-| `confirm` | `message` | 不可逆操作二次确认；用户确认后以 `action_id="confirm"` 重新 invoke |
++`spark.rpc` **不设新权限**：native exe 本就拥有完整 OS 能力，页面与 exe 出自同一插件目录、同一信任级（与 `spark.db` 默认开放同理由）。`spark.*` 其余能力（clipboard/notify/db 等）沿用 webview 的声明+授权模型。
+ 
+ Wire 协议版本常量 `API_VERSION = 1`（`crates/ipc/src/protocol.rs`），破坏性变更时 bump。
+ 
+@@ -194,53 +150,48 @@ Rust 开发者引用 `spark-sdk` crate，实现 `Plugin` trait。
+ ```rust
+ pub trait Plugin {
+     fn id(&self) -> &str;
++    /// 旧 list 模式入口：host 不再调用，保留仅为协议兼容（给出空实现即可）。
+     fn query(&mut self, params: QueryParams) -> QueryResult;
+     fn invoke(&mut self, params: InvokeParams) -> InvokeResult;
++    /// 页面 spark.rpc 的宿主；返回值原样回传页面 JS。默认返回 null。
++    fn page(&mut self, params: PluginPageParams) -> serde_json::Value;
+ }
+ ```
+ 
+ 辅助函数：
+ ```rust
+-spark_sdk::single_item(item: Candidate) -> QueryResult   // 单条结果
+-spark_sdk::empty_result() -> QueryResult                  // 空结果
+-spark_sdk::parse_params<T: DeserializeOwned>(Value) -> Result<T, _>
++spark_sdk::parse_params<T: DeserializeOwned>(Value) -> Result<T, _>   // args 反序列化
+ spark_sdk::sdk_version() -> &'static str
+ ```
+ 
+ ### 5.2 最小插件骨架
+ 
+ ```rust
+-use spark_core::{Action, Candidate, Source};
+-use spark_ipc::{InvokeParams, InvokeResult, QueryParams, QueryResult};
+-use spark_sdk::{single_item, Plugin};
+-
+-struct Echo;
+-
+-impl Plugin for Echo {
+-    fn id(&self) -> &str { "com.spark.echo" }
+-
+-    fn query(&mut self, params: QueryParams) -> QueryResult {
+-        let text = params.text;
+-        single_item(Candidate {
+-            id: format!("echo:{text}"),
+-            title: text.clone(),
+-            subtitle: Some("Echo · Enter 复制".into()),
+-            target: None,
+-            icon: None,
+-            score: 1.0,
+-            source: Source::Plugin,
+-            actions: vec![Action {
+-                id: "copy".into(),
+-                title: "复制".into(),
+-                is_default: true,
+-                target: None,
+-            }],
+-            plugin_id: Some(self.id().into()),
+-        })
++use serde_json::Value;
++use spark_ipc::{InvokeParams, InvokeResult, PluginPageParams, QueryParams, QueryResult};
++use spark_sdk::Plugin;
++
++struct MyApp;
++
++impl Plugin for MyApp {
++    fn id(&self) -> &str { "com.example.myapp" }
++
++    fn query(&mut self, _: QueryParams) -> QueryResult {
++        spark_sdk::empty_result()   // host 不会调用
++    }
++    fn invoke(&mut self, _: InvokeParams) -> InvokeResult {
++        spark_ipc::InvokeResult::Close { message: None }
+     }
+ 
+-    fn invoke(&mut self, params: InvokeParams) -> InvokeResult {
+-        InvokeResult::CopyText { text: params.text }
++    fn page(&mut self, params: PluginPageParams) -> Value {
++        match params.method.as_str() {
++            "get_config" => serde_json::json!({ "max_results": 50 }),
++            "set_config" => {
++                // 写配置/重建索引等原生逻辑；失败回 JSON-RPC error（页面 Promise reject）
++                serde_json::json!({ "ok": true })
++            }
++            other => serde_json::json!({ "error": format!("unknown method {other}") }),
++        }
+     }
+ }
+ ```
+@@ -266,14 +217,13 @@ serde_json = "1"
+ 
+ ### 5.4 main：运行时
+ 
+-`run_loop` 由 `spark-sdk` 提供，负责：帧编解码、`plugin.initialize` 握手、`query`/`invoke`/`cancel` 分发、`shutdown` 退出。stdout 必须纯净协议帧，日志走 stderr。
++`run_loop` 由 `spark-sdk` 提供，负责：帧编解码、`plugin.initialize` 握手、`plugin.page` 分发、`shutdown` 退出。stdout 必须纯净协议帧，日志走 stderr。
+ 
+ ```rust
+ fn main() {
+-    let mut plugin = Echo;
+-    // 阻塞：读 stdin 帧 → dispatch query/invoke → 写 stdout 帧。
++    let mut plugin = MyApp;
+     if let Err(e) = spark_sdk::run_loop(&mut plugin) {
+-        eprintln!("spark-plugin-echo: run_loop exited: {e}");
++        eprintln!("my-plugin: run_loop exited: {e}");
+         std::process::exit(1);
+     }
+ }
+@@ -287,7 +237,7 @@ fn main() {
+ 
+ 1. **帧格式**：每条消息 = 4 字节小端 uint32 长度（不含自身）+ UTF-8 JSON。从 stdin 读长度再读 body，向 stdout 写长度再写 body。stderr 留给插件自用日志（host 不解析）。
+ 2. **消息体**：标准 JSON-RPC 2.0（`{ jsonrpc, id, method, params }` 请求 / `{ jsonrpc, id, result|error }` 响应 / `{ jsonrpc, method, params }` 通知）。
+-3. **方法与结构**：照本文 §4 的方法名与 `QueryParams`/`QueryResult`/`InvokeParams`/`InvokeResult` 字段名（snake_case）。
++3. **只需实现三个方法**：`plugin.initialize` / `plugin.page` / `plugin.shutdown`（snake_case 字段见 §4.2）。
+ 4. **stdout 必须纯净**：只写协议帧，不要写任何调试打印（会破坏帧解析）；日志走 stderr。
+ 5. **刷新缓冲**：每帧写完立即 flush stdout，避免 host 阻塞等待。
+ 
+@@ -296,23 +246,20 @@ fn main() {
+ ## 7. 生命周期与错误处理
+ 
+ ```
+-host spawn 插件进程（带 plugin.initialize）
+-        │
+-        ▼
+-插件就绪，host 缓存进程
+-        │ 用户输入匹配关键字
++用户在插件卡片点「打开」→ UI 开 WebView2 页面窗口
++        │  （exe 此时尚未启动）
++        │  页面首次 spark.rpc(...)
+         ▼
+-host 发 plugin.query → 插件返回 QueryResult.items 融入主列表
+-        │ 用户选中某项动作
++host 懒启动 exe + plugin.initialize 握手（最坏 ~5s，其后常驻）
++        │  plugin.page 转发调用（5s 超时）
+         ▼
+-host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...）
+-        │
+-        ├─ 空闲超时 / host 退出 → plugin.shutdown → 进程退出
++用户关闭页面 → host 发 plugin.shutdown → 进程退出（1s 内不退则强杀）
+ ```
+ 
+-- 插件进程 crash：host 检测到管道断开，下次 query 时重新 spawn；用户无感。
+-- query 超时：host 发 `plugin.cancel`（notification），插件应尽快中止并丢弃该 `id` 的响应。
++- 插件进程 crash：host 检测到管道断开，下次 `plugin.page` 时重新 spawn；页面拿到错误后重试即可。
++- page 调用超时/出错：host 返回 `"UNAVAILABLE: detail"` 形状错误，页面 `spark.rpc` 的 Promise reject（`error.code = "UNAVAILABLE"`）。
+ - 插件内部错误：响应 `{ error: { code, message } }`，不要 panic 退出进程。
++- 页面应**每次改动即时保存**（经 rpc 写配置/写 db）：关窗即进程退出，没有"退出前存盘"钩子。
+ 
+ ---
+ 
+@@ -328,7 +275,7 @@ host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...
+ 
+ ### 8.1 通过插件市场发布
+ 
+-1. 编译好 exe，在插件仓库中创建 `插件名/版本号/` 目录，放入 `plugin.json` + exe。
++1. 编译好 exe，在插件仓库中创建 `插件名/版本号/` 目录，放入 `plugin.json` + exe + page.html。
+ 2. 更新仓库根目录 `registry.json`，添加该插件条目（`runtime: "native"`）。
+ 3. 推送后用户即可在 Spark 设置 → 插件 → 插件市场浏览并一键安装。
+ 4. native 插件 exe 体积大时，建议在 `version.url` 填预打包 zip 地址（GitHub Release asset），避免每次下载整个仓库 zipball。
+@@ -339,20 +286,21 @@ host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...
+ 
+ ## 9. 完整示例：echo
+ 
+-仓库内置 `plugins/echo`（Rust native 示例）。
++仓库内置 `plugins/echo`（Rust native 纯页面示例）。
+ 
+-- 清单见 §3.2。
+-- 源码 `plugins/echo/src/main.rs`（用 `spark_sdk::run_loop`，见 §5.4）。
+-- `Cargo.toml` 见 §5.3，是 workspace 成员（`Cargo.toml` members 含 `plugins/echo`）。
++- 清单：`page: "page.html"`，无 commands/keywords。
++- 页面 `plugins/echo/page.html`：输入文本 → `spark.rpc('echo', {...})` → 展示 exe 回显的 JSON。
++- 源码 `plugins/echo/src/main.rs`：`page()` 原样回显 `method`/`args`。
+ 
+-**可运行**：`cargo build --release -p spark-plugin-echo`，把产物 `target/release/spark-plugin-echo.exe` 复制进插件目录（与 `plugin.json` 同级，文件名与 `main` 字段一致）。开发模式启动 host 指向项目根 `plugins/`，输入 `echo <文本>` 即触发回显候选，回车复制。
++**可运行**：`cargo build --release -p spark-plugin-echo`，把产物 `spark-plugin-echo.exe` 复制进 `plugins/echo/`（与 `plugin.json` 同级）。开发模式启动 host 指向项目根 `plugins/`，设置 → 插件 → Echo 卡片 → 「打开」，在页面里发任意文本验证回显；关闭窗口后插件进程退出。
+ 
+ ## 10. 路线图
+ 
+ | 阶段 | 内容 |
+ |------|------|
+-| 当前 | 协议结构 + SDK trait + 帧编解码 + `run_loop` + host spawn/管道循环；echo 可跑 |
+-| 二期 | 插件市场支持（官方/自定义仓库、registry.json 索引、一键安装/更新）；`mode: page` 自建顶层窗口（需 `window.create` 权限）；native 权限模型细化 |
++| 当前 | 纯应用模型：page 必填 + `plugin.page` RPC + `spark.rpc` + 卡片打开/关窗关停；echo 页面版可跑 |
++| 二期 | 插件市场支持（官方/自定义仓库、registry.json 索引、一键安装/更新）；native 权限模型细化 |
++| 远期 | `commands[].mode:"page"` 自建顶层原生窗口（需 `window.create` 权限；纯应用模型不满足的场景，如截图选区浮层） |
+ | 三期 | 插件市场签名校验、自动检查更新、跨平台产物声明 |
+ | 四期 | WASM 轻插件、多仓库源、插件依赖声明 |
+ 
+@@ -363,10 +311,11 @@ host 发 plugin.invoke → 插件返回 InvokeResult（close/keep/copy_text/...
+ ## 11. 安全约束
+ 
+ 1. Native 插件拥有完整 OS 能力，权限模型比 webview 更需谨慎（二期细化）。
+-2. host 对 native 插件进程做超时/资源约束；stderr 不回传用户。
+-3. stdout 必须纯净协议帧，任何杂质都会破坏解析。
+-4. 市场上架（二期）将强制代码签名；本地开发免签名。
+-5. 不得收集用户隐私上传未声明用途的服务器。
++2. `spark.rpc` 是页面与自家 exe 之间的通道，不设权限（同源同信任）；host 对其他 `spark.*` 能力仍按"清单声明 + 用户授权"鉴权。
++3. host 对 native 插件进程做超时约束（page 调用 5s、懒启动盖帽 15s）；stderr 不回传用户。
++4. stdout 必须纯净协议帧，任何杂质都会破坏解析。
++5. 市场上架将强制代码签名；本地开发免签名。
++6. 不得收集用户隐私上传未声明用途的服务器。
+ 
+ ---
+ 
+diff --git a/插件开发/WebView插件开发.md b/插件开发/WebView插件开发.md
+index 01b323f..7243b46 100644
+--- a/插件开发/WebView插件开发.md
++++ b/插件开发/WebView插件开发.md
+@@ -221,13 +221,25 @@ spark.onResize(cb => (w, h))
+ spark.onClose(cb)                   // 窗口即将关闭前触发，可做存盘
+ ```
+ 
+-### 6.7 开发模式 `spark.dev` ✅（仅开发目录加载时）
++### 6.7 调用插件原生逻辑 `spark.rpc` ✅（仅 native 插件页面）
++
++native 纯应用插件专属：经 host 转发 `plugin.page` RPC 调用插件 exe 的自定义逻辑，
++返回插件自定义 JSON。不设权限（页面与 exe 同源同信任）；**webview 插件调用返回
++`UNAVAILABLE`**。超时 5s；错误以 Promise reject（`"CODE: detail"` 形状）。
++
++```js
++const result = await spark.rpc('get_config', { key: 'value' })   // args 任意 JSON
++```
++
++详见 [Native插件开发.md](./Native插件开发.md) §4.2/§5。
++
++### 6.8 开发模式 `spark.dev` ✅（仅开发目录加载时）
+ 
+ ```js
+ spark.dev.openDevTools()
+ ```
+ 
+-### 6.8 待实现 🚧
++### 6.9 待实现 🚧
+ 
+ 以下在规范中已定义，一期未实现，调用会抛 `UNAVAILABLE`：
+ 
+diff --git a/插件开发/插件开发规范.md b/插件开发/插件开发规范.md
+index 57a923c..e13ad6d 100644
+--- a/插件开发/插件开发规范.md
++++ b/插件开发/插件开发规范.md
+@@ -188,7 +188,7 @@ my-plugin/
+ | `mode` | 行为 | 适用 `runtime` |
+ |--------|------|----------------|
+ | `page` | 选中命令回车 → Spark 打开 WebView2 插件窗口 | `webview` |
+-| `list` | 插件返回结果项列表，融入主列表展示，不开窗 | `native`（一期） |
++| `list` | **已移除**：native 纯应用模型下 native 插件不进搜索框（清单声明 `commands` 即被拒绝），webview 清单也不再接受 `list`（路由代码已删） | — |
+ 
+ 一期 `webview` 插件只支持 `mode: page`。
+ 
+@@ -425,14 +425,16 @@ translate.spark-plugin  (zip)
+ 
+ ## 10. 重型插件（`runtime: native`）
+ 
+-供需要原生 OS 能力（OCR、截图选区、大量 IO、特定语言生态）的高级开发者使用。运行时已实现（2026-08-21）。
++供需要原生 OS 能力（OCR、截图选区、大量 IO、特定语言生态）的高级开发者使用。**纯应用模型**已实现（2026-09-04 改版；旧 `commands`/list 搜索融合模式已移除）。
+ 
+-- 插件 = 含 `plugin.json + exe` 的目录，`runtime: "native"`，`main` 指向 exe。
+-- 与 host 通过 stdin/stdout 的 length-prefixed JSON-RPC 通信（4 字节小端长度前缀 + UTF-8 JSON body；帧编解码见 `crates/ipc/src/frame.rs`；方法：`plugin.initialize/shutdown/query/invoke/cancel`）。
+-- host 懒启动进程并 `plugin.initialize` 握手，常驻直到崩溃/超时/host 退出；崩溃/超时自动重建。host 校验响应 id 与请求 id 一致，故插件 stdout 必须纯净协议帧。
+-- `mode: list`：返回 `Candidate` 结果项融入主列表（一期已实现）；`mode: page`：可自建顶层窗口（需声明 `window.create` 权限，二期未实现）。
+-- Rust 开发者引用 `spark-sdk` crate，main 调 `spark_sdk::run_loop(&mut plugin)` 即可（帧编解码 + initialize/query/invoke/cancel/shutdown 分发内置）。
+-- 详见 `crates/sdk` 与 `plugins/echo` 示例（端到端可跑）。
++- 插件 = 含 `plugin.json + exe + page.html` 的目录，`runtime: "native"`，`main` 指向 exe，`page` 指向页面（必填，相对 `.html` 路径）。
++- **纯应用模型**：native 插件**不允许**声明 `commands`/`keywords`/`features`（声明即校验失败、拒绝加载）——插件无法进搜索框、无法影响主窗口；页面从插件卡片「打开」/「调试」进入。
++- 页面 = 全部 UI：Spark 用与 webview 同款的插件窗口（WebView2）代开，页面 JS 可用 `spark.*` 能力 + `spark.rpc(method, args)`（host 转发 `plugin.page` RPC 调用 exe 的原生逻辑，返回插件自定义 JSON；不设权限，同源同信任）。
++- 与 host 通过 stdin/stdout 的 length-prefixed JSON-RPC 通信（4 字节小端长度前缀 + UTF-8 JSON body；帧编解码见 `crates/ipc/src/frame.rs`；host 发送的方法：`plugin.initialize/page/shutdown`；`query`/`invoke`/`cancel` 协议保留但不再发送）。
++- exe 生命周期与页面绑定：懒启动（页面首次 RPC 才 spawn + 握手），**关闭页面即优雅关停进程**；崩溃/超时自动重建。host 校验响应 id 与请求 id 一致，故插件 stdout 必须纯净协议帧。
++- Rust 开发者引用 `spark-sdk` crate，main 调 `spark_sdk::run_loop(&mut plugin)` 即可（帧编解码 + initialize/page/shutdown 分发内置，`Plugin::page` 宿主原生逻辑）。
++- 远期：`commands[].mode:"page"` 自建顶层原生窗口（需 `window.create` 权限；纯应用模型不满足的场景，如截图选区浮层）。
++- 详见 `crates/sdk`、`plugins/echo`（纯页面示例，端到端可跑）与 [Native插件开发.md](./Native插件开发.md)。
+ 
+ 普通用户/前端开发者无需关心本节。
+ 
+@@ -463,8 +465,8 @@ translate.spark-plugin  (zip)
+ | 阶段 | 内容 |
+ |------|------|
+ | **一期** | `runtime: webview` + `keyword` 触发 + `page` 模式 + 核心 `spark.*` API + 本地安装/开发模式 + 设置页三块 |
+-| **二期** | 插件市场（官方/自定义仓库、registry.json 索引、一键安装/更新）、`regex`/`root` 触发、`onInput` 挂载、自定义预加载、插件多开 |
+-| **三期** | 插件市场签名强制校验、自动检查更新、星标/下载量统计、native 插件 `mode: page` 自建窗口 |
++| **二期** | 插件市场（官方/自定义仓库、registry.json 索引、一键安装/更新）、`regex`/`root` 触发、`onInput` 挂载、自定义预加载、插件多开；**native 纯应用模型**（page 必填、`plugin.page` RPC、`spark.rpc`、卡片打开/关窗关停；移除 list 模式） |
++| **三期** | 插件市场签名强制校验、自动检查更新、星标/下载量统计、native `commands[].mode:"page"` 自建原生窗口（`window.create` 权限，远期） |
+ | **四期** | WASM 轻插件（in-process，纯逻辑）、多仓库源、仓库推荐、插件依赖声明 |
+ 
+ ---
+@@ -524,11 +526,12 @@ UI ↔ Host 间 JSON-RPC 方法名（开发者一般无需关心；仅供 host/U
+ | `host.plugin.toggle` | UI→Host | `{id,enabled}` | `{ok}` | 启用/禁用 |
+ | `host.plugin.grant` | UI→Host | `{id,permissions[]}` | `{ok}` | 授权权限 |
+ | `host.plugin.devload` | UI→Host | `{dir}` | `{id}` | 加载开发目录（不拷贝） |
+-| `host.plugin.open` | UI→Host | `{id,input,command}` | `PluginOpenInfo` | 取开窗所需信息（main 绝对路径/window/permissions/preload） |
++| `host.plugin.open` | UI→Host | `{id,input,command}` | `PluginOpenInfo` | 取开窗所需信息（main 绝对路径/window/permissions/preload；native 纯应用返回 page 绝对路径） |
+ | `host.plugin.set_dir` | UI→Host | `{path,migrate}` | `{ok}` | 更换插件目录并可选迁移 |
+-| `host.plugin.api` | UI→Host | `{plugin_id,capability,method,args}` | `{ok,data}` | `spark.*` 特权能力桥（clipboard/notify/db） |
++| `host.plugin.page_closed` | UI→Host 通知（无 id，无响应） | `{id}` | — | 插件页面窗口关闭通知（fire-and-forget，host 不回包）：native 纯应用插件的 exe 随之优雅关停（webview 无操作） |
++| `host.plugin.api` | UI→Host | `{plugin_id,capability,method,args}` | `{ok,data}` | `spark.*` 特权能力桥（clipboard/notify/db/rpc） |
+ 
+-一期 `host.plugin.api` 支持的 capability：`db`（set/get/remove/keys/clear，默认开放）、`clipboard`（read_text/write_text，需授权；read_image 未实现，返回 UNAVAILABLE）、`notify`（show，需授权）。`net`/`fs`/`shell` 的 preload API 桩已就位，host 端返回 UNAVAILABLE，随后增量实现。
++一期 `host.plugin.api` 支持的 capability：`db`（set/get/remove/keys/clear，默认开放）、`clipboard`（read_text/write_text，需授权；read_image 未实现，返回 UNAVAILABLE）、`notify`（show，需授权）、`rpc`（仅 native 插件：页面 `spark.rpc` 经 host 转发 `plugin.page` 调用插件 exe，不设权限；webview 插件调用返回 UNAVAILABLE）。`net`/`fs`/`shell` 的 preload API 桩已就位，host 端返回 UNAVAILABLE，随后增量实现。
+ 
+ ### 15.1 仓库源配置（二期）
+ 
+diff --git a/plugins/echo/page.html b/plugins/echo/page.html
+new file mode 100644
+index 0000000..0368d08
+--- /dev/null
++++ b/plugins/echo/page.html
+@@ -0,0 +1,39 @@
++<!DOCTYPE html>
++<html lang="zh-CN">
++<head>
++  <meta charset="utf-8">
++  <title>Echo 页面</title>
++  <style>
++    body { font-family: "Segoe UI", sans-serif; margin: 24px; background: transparent; color: var(--sp-fg, #ddd); }
++    h1 { font-size: 16px; margin: 0 0 12px; }
++    input { width: 100%; box-sizing: border-box; padding: 6px 10px; margin-bottom: 8px; }
++    button { padding: 6px 16px; cursor: pointer; }
++    pre { white-space: pre-wrap; word-break: break-all; background: rgba(128,128,128,.15); padding: 10px; border-radius: 6px; min-height: 60px; }
++  </style>
++</head>
++<body>
++  <h1>Echo 页面（spark.rpc 回显）</h1>
++  <input id="text" placeholder="输入任意文本，回车或点发送" />
++  <button id="send">发送</button>
++  <pre id="out">（插件 exe 未收到任何调用前不会启动）</pre>
++  <script>
++    const out = document.getElementById('out');
++    async function send() {
++      const text = document.getElementById('text').value;
++      try {
++        // 首次调用会触发 host 懒启动插件 exe 并完成握手
++        const r = await spark.rpc('echo', { text, at: Date.now() });
++        out.textContent = JSON.stringify(r, null, 2);
++      } catch (e) {
++        out.textContent = '错误: ' + ((e && e.message) || e);
++      }
++    }
++    document.getElementById('send').addEventListener('click', send);
++    document.getElementById('text').addEventListener('keydown', (e) => {
++      if (e.key === 'Enter') send();
++    });
++    // 窗口标题由页面自定（spark.window 能力宿主本地处理）
++    spark.window.setTitle('Echo 页面').catch(() => {});
++  </script>
++</body>
++</html>

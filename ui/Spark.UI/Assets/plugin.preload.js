@@ -133,6 +133,13 @@
       clear: function () { return call('db', 'clear'); }
     },
 
+    // native 纯应用插件专属：调用插件 exe 的自定义逻辑（host 经 plugin.page RPC
+    // 转发，返回插件自定义 JSON）。不设权限——exe 与页面同源同信任级；
+    // webview 插件调用会得到 UNAVAILABLE（没有 exe 可转发）。
+    rpc: function (method, args) {
+      return call('rpc', String(method || ''), args === undefined ? null : args);
+    },
+
     // 以下能力 host 端尚未实现：preload 提供 API 桩，调用统一返回 UNAVAILABLE。
     // 这样开发者照规范写不会拿到 TypeError，而是清晰的“未实现”错误。
     net: {

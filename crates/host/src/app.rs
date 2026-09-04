@@ -9,7 +9,7 @@ use spark_core::{ensure_data_dir, Action, Candidate, Query, Source};
 use spark_index::{AppIndex, SearchIndex};
 use spark_ipc::{InvokeParams, InvokeResult, PluginApiParams, TrustedPubkeyEntry};
 use spark_plugin_manager::{
-    KeyKind, KeywordMatch, NativeSearchRequest, PluginInfo, PluginInstallOutcome, PluginManager,
+    KeyKind, KeywordMatch, NativePageRequest, PluginInfo, PluginInstallOutcome, PluginManager,
     PluginOpenInfo, TrustedKey,
 };
 use std::borrow::Cow;
@@ -80,26 +80,42 @@ impl HostApp {
     }
 }
 
-/// IPC 搜索三段式的锁内准备结果（PERF-SEARCH ③）。
+/// IPC 搜索三段式的锁内准备结果。
 pub struct SearchPrep {
     pub hits: Vec<Candidate>,
-    /// native 命中快照；调用方放锁后 `execute`（≤300ms），再并回 hits。
-    pub native: Option<NativeSearchRequest>,
     /// 生效 limit（params.limit==0 时取 config.max_results；锁内定好免二次取锁）。
     pub limit: u32,
 }
 
+/// `plugin_api` 的执行计划：`Done` = 已在 host 锁内完成、data 即回包；
+/// `NativePage` = native 页面转发请求，调用方**放锁后** `execute`（native RPC
+/// 等待最坏 15s，绝不占 host 锁）。
+pub enum PluginApiOutcome {
+    Done(serde_json::Value),
+    NativePage(NativePageRequest),
+}
+
+/// 手动实现 Debug：deferred 请求持有子进程句柄（不可 derive），委托其手动 Debug。
+impl std::fmt::Debug for PluginApiOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Done(v) => f.debug_tuple("Done").field(v).finish(),
+            Self::NativePage(req) => f.debug_tuple("NativePage").field(req).finish(),
+        }
+    }
+}
+
 impl HostApp {
-    /// 搜索核心（调用方持有 host 锁）：索引 + 内置命令 + webview 关键字/前缀候选。
-    /// 不含 native RPC——native RPC 最坏可达秒级，必须留在全局锁外（③-a）。
+    /// 搜索核心（调用方持有 host 锁）：索引 + 内置命令 + 插件关键字/前缀候选
+    /// （webview 与 native 的 page 模式同构；native 候选同样只开页面窗口）。
     fn search_core(&mut self, text: &str) -> Vec<Candidate> {
         let q = Query {
             text: text.into(),
             limit: self.config.max_results,
         };
         let mut hits = self.index.search(&q);
-        // 插件关键字路由：命中 webview 插件的 keyword feature 时，在结果最前
-        // 插入一个 page-mode 候选项，UI 见 target="plugin:page:<id>" 即开插件窗口。
+        // 插件关键字路由：命中插件（webview/native）的 keyword feature 时，在结果
+        // 最前插入一个 page-mode 候选项，UI 见 target="plugin:page:<id>" 即开插件窗口。
         let mut next_top = 0usize; // 前缀建议紧跟精确命中之后（都排在应用结果前面）
         if let Some(m) = self.plugins.find_keyword_match(text) {
             if let Some(cand) = self.build_plugin_candidate(&m) {
@@ -120,39 +136,20 @@ impl HostApp {
         hits
     }
 
-    /// 同步搜索（`--query` 诊断模式 / invoke 兜底路径）：native 命中时阻塞等待
-    /// （既有语义：懒启动 + 5s + 失败即杀）。IPC 搜索路径改走 `search_prep` 三段式。
+    /// 同步搜索（`--query` 诊断模式 / invoke 兜底路径）。
     pub fn search(&mut self, text: &str) -> Vec<Candidate> {
-        let mut hits = self.search_core(text);
-        // native 插件（mode:list）：命中关键字时把插件返回的结果项并入列表。
-        // 诊断/兜底路径允许阻塞等待；超时/崩溃自动降级为空结果。
-        if let Some(m) = self.plugins.find_native_match(text) {
-            let result =
-                self.plugins
-                    .native_query_blocking(&m.plugin_id, &m.input, self.config.max_results);
-            hits.extend(result.items);
-        }
-        hits
+        self.search_core(text)
     }
 
-    /// IPC 搜索三段式的锁内段：核心搜索 + native 命中快照 + 生效 limit。
-    /// 调用方随后**放锁**执行 native RPC，再合并截断（见 ipc_server host.query）。
+    /// IPC 搜索三段式的锁内段：核心搜索 + 生效 limit。
     pub fn search_prep(&mut self, text: &str, client_limit: u32) -> SearchPrep {
         let hits = self.search_core(text);
-        let native = self.plugins.find_native_match(text).and_then(|m| {
-            self.plugins
-                .native_search_request(&m.plugin_id, &m.input, self.config.max_results)
-        });
         let limit = if client_limit == 0 {
             self.config.max_results
         } else {
             client_limit.min(self.config.max_results)
         };
-        SearchPrep {
-            hits,
-            native,
-            limit,
-        }
+        SearchPrep { hits, limit }
     }
 
     /// 由关键字匹配构造一个 page-mode 候选项。
@@ -239,15 +236,6 @@ impl HostApp {
                     .find(|c| c.id == params.item_id)
             })
             .ok_or_else(|| anyhow::anyhow!("item not found: {}", params.item_id))?;
-
-        // native 插件结果项：plugin_id 命中 native 插件时走 native_invoke，
-        // 不经 shell/索引（native 项 target 通常为空）。
-        if let Some(pid) = item.plugin_id.as_deref() {
-            if self.plugins.native_plugin(pid).is_some() {
-                let result = self.plugins.native_invoke(pid, params.clone())?;
-                return Ok(result);
-            }
-        }
 
         let action = if params.action_id.is_empty() {
             "open"
@@ -361,6 +349,16 @@ impl HostApp {
         Ok(self.plugins.open(id)?)
     }
 
+    /// 插件页面窗口关闭通知（UI → host）：native 纯应用插件的 exe 生命周期与页面
+    /// 绑定——关窗即优雅关停进程，"不打开就是不用"。webview 插件无进程，无操作。
+    ///
+    /// 不看 `enabled`：禁用流程先 toggle 再关窗，关停请求到达时插件可能已
+    /// disabled——关停对未运行进程是幂等 no-op，闸门只会造成进程泄漏。
+    /// fire-and-forget（不等待、不占 host 锁）：覆盖更新/卸载路径另有同步关停兜底。
+    pub fn plugin_page_closed(&self, id: &str) {
+        self.plugins.native_shutdown_plugin(id);
+    }
+
     /// 更换插件目录并迁移；同步写回 config.plugins_dir 并保存。
     pub fn plugin_set_dir(&mut self, path: &str, migrate: bool) -> Result<()> {
         let new_dir = PathBuf::from(path);
@@ -376,9 +374,11 @@ impl HostApp {
         self.plugins.plugins_dir()
     }
 
-    /// `spark.*` 特权能力桥：校验声明+授权后执行 clipboard/notify/db。
-    /// 返回值的 data 字段直接回传给插件页 JS。
-    pub fn plugin_api(&mut self, params: &PluginApiParams) -> Result<serde_json::Value> {
+    /// `spark.*` 特权能力桥的**锁内准备段**：校验声明+授权后执行 clipboard/notify/db；
+    /// native `rpc` 只做快照构造返回 deferred 请求，由调用方**放锁后**
+    /// `NativePageRequest::execute`——native RPC 等待（懒启动最坏 15s）绝不占
+    /// host 锁（native.rs 模块注释的锁序纪律）。
+    pub fn plugin_api(&mut self, params: &PluginApiParams) -> Result<PluginApiOutcome> {
         let declared = self.plugins.declared_permissions(&params.plugin_id);
         let granted = self.plugins.granted(&params.plugin_id);
         // 权限必须清单声明且用户授权（db 默认开放）。
@@ -386,22 +386,42 @@ impl HostApp {
             |perm: &str| declared.iter().any(|p| p == perm) && granted.iter().any(|p| p == perm);
 
         match params.capability.as_str() {
-            "db" => Ok(self.plugins.plugin_db(
+            "db" => Ok(PluginApiOutcome::Done(self.plugins.plugin_db(
                 &params.plugin_id,
                 &params.method,
                 params.args.clone(),
-            )?),
+            )?)),
             "clipboard" => {
                 if !has("clipboard") {
                     bail!("PERMISSION_DENIED: clipboard");
                 }
-                self.plugin_api_clipboard(&params.method, &params.args)
+                Ok(PluginApiOutcome::Done(
+                    self.plugin_api_clipboard(&params.method, &params.args)?,
+                ))
             }
             "notify" => {
                 if !has("notify") {
                     bail!("PERMISSION_DENIED: notify");
                 }
-                self.plugin_api_notify(&params.args)
+                Ok(PluginApiOutcome::Done(
+                    self.plugin_api_notify(&params.args)?,
+                ))
+            }
+            "rpc" => {
+                // native 纯应用模型专属：页面 spark.rpc → host → 插件 exe 的
+                // plugin.page。不设新权限——native exe 本就拥有完整 OS 能力，
+                // 页面与 exe 同源同信任级（与 db 默认开放同理由）；
+                // webview 插件没有 exe，明确 UNAVAILABLE 而非静默失败。
+                match self.plugins.native_page_request(
+                    &params.plugin_id,
+                    &params.method,
+                    params.args.clone(),
+                ) {
+                    Ok(req) => Ok(PluginApiOutcome::NativePage(req)),
+                    // 错误码语义与 preload 的 ClassifyError 对齐：不可用类失败
+                    // 统一 UNAVAILABLE 前缀。
+                    Err(e) => bail!("UNAVAILABLE: {e}"),
+                }
             }
             other => bail!("UNAVAILABLE: capability {other}"),
         }
@@ -548,12 +568,19 @@ mod tests {
 
     /// 空 app 索引的 HostApp：只测 search 的插件候选插入粘合，不建真实 Start Menu 索引。
     fn host_with_empty_index() -> HostApp {
+        host_with_dirs(
+            PathBuf::from("./__tests_plugins"),
+            PathBuf::from("./__tests_data"),
+        )
+    }
+
+    /// 同上，但插件/数据目录由调用方指定：会写 enabled/granted 状态的测试必须用
+    /// 独立 data 目录——PluginState 持久化在 data/plugins-state.json，共享目录会让
+    /// 测试间/多次运行互相污染（先跑的 disable 毒化后跑的 enabled 断言）。
+    fn host_with_dirs(plugins: PathBuf, data: PathBuf) -> HostApp {
         HostApp {
             index: AppIndex::new(),
-            plugins: PluginManager::with_dirs(
-                PathBuf::from("./__tests_plugins"),
-                PathBuf::from("./__tests_data"),
-            ),
+            plugins: PluginManager::with_dirs(plugins, data),
             config: HostConfig::default(),
             tray: None,
         }
@@ -569,6 +596,91 @@ mod tests {
             .load_dev_dir(&tmp.join("com.spark.trl"))
             .unwrap();
         app
+    }
+
+    /// native 纯应用插件 fixture（page 模型：无 commands，必有 page + 占位 html；
+    /// 可选 features 关键字——native 的搜索框入口）。
+    fn write_native_page_plugin(dir: &Path, id: &str) {
+        write_native_page_plugin_kw(dir, id, None);
+    }
+
+    fn write_native_page_plugin_kw(dir: &Path, id: &str, keyword: Option<&str>) {
+        fs::create_dir_all(dir).unwrap();
+        let features = match keyword {
+            Some(kw) => format!(
+                r#", "features": [{{ "type": "keyword", "keyword": "{kw}", "title": "N", "mode": "page" }}]"#
+            ),
+            None => String::new(),
+        };
+        let json = format!(
+            r#"{{ "id": "{id}", "name": "N", "version": "0.1.0", "api_version": 2,
+                 "runtime": "native", "main": "{id}.exe", "page": "page.html"{features} }}"#
+        );
+        fs::write(dir.join("plugin.json"), json).unwrap();
+        fs::write(dir.join("page.html"), "<html></html>").unwrap();
+    }
+
+    fn api_params(plugin_id: &str, capability: &str, method: &str) -> PluginApiParams {
+        PluginApiParams {
+            plugin_id: plugin_id.into(),
+            capability: capability.into(),
+            method: method.into(),
+            args: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn plugin_api_rpc_returns_deferred_for_native_only() {
+        // rpc 准备段：native 插件返回 deferred 请求（等待在锁外执行，本测试不执行）；
+        // webview 插件无 exe 可转发，明确 UNAVAILABLE。
+        let tmp = std::env::temp_dir().join("spark_host_rpc_deferred");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut app = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
+        write_native_page_plugin(&tmp.join("com.spark.np"), "com.spark.np");
+        app.plugins.load_dev_dir(&tmp.join("com.spark.np")).unwrap();
+
+        let outcome = app
+            .plugin_api(&api_params("com.spark.np", "rpc", "get_config"))
+            .unwrap();
+        assert!(matches!(outcome, PluginApiOutcome::NativePage(_)));
+
+        // disabled 的 native 插件：准备段即 UNAVAILABLE（旧页面在途调用由关窗 shutdown 收尾）。
+        let mut app2 = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
+        app2.plugins
+            .load_dev_dir(&tmp.join("com.spark.np"))
+            .unwrap();
+        app2.plugins.set_enabled("com.spark.np", false).unwrap();
+        let err2 = app2
+            .plugin_api(&api_params("com.spark.np", "rpc", "get_config"))
+            .unwrap_err();
+        assert!(err2.to_string().contains("UNAVAILABLE"), "{err2}");
+
+        // webview 插件无 exe 可转发：UNAVAILABLE（独立 data 目录，防 state 污染）。
+        let mut app3 = host_with_dirs(tmp.join("plugins"), tmp.join("data3"));
+        write_webview_plugin(&tmp.join("com.spark.wv"), "com.spark.wv", "wv");
+        app3.plugins
+            .load_dev_dir(&tmp.join("com.spark.wv"))
+            .unwrap();
+        let err3 = app3
+            .plugin_api(&api_params("com.spark.wv", "rpc", "get_config"))
+            .unwrap_err();
+        assert!(err3.to_string().contains("UNAVAILABLE"), "{err3}");
+    }
+
+    #[test]
+    fn plugin_page_closed_ignores_enabled_gate() {
+        // 关窗关停不看 enabled：禁用流程先 toggle 再关窗，闸门会造成进程泄漏。
+        // 关停对未运行进程是幂等 no-op——断言点是无闸门可调用且不 panic。
+        let tmp = std::env::temp_dir().join("spark_host_page_closed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut app = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
+        write_native_page_plugin(&tmp.join("com.spark.np"), "com.spark.np");
+        app.plugins.load_dev_dir(&tmp.join("com.spark.np")).unwrap();
+        app.plugins.set_enabled("com.spark.np", false).unwrap();
+
+        app.plugin_page_closed("com.spark.np"); // disabled 仍发出关停（fire-and-forget）
+        app.plugin_page_closed("com.spark.absent"); // 未知 id 同样 no-op 不 panic
+        app.plugin_page_closed("com.spark.wv-none"); // webview/未知 id 无操作
     }
 
     #[test]
@@ -610,5 +722,40 @@ mod tests {
         assert_eq!(hits[1].id, "plugin:com.spark.trl:翻译器");
         assert_eq!(hits[2].id, "plugin:com.spark.zn:翻译指南");
         assert!(hits[0].score > hits[1].score && hits[1].score > hits[2].score);
+    }
+
+    #[test]
+    fn search_native_keyword_candidate_opens_page() {
+        // native 的 features（page 模式）关键字与 webview 同构地进搜索：精确命中
+        // 置顶、target 指向同一套 plugin:page 开窗路由；无关键字 native 不产候选。
+        let tmp = std::env::temp_dir().join("spark_host_kw_native");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut app = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
+        write_native_page_plugin_kw(&tmp.join("com.spark.np"), "com.spark.np", Some("echo"));
+        write_native_page_plugin(&tmp.join("com.spark.bare"), "com.spark.bare");
+        app.plugins.load_dev_dir(&tmp.join("com.spark.np")).unwrap();
+        app.plugins
+            .load_dev_dir(&tmp.join("com.spark.bare"))
+            .unwrap();
+
+        let hits = app.search("echo");
+        assert_eq!(hits[0].id, "plugin:com.spark.np:echo");
+        assert_eq!(hits[0].score, 100.0);
+        assert_eq!(hits[0].target.as_deref(), Some("plugin:page:com.spark.np"));
+        assert_eq!(hits[0].source, Source::Plugin);
+
+        // 前缀建议同样适用。
+        let hits = app.search("ech");
+        assert_eq!(hits[0].id, "plugin:com.spark.np:echo");
+
+        // 无 features 的 native：不产候选（页面走卡片「打开」）。
+        assert!(app
+            .search("bare")
+            .iter()
+            .all(|c| c.source != Source::Plugin));
+
+        // 带参候选：input 语义与 webview 一致（UI 拆 "echo hi" → input="hi"）。
+        let hits = app.search("echo hi");
+        assert_eq!(hits[0].id, "plugin:com.spark.np:echo");
     }
 }
