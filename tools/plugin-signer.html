@@ -6,18 +6,21 @@
 <title>Spark 官方插件签名工具</title>
 <!--
   Spark 插件签名工具（Web 版）— 三期
-  
+
   产出与 crates/sign-tool (spark-sign CLI) 字节级一致的 signature.json：
     - canonical bytes 逐字节移植自 crates/plugin-manager/src/signing/canon.rs
     - Ed25519 用 @noble/ed25519（与 ed25519-dalek 同为 RFC 8032，签名一致）
     - SHA-256 用浏览器 Web Crypto
     - 私钥 = base64(32 字节 seed)，与 spark-sign keygen 写出的 .key 文件同格式
-  
+
   两种取文件方式：
-    1) GitHub 官方仓库（硬编码 MrHan-Yd/spark-plugins）：填分支 + 插件版本目录路径，
-       页面经 GitHub API 抓文件（CORS 已开），签完可下载或用 PAT 直接 commit 回该仓库。
+    1) 官方仓库（可切 GitHub / Gitee 镜像，均硬编码）：
+       - GitHub：API trees 列文件 + raw.githubusercontent.com 抓字节；CORS 官方放开
+       - Gitee：API v5 trees 列文件 + contents API 抓 base64（gitee.com raw 链路无
+         Access-Control-Allow-Origin，浏览器 fetch 会被 CORS 拦，必须走 API 域名）
+       签完可下载；GitHub 可用 PAT 直接 commit 回仓库，Gitee 同理（Gitee PAT）。
     2) 本地目录：用文件夹选择器选插件目录，完全离线（仅需 CDN 加载一次 ed25519 库）。
- 
+
   仅供官方签名者本机自用。私钥只在浏览器内存，签完不落盘（除非勾“记住”）。
 -->
 <script type="importmap">
@@ -582,6 +585,19 @@
     font-size: 11px;
   }
 
+  /* 面板来源切换过渡：旧面板淡出上移 → 新面板自下淡入（与 cardSlideUp 同 easing 语言）。
+     display:none 无法过渡，故走两段式：先 .pane-out 播完落定 hidden，再对入场面板挂 .pane-in；
+     animationend 后移除 .pane-in，保证下次切换重新触发。 */
+  .pane-out { animation: paneOut 0.14s ease both; }
+  .pane-in  { animation: paneIn 0.26s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  @keyframes paneOut {
+    to { opacity: 0; transform: translateY(-6px); }
+  }
+  @keyframes paneIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+  }
+
   .hidden { display: none !important; }
 </style>
 </head>
@@ -595,13 +611,18 @@
   </div>
 
   <div class="card">
-    <div class="seg" role="tablist" aria-label="文件来源">
-      <button type="button" id="srcGithub" class="active" data-src="github">GitHub 仓库</button>
+    <div class="seg" id="srcSeg" role="tablist" aria-label="文件来源">
+      <button type="button" id="srcGithub" class="active" data-src="repo">官方仓库</button>
       <button type="button" id="srcLocal" data-src="local">本地目录</button>
     </div>
 
-    <!-- GitHub 模式（官方仓库硬编码） -->
+    <!-- 官方仓库模式（GitHub / Gitee 可切换，仓库均硬编码） -->
     <div id="githubPane">
+      <label style="margin-top:2px">仓库平台</label>
+      <div class="seg" id="repoSeg" role="tablist" aria-label="仓库平台" style="margin-bottom:6px">
+        <button type="button" class="active" data-plat="github">GitHub</button>
+        <button type="button" data-plat="gitee">Gitee</button>
+      </div>
       <div class="row">
         <div>
           <label for="branch">分支 (Branch)</label>
@@ -612,8 +633,8 @@
           <input id="path" placeholder="translate/0.2.0" autocomplete="off">
         </div>
       </div>
-      <div class="hint">仅签官方仓库 <code>MrHan-Yd/spark-plugins</code>（工具已硬编码，不签其他仓库）。路径指到包含 <code>plugin.json</code> 的那一层。签的是该目录下所有文件（<code>signature.json</code> 自身除外），路径以该目录为根的 POSIX 相对路径。签名对象 = 仓库内字节，请确保发布/安装的插件文件与所签仓库字节逐字节一致（勿在发布流程里做换行/编码转换，否则 host 重算哈希会判 Invalid）。</div>
-      <label for="token">GitHub Token（可选：提高 API 限额 + 允许签完直接 commit 回官方仓库）</label>
+      <div class="hint" id="repoHint">仅签官方仓库（工具已硬编码，不签其他仓库）。路径指到包含 <code>plugin.json</code> 的那一层。签的是该目录下所有文件（<code>signature.json</code> 自身除外），路径以该目录为根的 POSIX 相对路径。签名对象 = 仓库内字节，请确保发布/安装的插件文件与所签仓库字节逐字节一致（勿在发布流程里做换行/编码转换，否则 host 重算哈希会判 Invalid）。Gitee 为 GitHub 官方仓库的镜像，两边字节应一致；任一平台签出的 signature.json 通用。</div>
+      <label for="token" id="tokenLabel">GitHub Token（可选：提高 API 限额 + 允许签完直接 commit 回官方仓库）</label>
       <input id="token" type="password" placeholder="ghp_...（留空走匿名限额 60 次/小时）" autocomplete="off">
     </div>
 
@@ -762,31 +783,41 @@ function buildSigJson(pluginId, version, keyId, files, sigB64){
 // ── ISO 8601 UTC（秒精度，与 spark-sign now_iso8601_utc 一致）───────────────
 //   已在 buildSigJson 内用 toISOString().slice(0,19)+"Z" 实现。
 
-// ── 官方仓库常量：签名对象恒为 spark-plugins，不签其他仓库 ────────────────
-const OFFICIAL_OWNER = "MrHan-Yd";
-const OFFICIAL_REPO = "spark-plugins";
+// ── 官方仓库常量：签名对象恒为 spark-plugins 官方仓库，不签其他仓库 ──────────
+//   gitee 为 GitHub 官方仓库的镜像；两边字节一致，签出的 signature.json 通用。
+const OFFICIAL = {
+  github: { owner: "MrHan-Yd",    repo: "spark-plugins" },
+  gitee:  { owner: "han-yongding", repo: "spark-plugins" },
+};
+let repoPlat = "github"; // "github" | "gitee"
 
-// ── 取文件：GitHub 官方仓库 ─────────────────────────────────────────────────
-async function listGithubTree(branch, token){
-  const headers = { "Accept": "application/vnd.github+json" };
-  if (token) headers["Authorization"] = "Bearer " + token;
-  const url = `https://api.github.com/repos/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
+// ── 取文件：官方仓库（GitHub / Gitee）───────────────────────────────────────
+async function listRepoTree(branch, token){
+  const gitee = repoPlat === "gitee";
+  const { owner, repo } = OFFICIAL[repoPlat];
+  const headers = { "Accept": "application/json" };
+  if (token) headers["Authorization"] = "Bearer " + token;  // Gitee PAT 同样吃 Bearer 头
+  const url = gitee
+    ? `https://gitee.com/api/v5/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`
+    : `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
   const r = await fetch(url, { headers });
-  if (r.status === 404) throw new Error(`仓库或分支不存在：${OFFICIAL_OWNER}/${OFFICIAL_REPO}@${branch}`);
-  if (!r.ok) throw new Error(`GitHub trees API ${r.status}: ${(await r.text()).slice(0,200)}`);
+  if (r.status === 404) throw new Error(`仓库或分支不存在：${owner}/${repo}@${branch}`);
+  if (!r.ok) throw new Error(`${gitee ? "Gitee" : "GitHub"} trees API ${r.status}: ${(await r.text()).slice(0,200)}`);
   const data = await r.json();
   // truncated=true 表示树过大被截断，缺文件会让签出的签名在 host 侧判 Invalid。直接失败而非静默继续。
-  if (data.truncated) throw new Error("仓库树过大被 GitHub 截断（truncated），本工具暂只支持中小仓库；请缩小路径范围或拆分仓库");
+  if (data.truncated) throw new Error("仓库树过大被截断（truncated），本工具暂只支持中小仓库；请缩小路径范围或拆分仓库");
   return data.tree || [];
 }
 
-async function fetchGithubFiles(){
-  const branch = $("branch").value.trim() || "main";
+async function fetchRepoFiles(){
+  const gitee = repoPlat === "gitee";
+  const { owner, repo } = OFFICIAL[repoPlat];
+  const branch = $("branch").value.trim() || "master";
   const path = $("path").value.trim().replace(/^\/+|\/+$/g, "");
   const token = $("token").value.trim();
   if (!path) throw new Error("请填插件版本目录路径");
-  log(`拉取 ${OFFICIAL_OWNER}/${OFFICIAL_REPO} @ ${branch} 下 ${path}/ …`);
-  const tree = await listGithubTree(branch, token);
+  log(`拉取 ${owner}/${repo} (${repoPlat}) @ ${branch} 下 ${path}/ …`);
+  const tree = await listRepoTree(branch, token);
   const prefix = path + "/";
   const blobs = tree.filter(e => e.type === "blob" && e.path.startsWith(prefix));
   if (!blobs.length) throw new Error(`目录 ${path}/ 下没有文件，确认路径与分支`);
@@ -794,16 +825,33 @@ async function fetchGithubFiles(){
   for (const b of blobs){
     const rel = b.path.slice(prefix.length); // POSIX 相对路径
     if (rel === "signature.json") continue;  // 签名不含自身
-    // raw.githubusercontent.com 发 access-control-allow-origin: *。
-    // 必须检查状态码：非 2xx 的错误页字节若混入哈希，自验仍过但 host 重算磁盘文件会判 Invalid。
-    const raw = `https://raw.githubusercontent.com/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/${branch}/${encodeURIComponent(b.path).replace(/%2F/g, "/")}`;
-    const resp = await fetch(raw);
-    if (!resp.ok) throw new Error(`拉取文件失败 ${resp.status}：${rel}（${b.path}）`);
-    const bytes = new Uint8Array(await resp.arrayBuffer());
+    let bytes;
+    if (gitee){
+      // gitee.com 的 raw 链路响应无 Access-Control-Allow-Origin，浏览器 fetch 必被 CORS 拦；
+      // 走同一 API 域名（api/v5 带 ACAO: *）的 contents 接口取 base64 字节，语义等价。
+      const api = `https://gitee.com/api/v5/repos/${owner}/${repo}/contents/${encodeGiteePath(b.path)}?ref=${encodeURIComponent(branch)}`;
+      const resp = await fetch(api, token ? { headers: { "Authorization": "Bearer " + token } } : undefined);
+      if (!resp.ok) throw new Error(`拉取文件失败 ${resp.status}：${rel}（${b.path}）`);
+      const j = await resp.json();
+      if (j.encoding !== "base64" || typeof j.content !== "string") throw new Error(`contents API 返回异常：${rel}（无 base64 内容）`);
+      bytes = b64ToBytes(j.content);
+    }else{
+      // raw.githubusercontent.com 发 access-control-allow-origin: *。
+      // 必须检查状态码：非 2xx 的错误页字节若混入哈希，自验仍过但 host 重算磁盘文件会判 Invalid。
+      const raw = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${encodeURIComponent(b.path).replace(/%2F/g, "/")}`;
+      const resp = await fetch(raw);
+      if (!resp.ok) throw new Error(`拉取文件失败 ${resp.status}：${rel}（${b.path}）`);
+      bytes = new Uint8Array(await resp.arrayBuffer());
+    }
     files.push({ path: rel, bytes, sha256: await sha256Hex(bytes), size: bytes.length });
   }
   state.sigPath = path + "/signature.json";
   return files;
+}
+
+// Gitee contents API 的路径段编码：保留 "/"（路径分隔符不转义，与 raw 链路一致）
+function encodeGiteePath(p){
+  return p.split("/").map(encodeURIComponent).join("/");
 }
 
 // ── 取文件：本地目录 ─────────────────────────────────────────────────────────
@@ -867,8 +915,8 @@ async function doSign(){
     const seed = b64ToBytes(privB64);
     if (seed.length !== 32) throw new Error(`私钥应解码为 32 字节，实际 ${seed.length}（确认是 spark-sign keygen 产出的 .key）`);
 
-    const src = document.querySelector(".seg button.active").dataset.src;
-    const files = src === "github" ? await fetchGithubFiles() : await fetchLocalFiles();
+    const src = document.querySelector("#srcSeg button.active").dataset.src;
+    const files = src === "repo" ? await fetchRepoFiles() : await fetchLocalFiles();
     if (!files.length) throw new Error("没有可签名的文件");
     // host 验签要求 files[] 含 plugin.json 且与磁盘双向校验；缺 plugin.json 签出来必判 Invalid，直接阻断。
     if (!files.some(f => f.path === "plugin.json")) throw new Error("目录下必须有 plugin.json（host 验签要求清单含 plugin.json）");
@@ -899,7 +947,7 @@ async function doSign(){
     $("outCard").classList.remove("hidden");
     $("downloadBtn").disabled = false;
     $("copyBtn").disabled = false;
-    if (src === "github" && $("token").value.trim()) $("commitBtn").disabled = false;
+    if (src === "repo" && $("token").value.trim()) $("commitBtn").disabled = false;
 
     ok(`签名完成：${pluginId} @ ${version}，key_id=${keyId}，${files.length} 个文件，签名 ${sigB64.slice(0,16)}…`);
     log(`signature.json 目标路径：${state.sigPath || "（本地模式，请自行放入插件目录）"}`);
@@ -925,20 +973,26 @@ function download(){
   ok("已下载 signature.json，放到插件目录根（与 plugin.json 同级）");
 }
 
-// ── commit 回官方仓库 ──────────────────────────────────────────────────────
+// ── commit 回官方仓库（GitHub / Gitee 均走各自 contents API）────────────────
 async function commitBack(){
   clearLog();
   try{
+    const gitee = repoPlat === "gitee";
+    const { owner, repo } = OFFICIAL[repoPlat];
     const token = $("token").value.trim();
-    if (!token) throw new Error("commit 需要 GitHub Token");
-    const branch = $("branch").value.trim() || "main";
+    if (!token) throw new Error(gitee ? "commit 需要 Gitee Token（私人令牌）" : "commit 需要 GitHub Token");
+    const branch = $("branch").value.trim() || "master";
     const path = $("path").value.trim().replace(/^\/+|\/+$/g, "");
     const fullPath = `${path}/signature.json`;
-    const headers = { "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json" };
+    const headers = { "Authorization": "Bearer " + token, "Accept": "application/json" };
+    // Gitee API v5 与 GitHub contents API 同构（base 差异）；Gitee 路径段保留 "/" 不转义
+    const contentBase = gitee
+      ? `https://gitee.com/api/v5/repos/${owner}/${repo}/contents/${encodeGiteePath(fullPath)}`
+      : `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(fullPath)}`;
 
     // 取已存在文件的 sha（覆盖更新需要）；404 视为新增
     let sha = null;
-    const exist = await fetch(`https://api.github.com/repos/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/contents/${encodeURIComponent(fullPath)}?ref=${encodeURIComponent(branch)}`, { headers });
+    const exist = await fetch(`${contentBase}?ref=${encodeURIComponent(branch)}`, { headers });
     if (exist.ok){ const j = await exist.json(); sha = j.sha; }
     else if (exist.status !== 404) warn(`查询已有文件返回 ${exist.status}，尝试按新增提交`);
 
@@ -948,32 +1002,80 @@ async function commitBack(){
       branch,
     };
     if (sha) body.sha = sha;
-    const r = await fetch(`https://api.github.com/repos/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/contents/${encodeURIComponent(fullPath)}`, {
-      method: "PUT", headers, body: JSON.stringify(body),
+    // 覆盖更新两者都是 PUT；新增时 GitHub 走 PUT、Gitee 走 POST（API v5 语义）
+    const r = await fetch(contentBase, {
+      method: sha ? "PUT" : (gitee ? "POST" : "PUT"),
+      headers, body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(`commit ${r.status}: ${(await r.text()).slice(0,300)}`);
     const j = await r.json();
-    ok(`已 commit 到 ${fullPath}`);
-    log(`commit: ${j.commit.html_url || j.content?.html_url || "(见仓库)"}`);
+    ok(`已 commit 到 ${owner}/${repo} @ ${branch} 的 ${fullPath}`);
+    log(`commit: ${j.commit?.html_url || j.content?.html_url || "(见仓库)"}`);
   }catch(e){ fail(e.message || String(e)); console.error(e); }
 }
 
-// ── 切换来源 / 记忆私钥 / 事件绑定 ─────────────────────────────────────────
+// ── 切换来源 / 切换仓库平台 / 记忆私钥 / 事件绑定 ───────────────────────────
+let srcTimer = 0; // 面板切换淡出计时器（连点中断时先落定上一轮，再开新一轮）
 function switchSrc(src){
-  document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("active", b.dataset.src === src));
-  $("githubPane").classList.toggle("hidden", src !== "github");
-  $("localPane").classList.toggle("hidden", src !== "local");
+  const showPane = src === "repo" ? $("githubPane") : $("localPane");
+  const hidePane = src === "repo" ? $("localPane") : $("githubPane");
+  document.querySelectorAll("#srcSeg button").forEach(b => b.classList.toggle("active", b.dataset.src === src));
   $("commitBtn").disabled = true;
   refreshSignBtn();
+  clearTimeout(srcTimer); srcTimer = 0;
+  // 落定上一轮被中断的淡出：按本轮意图归位（本轮要显示的面板保留可见，其余收起）
+  document.querySelectorAll(".pane-out").forEach(el => {
+    el.classList.remove("pane-out");
+    if (el !== showPane) el.classList.add("hidden");
+  });
+  // 入场动画中途反向切换：清掉待收起面板残留的 pane-in（声明序在 pane-out 之后，级联会盖掉淡出动画）
+  hidePane.classList.remove("pane-in");
+  if (hidePane.classList.contains("hidden")){
+    if (showPane.classList.contains("hidden")){
+      // 中断态两面板皆收起：直接补显示目标面板 + 入场动画
+      showPane.classList.remove("hidden");
+      showPane.classList.add("pane-in");
+      showPane.addEventListener("animationend", () => showPane.classList.remove("pane-in"), { once: true });
+    }
+    return; // 已在目标态（含初始 GitHub 可见面）
+  }
+  hidePane.classList.add("pane-out");
+  srcTimer = setTimeout(() => {
+    srcTimer = 0;
+    hidePane.classList.add("hidden");
+    hidePane.classList.remove("pane-out");
+    showPane.classList.remove("hidden");
+    showPane.classList.add("pane-in");
+    showPane.addEventListener("animationend", () => showPane.classList.remove("pane-in"), { once: true });
+  }, 150);
+}
+function switchPlat(p){
+  repoPlat = p;
+  document.querySelectorAll("#repoSeg button").forEach(b => b.classList.toggle("active", b.dataset.plat === p));
+  const gitee = p === "gitee";
+  // token 不跨平台复用：残留的 GitHub PAT 若随 Gitee 请求发出（或反之）等于把凭据送给另一家服务
+  if ($("token").value.trim()){
+    $("token").value = "";
+    log("已清空 token：平台切换后 token 不跨平台复用，commit 前请重新粘贴对应平台的令牌", "warn");
+  }
+  $("tokenLabel").textContent = gitee
+    ? "Gitee Token（可选：提高 API 限额 + 允许签完直接 commit 回仓库）"
+    : "GitHub Token（可选：提高 API 限额 + 允许签完直接 commit 回官方仓库）";
+  $("token").placeholder = gitee
+    ? "Gitee 私人令牌（留空走匿名限额）"
+    : "ghp_...（留空走匿名限额 60 次/小时）";
+  $("commitBtn").disabled = true;
+  log(`已切换仓库平台：${gitee ? "Gitee (han-yongding/spark-plugins 镜像)" : "GitHub (MrHan-Yd/spark-plugins)"}`);
 }
 function refreshSignBtn(){
-  const src = document.querySelector(".seg button.active").dataset.src;
-  const ready = src === "github"
+  const src = document.querySelector("#srcSeg button.active").dataset.src;
+  const ready = src === "repo"
     ? $("path").value.trim()
     : $("folder").files.length > 0;
   $("signBtn").disabled = !ready || !$("privKey").value.trim();
 }
-document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => switchSrc(b.dataset.src)));
+document.querySelectorAll("#srcSeg button").forEach(b => b.addEventListener("click", () => switchSrc(b.dataset.src)));
+document.querySelectorAll("#repoSeg button").forEach(b => b.addEventListener("click", () => switchPlat(b.dataset.plat)));
 ["path","privKey"].forEach(id => $(id).addEventListener("input", refreshSignBtn));
 $("folder").addEventListener("change", refreshSignBtn);
 $("signBtn").addEventListener("click", doSign);
@@ -991,7 +1093,7 @@ $("remember").addEventListener("change", () => {
 $("privKey").addEventListener("input", () => { if ($("remember").checked) localStorage.setItem(KEY_STORE, $("privKey").value); refreshSignBtn(); });
 
 // 就绪提示
-log("就绪。填路径 / 分支 / 私钥后点「拉取文件并签名」（官方仓库已固定为 MrHan-Yd/spark-plugins）。");
+log("就绪。选平台（GitHub/Gitee），填路径 / 分支 / 私钥后点「拉取文件并签名」。");
 if (!crypto.subtle) fail("当前页面不是安全上下文（需 file:// 或 https://localhost），Web Crypto 不可用。");
 </script>
 </body>

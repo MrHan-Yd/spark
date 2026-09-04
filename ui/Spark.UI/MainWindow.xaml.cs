@@ -3906,6 +3906,12 @@ public sealed partial class MainWindow : Window
     private bool _loadingMarket;
     /// <summary>当前仓库索引（zipball_url 等元数据来源），供安装时复用。</summary>
     private RegistryIndexDto? _currentRegistry;
+    /// <summary>内置官方源数量（MarketSourceCombo 前两项）：0=GitHub 官方、1=Gitee 官方，其后为自定义仓库 URL。</summary>
+    private const int OfficialMarketSourceCount = 2;
+    /// <summary>市场源下拉项与 registry URL 的并行表（索引与 Items 对齐），避免把展示文案当 URL 读。</summary>
+    private readonly List<string> _marketSourceUrls = new();
+    /// <summary>当前市场加载所用源的 registry URL（官方门控/安装 zipball 解析依据），随每次加载刷新。</summary>
+    private string _currentMarketSourceUrl = RegistryService.OfficialRegistryUrl;
 
     private sealed class CustomRepoUrlVm : INotifyPropertyChanged
     {
@@ -4073,18 +4079,27 @@ public sealed partial class MainWindow : Window
     {
         MarketSourceCombo.Items.Clear();
         MarketSourceCombo.Items.Add("官方仓库 (GitHub)");
+        MarketSourceCombo.Items.Add("官方仓库 (Gitee)");
+
+        _marketSourceUrls.Clear();
+        _marketSourceUrls.Add(RegistryService.OfficialRegistryUrl);
+        _marketSourceUrls.Add(RegistryService.OfficialRegistryUrlGitee);
 
         _customRepoUrls.Clear();
         foreach (var url in customUrls)
         {
-            if (!string.IsNullOrWhiteSpace(url))
-            {
-                MarketSourceCombo.Items.Add(url.Trim());
-                _customRepoUrls.Add(new CustomRepoUrlVm { Url = url.Trim() });
-            }
+            if (string.IsNullOrWhiteSpace(url)) continue;
+            var trimmed = url.Trim();
+            MarketSourceCombo.Items.Add(trimmed);
+            _marketSourceUrls.Add(trimmed);
+            _customRepoUrls.Add(new CustomRepoUrlVm { Url = trimmed });
         }
         MarketCustomUrlList.ItemsSource = _customRepoUrls;
-        MarketSourceCombo.SelectedIndex = 0;
+
+        // 恢复上次选中的源（官方 Gitee/自定义源均持久化，免每次打开重选）；已失效（配置被清）回退 GitHub 官方
+        var saved = LocalState.Ui.MarketSourceUrl;
+        var idx = _marketSourceUrls.FindIndex(u => string.Equals(u, saved, StringComparison.OrdinalIgnoreCase));
+        MarketSourceCombo.SelectedIndex = idx >= 0 ? idx : 0;
     }
 
     private void OnToggleManageCustomRepos(object sender, RoutedEventArgs e)
@@ -4142,7 +4157,15 @@ public sealed partial class MainWindow : Window
         var idx = MarketSourceCombo.SelectedIndex;
         if (idx < 0) return;
 
-        MarketCustomWarning.Visibility = idx > 0 ? Visibility.Visible : Visibility.Collapsed;
+        var url = idx < _marketSourceUrls.Count ? _marketSourceUrls[idx] : RegistryService.OfficialRegistryUrl;
+        // 三方仓库警告只挂自定义源：内置官方（GitHub/Gitee）的"官方"预判可信，不吓唬用户
+        MarketCustomWarning.Visibility = idx >= OfficialMarketSourceCount ? Visibility.Visible : Visibility.Collapsed;
+        // 记住选择（下次打开市场不重选）；恢复填充时等值跳过写盘
+        if (!string.Equals(LocalState.Ui.MarketSourceUrl, url, StringComparison.OrdinalIgnoreCase))
+        {
+            LocalState.Ui.MarketSourceUrl = url;
+            LocalState.SaveUi();
+        }
         await LoadMarketplaceAsync();
     }
 
@@ -4245,12 +4268,13 @@ public sealed partial class MainWindow : Window
         SetMarketStatus(null);
 
         var idx = MarketSourceCombo.SelectedIndex;
-        var url = (idx > 0 && idx < MarketSourceCombo.Items.Count)
-            ? MarketSourceCombo.Items[idx]?.ToString() ?? RegistryService.OfficialRegistryUrl
+        var url = idx >= 0 && idx < _marketSourceUrls.Count
+            ? _marketSourceUrls[idx]
             : RegistryService.OfficialRegistryUrl;
-        // 官方源门控：只有内置官方仓库的索引 signature 字段才参与"官方"预判，
+        _currentMarketSourceUrl = url;
+        // 官方源门控：内置官方仓库（GitHub/Gitee）的索引 signature 字段才参与"官方"预判，
         // 三方仓库的该字段可伪造（防钓鱼），不预判（规范 Phase 4.4）。
-        var isOfficialSource = string.Equals(url, RegistryService.OfficialRegistryUrl, StringComparison.OrdinalIgnoreCase);
+        var isOfficialSource = RegistryService.IsOfficialRegistryUrl(url);
 
         try
         {
@@ -4390,11 +4414,14 @@ public sealed partial class MainWindow : Window
             }
             else
             {
-                // GitHub 仓库 zipball 提取模式：优先读索引声明的 zipball_url，回退官方地址。
-                // 第三方仓库的 zipball_url 可能过期/写错，下载失败时自动回退官方常量重试一次。
-                var zipballUrl = !string.IsNullOrWhiteSpace(_currentRegistry?.ZipballUrl)
-                    ? _currentRegistry.ZipballUrl
-                    : RegistryService.OfficialZipballUrl;
+                // zipball 提取模式：官方源（GitHub/Gitee）恒用本源内置直链——Gitee 镜像的
+                // zipball_url 指回 GitHub，按索引值走会产生必然失败的下载尝试；
+                // 三方源优先读索引声明的 zipball_url，失败时回退官方直链重试一次。
+                var fallbackZipball = RegistryService.OfficialZipballFor(_currentMarketSourceUrl);
+                var zipballUrl = RegistryService.IsOfficialRegistryUrl(_currentMarketSourceUrl)
+                    || string.IsNullOrWhiteSpace(_currentRegistry?.ZipballUrl)
+                    ? fallbackZipball
+                    : _currentRegistry.ZipballUrl!;
                 var verPath = item.TargetVersion.Path ?? $"{item.Id}/{item.TargetVersion.Version}";
 
                 try
@@ -4405,12 +4432,12 @@ public sealed partial class MainWindow : Window
                         expectedSha256: null,
                         progress: progress);
                 }
-                catch (HttpRequestException ex) when (zipballUrl != RegistryService.OfficialZipballUrl)
+                catch (HttpRequestException ex) when (zipballUrl != fallbackZipball)
                 {
                     App.Log("InstallZipballFallback", ex);
                     lastPct = -1; // 回退地址是新的下载流，进度基线复位，避免条在旧值停滞
                     tempDir = await RegistryService.DownloadAndExtractZipballAsync(
-                        RegistryService.OfficialZipballUrl,
+                        fallbackZipball,
                         verPath,
                         expectedSha256: null,
                         progress: progress);

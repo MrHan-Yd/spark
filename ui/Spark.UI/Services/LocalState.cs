@@ -80,6 +80,9 @@ public sealed class AppUiState
     public int BallY { get; set; } = -1;
     /// <summary>开发者模式（通用设置）：开启后插件页显示调试按钮，插件窗口开放 DevTools。</summary>
     public bool DeveloperMode { get; set; }
+    /// <summary>插件市场当前选中的仓库源（registry.json 完整 URL；"" = 默认 GitHub 官方）。
+    /// 与 host 配置的 PluginRegistryUrls（自定义源清单）分开：这是"当前选中哪个"的 UI 偏好。</summary>
+    public string MarketSourceUrl { get; set; } = "";
 }
 
 public sealed class FavoritesState

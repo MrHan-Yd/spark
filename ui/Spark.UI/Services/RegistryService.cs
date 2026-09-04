@@ -22,6 +22,15 @@ public static class RegistryService
     public const string OfficialRegistryUrl = "https://raw.githubusercontent.com/MrHan-Yd/spark-plugins/master/registry.json";
 
     /// <summary>
+    /// 官方源二（Gitee 镜像仓库，han-yongding/spark-plugins）：国内直连 GitHub 不稳时使用。
+    /// raw 地址会 302 到 raw.giteeusercontent.com 签名 URL（HttpClient 自动跟随）；
+    /// 内容与 GitHub 官方仓库逐插件签名校验兜底，仓库本身不可信面与官方源等同。
+    /// 注意：Gitee 无 CDN 镜像链（国内直连即达），浏览器侧 raw/API 的 CORS 行为不一致，
+    /// 见 tools/plugin-signer.html 的平台说明。
+    /// </summary>
+    public const string OfficialRegistryUrlGitee = "https://gitee.com/han-yongding/spark-plugins/raw/master/registry.json";
+
+    /// <summary>
     /// 官方索引镜像（jsDelivr GitHub CDN）。raw.githubusercontent.com 部分直连线路会被
     /// GitHub 边缘节点直接拒绝（实测稳定返回 HTTP 400），而 jsDelivr 国内直连可达；
     /// 仅在官方地址抓取失败后作为回退候选，内容仍以逐插件签名校验兜底。
@@ -31,6 +40,29 @@ public static class RegistryService
 
     /// <summary>官方仓库 zipball 回退地址（索引未声明 zipball_url 时使用）。</summary>
     public const string OfficialZipballUrl = "https://github.com/MrHan-Yd/spark-plugins/archive/refs/heads/master.zip";
+
+    /// <summary>Gitee 官方仓库 zipball（repository/archive 直链，302 到签名下载地址）。</summary>
+    public const string OfficialZipballUrlGitee = "https://gitee.com/han-yongding/spark-plugins/repository/archive/master.zip";
+
+    /// <summary>
+    /// 内置官方源判定：GitHub 与 Gitee 两个官方仓库的 registry.json URL 之外均视为三方源。
+    /// 决定"官方"角标预判门控（规范 Phase 4.4）。注意 jsDelivr 镜像链仅 GitHub 官方源启用
+    /// （FetchJsonWithFallbackAsync 内自行做 GitHub 精确匹配），Gitee 源不启用镜像。
+    /// </summary>
+    public static bool IsOfficialRegistryUrl(string? url) =>
+        string.Equals(url, OfficialRegistryUrl, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(url, OfficialRegistryUrlGitee, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 按当前市场源的 registry URL 解析本源的官方 zipball 直链。
+    /// 官方源恒用内置常量：Gitee 镜像 registry.json 里的 zipball_url 指回 GitHub，
+    /// 按索引值走会在 Gitee 源下产生必然失败的下载尝试；官方仓库即 zipball 本体，无过期风险。
+    /// 三方源回退 GitHub 官方（保持既有语义）。
+    /// </summary>
+    public static string OfficialZipballFor(string? registryUrl) =>
+        string.Equals(registryUrl, OfficialRegistryUrlGitee, StringComparison.OrdinalIgnoreCase)
+            ? OfficialZipballUrlGitee
+            : OfficialZipballUrl;
 
     private static readonly HttpClient Http = new()
     {
@@ -87,6 +119,7 @@ public static class RegistryService
     {
         if (url.Contains("raw.githubusercontent.com", StringComparison.OrdinalIgnoreCase)) return "raw.githubusercontent.com";
         if (url.Contains("cdn.jsdelivr.net", StringComparison.OrdinalIgnoreCase)) return "jsDelivr 镜像";
+        if (url.Contains("gitee.com", StringComparison.OrdinalIgnoreCase)) return "Gitee";
         if (Uri.TryCreate(url, UriKind.Absolute, out var u)) return u.Host;
         return url;
     }
