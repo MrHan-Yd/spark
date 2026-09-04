@@ -14,6 +14,9 @@
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <SelfContained>true</SelfContained>
+    <!-- 发布期 AOT 预编译（dotnet publish 生效）：冷启动免 JIT，首启/首唤起显著加速。
+         代价是安装包体积约 +50-80MB；开发 dotnet build 路径不受影响。 -->
+    <PublishReadyToRun>true</PublishReadyToRun>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>

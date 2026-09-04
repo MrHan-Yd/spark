@@ -165,10 +165,6 @@ pub struct SetConfigParams {
     #[serde(default)]
     pub hotkey_toggle: Option<String>,
     #[serde(default)]
-    pub hide_on_focus_lost: Option<bool>,
-    #[serde(default)]
-    pub hide_on_execute: Option<bool>,
-    #[serde(default)]
     pub launch_on_startup: Option<bool>,
     /// 严格模式（规范 §12.2 3.2）：开启后本地导入/市场安装均要求插件带有效签名，
     /// 无签名拒装（`SignatureMissing`）。默认关。

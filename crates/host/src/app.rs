@@ -9,8 +9,8 @@ use spark_core::{ensure_data_dir, Action, Candidate, Query, Source};
 use spark_index::{AppIndex, SearchIndex};
 use spark_ipc::{InvokeParams, InvokeResult, PluginApiParams, TrustedPubkeyEntry};
 use spark_plugin_manager::{
-    KeyKind, KeywordMatch, PluginInfo, PluginInstallOutcome, PluginManager, PluginOpenInfo,
-    TrustedKey,
+    KeyKind, KeywordMatch, NativeSearchRequest, PluginInfo, PluginInstallOutcome, PluginManager,
+    PluginOpenInfo, TrustedKey,
 };
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 pub struct HostApp {
-    /// 应用索引（index_watch 后台重建后 swap_memory 原子换入）。
+    /// 应用索引：启动期由 index_watch::build_boot_index 后台构建后带 reconcile 换入；
+    /// 运行期 30s 定时器检测到 Start Menu 变化后 swap_memory 原子换入。
     pub index: AppIndex,
     plugins: PluginManager,
     pub config: HostConfig,
@@ -28,11 +29,28 @@ pub struct HostApp {
 
 impl HostApp {
     pub fn bootstrap(extra_plugins: Option<&Path>) -> Result<Self> {
+        Self::bootstrap_impl(extra_plugins, false)
+    }
+
+    /// 快速启动版：Start Menu 全量扫描放后台（配合 index_watch::build_boot_index，
+    /// 完成后带 reconcile 换入），热键注册不再被索引构建阻塞。历史仍同步加载，
+    /// 默认页（最近使用）立即可用。`--query` 诊断模式保持同步全量版 bootstrap。
+    pub fn bootstrap_fast(extra_plugins: Option<&Path>) -> Result<Self> {
+        Self::bootstrap_impl(extra_plugins, true)
+    }
+
+    fn bootstrap_impl(extra_plugins: Option<&Path>, background_index: bool) -> Result<Self> {
         let _ = ensure_data_dir()?;
         let config = HostConfig::load_or_default();
-        info!("building app index from Start Menu…");
-        let index = AppIndex::with_seed_fallback();
-        info!(apps = index.len(), "app index ready");
+        let index = if background_index {
+            info!("app index deferred to background (hotkey-first boot)");
+            AppIndex::with_history_only()
+        } else {
+            info!("building app index from Start Menu…");
+            let idx = AppIndex::with_seed_fallback();
+            info!(apps = idx.len(), "app index ready");
+            idx
+        };
 
         // 插件目录优先级：CLI `--plugins-dir` > config.plugins_dir > <exe_dir>/plugins。
         // 一期：内置与用户插件统一放此目录（安装器随包发的内置插件 + 用户导入的都在这）。
@@ -60,8 +78,21 @@ impl HostApp {
             tray: None,
         })
     }
+}
 
-    pub fn search(&mut self, text: &str) -> Vec<Candidate> {
+/// IPC 搜索三段式的锁内准备结果（PERF-SEARCH ③）。
+pub struct SearchPrep {
+    pub hits: Vec<Candidate>,
+    /// native 命中快照；调用方放锁后 `execute`（≤300ms），再并回 hits。
+    pub native: Option<NativeSearchRequest>,
+    /// 生效 limit（params.limit==0 时取 config.max_results；锁内定好免二次取锁）。
+    pub limit: u32,
+}
+
+impl HostApp {
+    /// 搜索核心（调用方持有 host 锁）：索引 + 内置命令 + webview 关键字/前缀候选。
+    /// 不含 native RPC——native RPC 最坏可达秒级，必须留在全局锁外（③-a）。
+    fn search_core(&mut self, text: &str) -> Vec<Candidate> {
         let q = Query {
             text: text.into(),
             limit: self.config.max_results,
@@ -86,26 +117,42 @@ impl HostApp {
                 next_top += 1;
             }
         }
-        // native 插件（mode:list）：命中关键字前缀时，把插件返回的结果项并入列表。
-        // 注：native_query 是阻塞 RPC（带超时），在 host 锁内调用；native 插件为重型
-        // 组件，超时/崩溃自动降级为空结果，不阻断搜索主流程。
+        hits
+    }
+
+    /// 同步搜索（`--query` 诊断模式 / invoke 兜底路径）：native 命中时阻塞等待
+    /// （既有语义：懒启动 + 5s + 失败即杀）。IPC 搜索路径改走 `search_prep` 三段式。
+    pub fn search(&mut self, text: &str) -> Vec<Candidate> {
+        let mut hits = self.search_core(text);
+        // native 插件（mode:list）：命中关键字时把插件返回的结果项并入列表。
+        // 诊断/兜底路径允许阻塞等待；超时/崩溃自动降级为空结果。
         if let Some(m) = self.plugins.find_native_match(text) {
-            if self.plugins.native_plugin(&m.plugin_id).is_some() {
-                match self
-                    .plugins
-                    .native_query(&m.plugin_id, &m.input, self.config.max_results)
-                {
-                    Ok(result) if !result.items.is_empty() => {
-                        for item in result.items {
-                            hits.push(item);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!(?e, id = %m.plugin_id, "native query returned error"),
-                }
-            }
+            let result =
+                self.plugins
+                    .native_query_blocking(&m.plugin_id, &m.input, self.config.max_results);
+            hits.extend(result.items);
         }
         hits
+    }
+
+    /// IPC 搜索三段式的锁内段：核心搜索 + native 命中快照 + 生效 limit。
+    /// 调用方随后**放锁**执行 native RPC，再合并截断（见 ipc_server host.query）。
+    pub fn search_prep(&mut self, text: &str, client_limit: u32) -> SearchPrep {
+        let hits = self.search_core(text);
+        let native = self.plugins.find_native_match(text).and_then(|m| {
+            self.plugins
+                .native_search_request(&m.plugin_id, &m.input, self.config.max_results)
+        });
+        let limit = if client_limit == 0 {
+            self.config.max_results
+        } else {
+            client_limit.min(self.config.max_results)
+        };
+        SearchPrep {
+            hits,
+            native,
+            limit,
+        }
     }
 
     /// 由关键字匹配构造一个 page-mode 候选项。
@@ -234,10 +281,6 @@ impl HostApp {
                 })
             }
         }
-    }
-
-    pub fn index_len(&self) -> usize {
-        self.index.len()
     }
 
     /// 优雅关闭：向所有 native 插件进程发 shutdown。在主消息循环退出后调用。

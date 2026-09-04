@@ -19,7 +19,7 @@ pub struct HistoryStore {
     entries: HashMap<String, HistoryEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct HistoryEntry {
     pub item_id: String,
     pub title: String,
@@ -31,6 +31,45 @@ pub struct HistoryEntry {
     pub icon: Option<String>,
     pub use_count: u32,
     pub last_used_at: u64,
+    /// 小写标题缓存（搜索兜底匹配用）：.0 是缓存对应的原标题，读取时比对不一致
+    /// 才重算——自校验缓存，任何路径改标题都不会读到过期值；serde skip，load 后
+    /// 首查自愈。用 Mutex 而非 RefCell：HistoryEntry 须满足 Send+Sync（SearchIndex
+    /// trait 约束），临界区只有一次字符串比对，开销可忽略。
+    /// 访问统一走 [Self::title_contains]，不直接开锁。
+    #[serde(skip, default)]
+    title_lc: std::sync::Mutex<(String, String)>,
+}
+
+impl Clone for HistoryEntry {
+    fn clone(&self) -> Self {
+        Self {
+            item_id: self.item_id.clone(),
+            title: self.title.clone(),
+            subtitle: self.subtitle.clone(),
+            target: self.target.clone(),
+            icon: self.icon.clone(),
+            use_count: self.use_count,
+            last_used_at: self.last_used_at,
+            // 缓存不随拷贝转移，克隆体首读自愈
+            title_lc: std::sync::Mutex::default(),
+        }
+    }
+}
+
+impl HistoryEntry {
+    /// 小写标题是否包含 q（读自校验缓存，miss 时重算）。
+    /// 不返回锁句柄（MappedMutexGuard 在本工具链不可用），逻辑内联在临界区内。
+    fn title_contains(&self, q: &str) -> bool {
+        let mut cache = self
+            .title_lc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.0 != self.title {
+            cache.1 = self.title.to_lowercase();
+            cache.0.clone_from(&self.title);
+        }
+        cache.1.contains(q)
+    }
 }
 
 impl HistoryStore {
@@ -77,6 +116,7 @@ impl HistoryStore {
                     icon: item.icon.clone(),
                     use_count: 0,
                     last_used_at: now,
+                    title_lc: std::sync::Mutex::default(),
                 });
             entry.title = item.title.clone();
             entry.subtitle = item.subtitle.clone();
@@ -118,6 +158,7 @@ impl HistoryStore {
                 icon: None,
                 use_count,
                 last_used_at,
+                title_lc: std::sync::Mutex::default(),
             },
         );
     }
@@ -211,6 +252,17 @@ impl HistoryStore {
     /// 查列表的这一次遍历顺带物理移除并落盘（有变化才落盘）——不依赖定时器
     /// 或索引重建。盘符甄别与判死细则见 target_alive。
     pub fn as_candidates(&mut self, limit: usize) -> Vec<Candidate> {
+        self.candidates_inner(limit, None)
+    }
+
+    /// 搜索兜底：与 as_candidates 相同的清理/过滤/排序，但额外按小写标题包含
+    /// q 过滤（title_lc 自校验缓存，查询热路径零 to_lowercase 分配）。过滤发生在
+    /// 构造 Candidate 之前——未命中的条目不再付出整串克隆的代价。
+    pub fn candidates_title_containing(&mut self, q: &str, limit: usize) -> Vec<Candidate> {
+        self.candidates_inner(limit, Some(q))
+    }
+
+    fn candidates_inner(&mut self, limit: usize, title_q: Option<&str>) -> Vec<Candidate> {
         let mut changed = false;
         self.entries.retain(|_, e| match e.target.as_deref() {
             Some(t) if is_app_target(t) && !target_alive(t) => {
@@ -234,6 +286,9 @@ impl HistoryStore {
                 .cmp(&a.last_used_at)
                 .then(b.use_count.cmp(&a.use_count))
         });
+        if let Some(q) = title_q {
+            list.retain(|e| e.title_contains(q));
+        }
         list.into_iter()
             .take(limit)
             .map(|e| {
@@ -405,6 +460,7 @@ mod tests {
                 icon: None,
                 use_count: 1,
                 last_used_at: now - 86_400,
+                ..Default::default()
             },
         );
         h.entries.insert(
@@ -417,6 +473,7 @@ mod tests {
                 icon: None,
                 use_count: 20,
                 last_used_at: now - 5 * 86_400,
+                ..Default::default()
             },
         );
         let items = h.as_candidates(10);
@@ -438,6 +495,7 @@ mod tests {
                 icon: Some(r"C:\sm\Google Chrome.lnk".into()),
                 use_count: 3,
                 last_used_at: 1000,
+                ..Default::default()
             },
         );
         let mut idx = MemoryIndex::new();
@@ -469,6 +527,7 @@ mod tests {
                 icon: None,
                 use_count: 1,
                 last_used_at: 1000,
+                ..Default::default()
             },
         );
         let idx = MemoryIndex::new();
@@ -490,6 +549,7 @@ mod tests {
                 icon: None,
                 use_count: 2,
                 last_used_at: 1000,
+                ..Default::default()
             },
         );
         let idx = MemoryIndex::new();
@@ -510,6 +570,7 @@ mod tests {
                 icon: None,
                 use_count: 1,
                 last_used_at: 1000,
+                ..Default::default()
             },
         );
         let idx = MemoryIndex::new();

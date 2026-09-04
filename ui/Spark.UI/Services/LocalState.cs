@@ -60,8 +60,6 @@ public static class LocalState
 public sealed class AppUiState
 {
     public bool LaunchOnStartup { get; set; } = true;
-    public bool HideOnFocusLost { get; set; } = true;
-    public bool HideAfterInvoke { get; set; } = true;
     public string Hotkey { get; set; } = "Alt+Space";
     public string Theme { get; set; } = "dark";
     public string DefaultView { get; set; } = "grid";

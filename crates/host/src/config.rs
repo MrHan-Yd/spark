@@ -14,6 +14,9 @@ pub struct HostConfig {
     pub max_results: u32,
     #[serde(default)]
     pub plugins_dir: Option<PathBuf>,
+    // 失焦隐藏 / 执行后隐藏已固化为始终开启的默认行为（UI 不再提供开关、不再推送），
+    // host 不消费这两个值；字段仅为兼容旧 config.toml（deny_unknown_fields 会拒载
+    // 含未知字段的文件，删除会导致老用户整份配置回退默认）而保留。
     #[serde(default = "default_true")]
     pub hide_on_focus_lost: bool,
     #[serde(default = "default_true")]

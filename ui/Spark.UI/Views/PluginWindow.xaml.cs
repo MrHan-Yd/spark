@@ -70,17 +70,20 @@ public sealed partial class PluginWindow : Window
     /// 读不到或加载异常则降级到 Spark 内置 <c>Assets/spark.png</c>。
     /// 用文件路径而非 ms-appx:///：本项目是 unpackaged self-contained 应用，
     /// Assets 是 Content+CopyToOutput，ms-appx:/// 对任意资源不可靠。
+    /// 加载含磁盘嗅探已异步化：fire-and-forget，回填前 TitleIcon 保持空（不可见差异毫秒级）。
     /// </summary>
-    private void LoadTitleIcon()
+    private void LoadTitleIcon() => _ = LoadTitleIconAsync();
+
+    private async Task LoadTitleIconAsync()
     {
-        if (!TrySetIcon(_info.IconAbs))
-            TrySetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "spark.png"));
+        if (await TrySetIconAsync(_info.IconAbs)) return;
+        await TrySetIconAsync(Path.Combine(AppContext.BaseDirectory, "Assets", "spark.png"));
     }
 
-    private bool TrySetIcon(string? path)
+    private async Task<bool> TrySetIconAsync(string? path)
     {
         // 统一走 PluginIconLoader：位图用 BitmapImage，SVG 用 SvgImageSource
-        var src = PluginIconLoader.Load(path);
+        var src = await PluginIconLoader.LoadAsync(path);
         if (src is null) return false;
         TitleIcon.Source = src;
         return true;

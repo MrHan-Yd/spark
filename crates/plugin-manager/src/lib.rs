@@ -15,7 +15,9 @@ pub use manifest::{
     cmp_version, FeatureType, PluginCommand, PluginFeature, PluginManifest, PluginRuntime,
     PluginWindow,
 };
-pub use native::{NativeMatch, NativeRuntime, NativeSpawnInfo};
+pub use native::{
+    NativeMatch, NativeRuntime, NativeRuntimeHandle, NativeSearchRequest, NativeSpawnInfo,
+};
 pub use signing::{
     canonical_bytes, collect_file_entries, verify_dir, verify_with_keys, FileEntry, KeyKind,
     Revocation, SignState, TrustedKey, VerifyError, REVOKED, TRUSTED_KEYS,
@@ -132,8 +134,8 @@ pub struct KeywordConflict {
     pub plugin_ids: Vec<String>,
 }
 
-/// 不 derive Debug：`NativeRuntime` 持有子进程句柄（Child/管道），不可 Debug。
-/// Default 仍可用：所有字段均有 Default（NativeRuntime::default() 为空进程表）。
+/// 不 derive Debug：native 运行时句柄背后是子进程（Child/管道），不可 Debug。
+/// Default 仍可用：所有字段均有 Default（句柄 Default = 启动专职 runtime 线程）。
 #[derive(Default)]
 pub struct PluginManager {
     plugins: Vec<LoadedPlugin>,
@@ -142,8 +144,9 @@ pub struct PluginManager {
     /// 状态文件与插件私有数据所在目录（默认全局 data_dir；测试可注入）。
     data_dir: PathBuf,
     state: PluginState,
-    /// native 插件进程运行时（懒启动 + 常驻 + 崩溃重建）。
-    native: NativeRuntime,
+    /// native 插件进程运行时句柄：runtime 状态生活在专职线程（native.rs 模块注释），
+    /// host 锁内只做通道 send，RPC 等待在 host 锁外（PERF-SEARCH ③-a）。
+    native: NativeRuntimeHandle,
     /// 运行时可信密钥表 = 内置官方表（`TRUSTED_KEYS`）+ 用户导入的三方密钥。
     /// 验签一律走此合并表：官方判定只看内置 `KeyKind::Official` 条目，
     /// 用户表恒为 `KeyKind::ThirdParty`（"已签名"角标），无法伪冒官方。
@@ -163,7 +166,7 @@ impl PluginManager {
             plugins_dir,
             data_dir,
             state,
-            native: NativeRuntime::default(),
+            native: NativeRuntimeHandle::default(),
             trusted_keys: crate::signing::TRUSTED_KEYS.to_vec(),
         }
     }
@@ -444,7 +447,8 @@ impl PluginManager {
 
         // 覆盖更新：暂存拷贝 + 备份交换，保证拷贝失败不破坏现有插件
         // （与 set_dir 迁移的"先拷后删+失败回滚"安全模式一致）。
-        self.native.shutdown_plugin(&id);
+        // 同步等待进程退出：.exe 被占用时覆盖会失败（见 shutdown_plugin_sync）。
+        self.native.shutdown_plugin_sync(&id);
         let staging = self.plugins_dir.join(format!(".{id}.staging"));
         let backup = self.plugins_dir.join(format!(".{id}.bak"));
         // 清理上次崩溃可能残留的暂存/备份目录（best-effort）。
@@ -828,45 +832,61 @@ impl PluginManager {
 
     // ─── native 插件运行时委托 ───────────────────────────────────────────────
 
-    /// 构造某 native 插件的启动信息（owned）。调用方拿到后即可结束不可变借用，
-    /// 再可变调用 `native_query`/`native_invoke`，避免借用冲突。
+    /// 构造某 native 插件的启动信息（owned，可跨锁阶段传递）。
     pub fn native_spawn_info(&self, id: &str) -> Option<NativeSpawnInfo> {
         self.native_plugin(id).map(NativeSpawnInfo::from_plugin)
     }
 
-    /// native 查询：懒启动进程 → query → 返回结果项。
-    /// 进程崩溃/超时自动重建，本次失败降级为空结果（不抛错给搜索主流程）。
-    pub fn native_query(
-        &mut self,
+    /// 搜索路径（PERF-SEARCH ③）：锁内只取 native 查询快照（句柄克隆 + spawn 信息），
+    /// RPC 由调用方在 **host 锁外** `NativeSearchRequest::execute`（≤300ms，超时保留
+    /// 进程，未就绪自动后台预热）。插件不存在/未启用 → None（调用方按无 native 命中处理）。
+    pub fn native_search_request(
+        &self,
+        id: &str,
+        input: &str,
+        limit: u32,
+    ) -> Option<NativeSearchRequest> {
+        let info = self.native_spawn_info(id)?;
+        Some(NativeSearchRequest::new(
+            self.native.clone(),
+            info,
+            input.to_string(),
+            limit,
+        ))
+    }
+
+    /// 同步阻塞查询（既有语义：懒启动 + 5s + 失败即杀，本次失败降级空结果）。
+    /// 仅 `--query` 诊断与 invoke 兜底路径使用——阻塞等待绝不发生在 IPC 搜索路径。
+    pub fn native_query_blocking(
+        &self,
         id: &str,
         text: &str,
         limit: u32,
-    ) -> Result<spark_ipc::QueryResult, PluginError> {
-        let info = match self.native_spawn_info(id) {
-            Some(i) => i,
-            None => {
-                return Ok(spark_ipc::QueryResult {
-                    items: vec![],
-                    partial: false,
-                });
-            }
+    ) -> spark_ipc::QueryResult {
+        let Some(info) = self.native_spawn_info(id) else {
+            return spark_ipc::QueryResult {
+                items: vec![],
+                partial: false,
+            };
         };
-        self.native.query(&info, text, limit)
+        self.native.query_blocking(info, text.to_string(), limit)
     }
 
-    /// native 执行：用户选中某结果项动作时调用。
+    /// native 执行：用户选中某结果项动作时调用（既有语义：懒启动 + 5s + 失败即杀；
+    /// 用户主动执行可等待。ipc_server 在 host 锁内调用——native 线程对 host 锁无
+    /// 依赖，单向等待无死锁环，见 native.rs 模块注释）。
     pub fn native_invoke(
-        &mut self,
+        &self,
         id: &str,
         params: spark_ipc::InvokeParams,
     ) -> Result<spark_ipc::InvokeResult, PluginError> {
         let info = self
             .native_spawn_info(id)
             .ok_or_else(|| PluginError::Manifest(format!("native plugin not found: {id}")))?;
-        self.native.invoke(&info, params)
+        self.native.invoke(info, params)
     }
 
-    /// host 退出前调用：向所有 native 进程发 shutdown 并 wait。
+    /// host 退出前调用：向所有 native 进程发 shutdown 并 wait，收割 runtime 线程。
     pub fn native_shutdown_all(&mut self) {
         self.native.shutdown_all();
     }

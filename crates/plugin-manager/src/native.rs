@@ -1,13 +1,22 @@
 //! Native 插件运行时：host 侧 spawn 插件 exe + stdin/stdout 管道 RPC。
 //!
 //! 一个 [`NativeRuntime`] 持有按插件 id 索引的 [`NativeProcess`]。进程**懒启动**：
-//! 首次 query/invoke 命中某插件时才 spawn 并 `plugin.initialize` 握手；之后常驻，
-//! 直到崩溃、超时或 host 退出。
+//! invoke/诊断路径首次命中时 spawn 并 `plugin.initialize` 握手；之后常驻，
+//! 直到崩溃、超时或 host 退出。搜索路径**不懒启动**——未就绪返回 NotReady 由
+//! 调用方触发 [`NativeRuntime::warm`] 后台预热（spawn 无界，不能落在查询路径）。
 //!
 //! 线程模型：每个活跃进程跑一个独立**读帧线程**，把 stdout 帧泵入 mpsc 通道；
-//! RPC 调用方（持有 host 锁的搜索/invoke 线程）发请求后 `recv_timeout` 取响应。
-//! 这样读不阻塞调用方、超时可控、崩溃（EOF）能被检测。写（发请求）只在调用方线程，
-//! 单写者，无需同步。
+//! RPC 调用方发请求后 `recv_timeout` 取响应。读不阻塞调用方、超时可控、崩溃
+//! （EOF）能被检测。写（发请求）只在调用方线程，单写者，无需同步。
+//!
+//! 锁结构（PERF-SEARCH ③-a）：runtime 状态整体生活在 [`spawn_runtime_thread`]
+//! 创建的**专职线程**，host 线程经 [`NativeRuntimeHandle`] 消息通信。为什么：
+//! 搜索/invoke 在 host 全局锁（`SharedHost = Arc<Mutex<HostApp>>`）内执行，
+//! native RPC 最坏可达秒级——RPC 等待必须移出 host 锁，而 runtime 状态需要
+//! 单写者，专职线程把"单写者"收敛为一个点，锁内只剩通道 send（微秒级）。
+//! **锁序纪律**：native 线程从不取 host 锁；host 线程等待本线程应答一律在
+//! host 锁外（invoke 路径例外地持锁等待——单向依赖无死锁环，见 ipc_server
+//! host.invoke 注释）。
 
 use crate::{LoadedPlugin, PluginError, PluginManager, PluginRuntime};
 use spark_ipc::{
@@ -20,6 +29,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -55,8 +65,21 @@ impl NativeSpawnInfo {
     }
 }
 
-/// 单次 RPC 默认超时。native 插件是重型组件，给足时间但避免永久挂起拖死 host。
+/// 单次 RPC 默认超时（invoke / 诊断路径）。native 插件是重型组件，给足时间但
+/// 避免永久挂起拖死 host。搜索路径走更短的 [`SEARCH_RPC_TIMEOUT`]。
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 搜索路径 RPC 上限（PERF-SEARCH ③-b）：用户在打字，逐键查询必须快进快出。
+/// 超时**保留进程**（"慢但健康"的插件不被逐键 kill+respawn 造成进程风暴），
+/// 本轮按 partial 降级交 UI 补查。300ms = 打字节奏（防抖 80ms）之上仍可感知不到。
+pub(crate) const SEARCH_RPC_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// RPC 失败分类：Timeout = 插件没在时限内回话（进程可能"慢但健康"）；
+/// Fatal = 进程级故障（EOF/写失败/应答错误），必须丢弃重建。
+enum RpcFailure {
+    Timeout(PluginError),
+    Fatal(PluginError),
+}
 
 /// 读帧线程推给调用方的条目：要么是一条响应，要么是“读端已断”（EOF/IO 错误）。
 enum FrameEvent {
@@ -137,7 +160,7 @@ impl NativeProcess {
             permissions: info.granted.clone(),
             api_version: API_VERSION,
         };
-        let resp = self.rpc(
+        let resp = self.rpc_sync(
             PluginMethod::Initialize.as_str(),
             serde_json::to_value(&params)?,
         )?;
@@ -154,31 +177,46 @@ impl NativeProcess {
         Ok(result)
     }
 
-    /// query：发 plugin.query，等 QueryResult。
+    /// query：发 plugin.query，等 QueryResult（既有阻塞语义，invoke/诊断路径用）。
     fn query(&mut self, params: QueryParams) -> Result<QueryResult, PluginError> {
-        let resp = self.rpc(PluginMethod::Query.as_str(), serde_json::to_value(&params)?)?;
+        let resp = self.rpc_sync(PluginMethod::Query.as_str(), serde_json::to_value(&params)?)?;
         Ok(serde_json::from_value(resp)?)
     }
 
-    /// invoke：发 plugin.invoke，等 InvokeResult。
+    /// invoke：发 plugin.invoke，等 InvokeResult（既有阻塞语义）。
     fn invoke(&mut self, params: InvokeParams) -> Result<InvokeResult, PluginError> {
-        let resp = self.rpc(
+        let resp = self.rpc_sync(
             PluginMethod::Invoke.as_str(),
             serde_json::to_value(&params)?,
         )?;
         Ok(serde_json::from_value(resp)?)
     }
 
-    /// 发一帧请求并等**对应 id** 的响应（带超时）。
-    ///
-    /// 响应 id 必须与本次请求 id 一致；不一致（插件多回一帧 / 自发帧 / 串号）
-    /// 即视为协议错误返回 Err，由 `with_proc` 丢弃进程、下次重建——杜绝静默错位。
-    /// 正常 1:1 lockstep 响应 id 必然匹配，不会误杀。
-    fn rpc(
+    /// 既有语义的 RPC：默认超时，任何失败都按进程级故障处理（with_proc 丢弃）。
+    fn rpc_sync(
         &mut self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
+        match self.rpc(method, params, DEFAULT_RPC_TIMEOUT) {
+            Ok(v) => Ok(v),
+            Err(RpcFailure::Timeout(e)) | Err(RpcFailure::Fatal(e)) => Err(e),
+        }
+    }
+
+    /// 发一帧请求并等**对应 id** 的响应（超时由调用方按路径给：搜索 300ms / 其余 5s）。
+    ///
+    /// 响应只接受与本次请求 id 完全一致的帧；不一致（此前被放弃请求的迟到响应、
+    /// 自发帧）一律**忽略并继续等**——搜索路径超时后进程被保留（SEARCH_RPC_TIMEOUT
+    /// 注释），被放弃请求的迟到应答会滞留在读通道里，若沿用旧"不符即杀"会把
+    /// 保留的进程误杀成逐键重 spawn。只收精确匹配 id，错位应答不可能被静默
+    /// 路由到错误请求上（与旧逻辑同级别的防串号保证）。
+    fn rpc(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, RpcFailure> {
         let id = self.next_req_id();
         let expected_id = serde_json::Value::from(id);
         let req = serde_json::json!({
@@ -187,39 +225,67 @@ impl NativeProcess {
             "method": method,
             "params": params,
         });
-        let line = encode_line(&req).map_err(ipc_err)?;
-        write_frame(&mut self.stdin, line.as_bytes()).map_err(ipc_err)?;
+        let line = encode_line(&req).map_err(|e| RpcFailure::Fatal(ipc_err(e)))?;
+        write_frame(&mut self.stdin, line.as_bytes())
+            .map_err(ipc_err)
+            .map_err(RpcFailure::Fatal)?;
 
-        match self.rx.recv_timeout(DEFAULT_RPC_TIMEOUT) {
-            Ok(FrameEvent::Response(resp)) => {
-                // id 校验：不符 = 协议错误（多余/串号/自发帧），丢弃进程重建。
-                if resp.id.as_ref() != Some(&expected_id) {
-                    return Err(io_other(format!(
-                        "native plugin {} {method}: response id {:?} != request id {id}",
-                        self.plugin_id, resp.id
-                    )));
-                }
-                if let Some(err) = resp.error {
-                    return Err(io_other(format!(
-                        "plugin {method} error {}: {}",
-                        err.code, err.message
-                    )));
-                }
-                resp.result
-                    .ok_or_else(|| io_other(format!("plugin {method} returned no result")))
+        // 绝对截止时间（审计 Issue #2 修复）：不匹配帧"忽略并继续等"的窗口必须有
+        // 总上界——若每次 recv 重新计时，插件以 ≥1 帧/超时窗 的速率发自发/通知帧
+        // 可让本次 rpc 永不超时 → runtime 线程被占死、host 退出的 shutdown_all join
+        // 永久悬挂。按剩余时间收帧保证总等待 ≤ timeout，join 因此有界
+        // （最坏 = 一个 rpc 超时 + 每进程 shutdown ≤1s）。
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RpcFailure::Timeout(io_other(format!(
+                    "native plugin {} {method} timed out after {timeout:?}",
+                    self.plugin_id
+                ))));
             }
-            Ok(FrameEvent::Eof(reason)) => Err(io_other(format!(
-                "native plugin {} pipe closed: {reason}",
-                self.plugin_id
-            ))),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(io_other(format!(
-                "native plugin {} {method} timed out after {:?}",
-                self.plugin_id, DEFAULT_RPC_TIMEOUT
-            ))),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io_other(format!(
-                "native plugin {} reader disconnected",
-                self.plugin_id
-            ))),
+            match self.rx.recv_timeout(remaining) {
+                Ok(FrameEvent::Response(resp)) => {
+                    // id 不符 = 此前放弃请求的迟到应答或自发帧：忽略，继续等本次的
+                    if resp.id.as_ref() != Some(&expected_id) {
+                        debug!(
+                            id = %self.plugin_id,
+                            method,
+                            got = ?resp.id,
+                            expected = id,
+                            "native plugin stale/unsolicited frame ignored"
+                        );
+                        continue;
+                    }
+                    if let Some(err) = resp.error {
+                        return Err(RpcFailure::Fatal(io_other(format!(
+                            "plugin {method} error {}: {}",
+                            err.code, err.message
+                        ))));
+                    }
+                    return resp.result.ok_or_else(|| {
+                        RpcFailure::Fatal(io_other(format!("plugin {method} returned no result")))
+                    });
+                }
+                Ok(FrameEvent::Eof(reason)) => {
+                    return Err(RpcFailure::Fatal(io_other(format!(
+                        "native plugin {} pipe closed: {reason}",
+                        self.plugin_id
+                    ))))
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(RpcFailure::Timeout(io_other(format!(
+                        "native plugin {} {method} timed out after {:?}",
+                        self.plugin_id, timeout
+                    ))))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(RpcFailure::Fatal(io_other(format!(
+                        "native plugin {} reader disconnected",
+                        self.plugin_id
+                    ))))
+                }
+            }
         }
     }
 
@@ -306,6 +372,12 @@ fn spawn_reader(stdout: ChildStdout, tx: mpsc::Sender<FrameEvent>) {
 #[derive(Default)]
 pub struct NativeRuntime {
     procs: HashMap<String, NativeProcess>,
+    /// 在途预热标记（审计 Issue #1 修复）：Warm 到达时已就绪**或在途**都直接忽略——
+    /// 搜索路径不懒启动，spawn+握手完成前 procs 恒空，没有这个标记逐键 Warm 会
+    /// 并发拉起十几个插件进程（进程风暴）+ 失败路径逐键 warn（日志风暴）。
+    /// WarmDone 归位（成败都算）时移除，保证后续可重试；标记只在 runtime 线程
+    /// 消息循环内读写（warm/insert_warm），无跨线程同步需求。
+    warming: std::collections::HashSet<String>,
 }
 
 /// native 插件的关键字/前缀路由匹配结果。
@@ -321,6 +393,7 @@ pub struct NativeMatch {
 impl NativeRuntime {
     /// 执行一次 native query：确保进程已启动，发 query，返回结果项。
     /// 进程崩溃/超时 → 丢弃进程，下次自动重 spawn；本次返回空结果。
+    /// （既有阻塞语义，仅诊断/兜底路径使用；搜索路径走 query_for_search。）
     pub fn query(
         &mut self,
         info: &NativeSpawnInfo,
@@ -348,6 +421,87 @@ impl NativeRuntime {
         params: InvokeParams,
     ) -> Result<InvokeResult, PluginError> {
         self.with_proc(info, |proc| proc.invoke(params))
+    }
+
+    /// 搜索路径查询（PERF-SEARCH ③-b 语义）：**不懒启动**、`SEARCH_RPC_TIMEOUT`
+    /// 上限、**超时保留进程**。未就绪返回 NotReady，由调用方触发 [`Self::warm`]。
+    pub fn query_for_search(
+        &mut self,
+        info: &NativeSpawnInfo,
+        text: &str,
+        limit: u32,
+    ) -> Result<QueryResult, SearchQueryError> {
+        let Some(proc) = self.procs.get_mut(&info.id) else {
+            return Err(SearchQueryError::NotReady);
+        };
+        let params = QueryParams {
+            text: text.to_string(),
+            limit,
+        };
+        let body = serde_json::to_value(&params)
+            .map_err(|e| SearchQueryError::Failed(PluginError::Manifest(e.to_string())))?;
+        match proc.rpc(PluginMethod::Query.as_str(), body, SEARCH_RPC_TIMEOUT) {
+            Ok(v) => serde_json::from_value(v)
+                .map_err(|e| SearchQueryError::Failed(PluginError::Manifest(e.to_string()))),
+            Err(RpcFailure::Timeout(e)) => {
+                // 进程保留：下一键查询再给它 300ms；进程真死了走 EOF 被清理
+                warn!(?e, id = %info.id, "native search query timeout; process kept");
+                Err(SearchQueryError::Timeout)
+            }
+            Err(RpcFailure::Fatal(e)) => {
+                self.procs.remove(&info.id);
+                warn!(?e, id = %info.id, "native search query failed; process dropped");
+                Err(SearchQueryError::Failed(e))
+            }
+        }
+    }
+
+    /// 后台预热：spawn+握手（秒级、无界）放独立线程，完成后经 WarmDone 消息归位。
+    /// 已就绪**或在途**则 no-op（在途去重见 warming 字段注释）；线程创建失败不标记，
+    /// 下一次 Warm 可重试。WarmDone 必达性：spawn 线程无论成败都会 send WarmDone，
+    /// runtime 循环按序处理 → warming 标记不会永久卡死插件就绪。
+    fn warm(&mut self, info: NativeSpawnInfo, done_tx: &mpsc::Sender<RuntimeMsg>) {
+        if self.procs.contains_key(&info.id) || self.warming.contains(&info.id) {
+            return;
+        }
+        let tx = done_tx.clone();
+        let flag_id = info.id.clone();
+        let log_id = info.id.clone();
+        let spawned = thread::Builder::new()
+            .name("spark-native-warm".into())
+            .spawn(move || {
+                let id = info.id.clone();
+                let res = NativeProcess::spawn(&info);
+                let _ = tx.send(RuntimeMsg::WarmDone { id, res });
+            });
+        match spawned {
+            Ok(_handle) => {
+                // WarmDone 由 runtime 循环按序消费，不存在"标记先于归位被旁路"的竞态
+                self.warming.insert(flag_id);
+            }
+            Err(e) => warn!(?e, id = %log_id, "native warm thread spawn failed"),
+        }
+    }
+
+    /// WarmDone 归位：先清在途标记（成败都清，失败保证后续可重试），再插入预热完成
+    /// 的进程；竞态下已有进程则丢弃后到者（drop 会 kill）。
+    /// 孤儿进程归属：WarmDone 归位时插件可能已被卸载/禁用（runtime 线程不持 host 锁，
+    /// 不回查插件表）——该进程与既有"卸载不关进程"行为同款，留在进程表直到 host 退出
+    /// 被 shutdown_all 收割；后续搜索不会再命中它（插件表已无该 id 的路由匹配）。
+    fn insert_warm(&mut self, id: String, res: Result<NativeProcess, PluginError>) {
+        self.warming.remove(&id);
+        match res {
+            Ok(proc) => {
+                if self.procs.contains_key(&id) {
+                    debug!(id = %id, "warm spawn raced with existing process; dropped");
+                    drop(proc);
+                    return;
+                }
+                info!(id = %id, "native plugin warmed up");
+                self.procs.insert(id, proc);
+            }
+            Err(e) => warn!(?e, id = %id, "native warm spawn failed"),
+        }
     }
 
     /// 取/启动某插件进程，执行一次调用。失败时清理该插件进程（下次重 spawn）。
@@ -398,6 +552,277 @@ impl NativeRuntime {
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
         self.shutdown_all();
+    }
+}
+
+/// 搜索路径查询失败分类（[`NativeRuntime::query_for_search`]）。
+pub enum SearchQueryError {
+    /// 进程未就绪（搜索路径不懒启动）：调用方应触发 Warm 后台预热并按 partial 降级。
+    NotReady,
+    /// RPC 超时：进程保留（"慢但健康"的判断交给后续请求）。
+    Timeout,
+    /// 进程级故障（进程已被丢弃，下次查询重 spawn）。
+    Failed(PluginError),
+}
+
+/// 专职 native 线程的消息。runtime 状态（进程句柄/stdin/req-id，需 `&mut`）只能被
+/// 该线程触碰；host 锁内只做通道 send，RPC 等待全部发生在 host 锁外（见模块注释）。
+enum RuntimeMsg {
+    /// 搜索路径查询（不懒启动 / 300ms / 超时保留进程）。
+    QuerySearch {
+        info: NativeSpawnInfo,
+        text: String,
+        limit: u32,
+        reply: mpsc::Sender<Result<QueryResult, SearchQueryError>>,
+    },
+    /// 同步阻塞查询（懒启动 / 5s / 失败即杀）：`--query` 诊断与 invoke 兜底路径。
+    QueryBlocking {
+        info: NativeSpawnInfo,
+        text: String,
+        limit: u32,
+        reply: mpsc::Sender<QueryResult>,
+    },
+    /// 插件执行（懒启动 / 5s / 失败即杀，既有语义）。
+    Invoke {
+        info: NativeSpawnInfo,
+        params: InvokeParams,
+        reply: mpsc::Sender<Result<InvokeResult, PluginError>>,
+    },
+    /// 后台预热 spawn+握手完成，进程归位。
+    WarmDone {
+        id: String,
+        res: Result<NativeProcess, PluginError>,
+    },
+    /// 预热请求：runtime 线程派生独立 spawn 线程（spawn 无界，不能占 runtime 线程）。
+    Warm { info: NativeSpawnInfo },
+    /// 关停单插件（同步等待回复：覆盖更新前必须确认 .exe 已不被占用）。
+    ShutdownPlugin { id: String, reply: mpsc::Sender<()> },
+    /// 优雅关闭全部进程并退出 runtime 线程（join 收割）。
+    ShutdownAll,
+}
+
+/// native 运行时句柄（可克隆，只共享发送端）。join 句柄放 `Arc<Mutex<Option<_>>>`
+/// 供 [`Self::shutdown_all`] 收割。锁序纪律见模块注释：native 线程从不取 host 锁，
+/// host 线程等待本线程应答一律在 host 锁外。
+#[derive(Clone)]
+pub struct NativeRuntimeHandle {
+    tx: mpsc::Sender<RuntimeMsg>,
+    join: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+}
+
+impl Default for NativeRuntimeHandle {
+    fn default() -> Self {
+        spawn_runtime_thread()
+    }
+}
+
+/// 创建专职 native 线程。PluginManager 构造时调用一次；线程常驻直到
+/// [`NativeRuntimeHandle::shutdown_all`]（host 退出路径显式调用）。
+pub fn spawn_runtime_thread() -> NativeRuntimeHandle {
+    let (tx, rx) = mpsc::channel::<RuntimeMsg>();
+    let warm_tx = tx.clone();
+    let join = thread::Builder::new()
+        .name("spark-native-runtime".into())
+        .spawn(move || {
+            let mut rt = NativeRuntime::default();
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    RuntimeMsg::QuerySearch {
+                        info,
+                        text,
+                        limit,
+                        reply,
+                    } => {
+                        let _ = reply.send(rt.query_for_search(&info, &text, limit));
+                    }
+                    RuntimeMsg::QueryBlocking {
+                        info,
+                        text,
+                        limit,
+                        reply,
+                    } => {
+                        let _ = reply.send(rt.query(&info, &text, limit).unwrap_or(QueryResult {
+                            items: vec![],
+                            partial: false,
+                        }));
+                    }
+                    RuntimeMsg::Invoke {
+                        info,
+                        params,
+                        reply,
+                    } => {
+                        let _ = reply.send(rt.invoke(&info, params));
+                    }
+                    RuntimeMsg::Warm { info } => rt.warm(info, &warm_tx),
+                    RuntimeMsg::WarmDone { id, res } => rt.insert_warm(id, res),
+                    RuntimeMsg::ShutdownPlugin { id, reply } => {
+                        rt.shutdown_plugin(&id);
+                        let _ = reply.send(());
+                    }
+                    RuntimeMsg::ShutdownAll => {
+                        rt.shutdown_all();
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn native runtime thread");
+    NativeRuntimeHandle {
+        tx,
+        join: Arc::new(Mutex::new(Some(join))),
+    }
+}
+
+impl NativeRuntimeHandle {
+    /// 搜索路径查询（宿主在 **host 锁外**调用）：RPC 上限 `SEARCH_RPC_TIMEOUT`。
+    /// 返回 (结果, partial)：NotReady（自动触发后台预热）/超时/故障 → (空, true)。
+    pub fn query_search(
+        &self,
+        info: NativeSpawnInfo,
+        text: String,
+        limit: u32,
+    ) -> (QueryResult, bool) {
+        let empty = || QueryResult {
+            items: vec![],
+            partial: false,
+        };
+        let (tx, rx) = mpsc::channel();
+        if self
+            .tx
+            .send(RuntimeMsg::QuerySearch {
+                info: info.clone(),
+                text,
+                limit,
+                reply: tx,
+            })
+            .is_err()
+        {
+            // runtime 线程已退出（关停中或 panic 消亡）：按无插件结果处理。
+            // 正常关停后 UI 不应再来查询；若因 panic 消亡，这条 warn 是唯一线索
+            warn!(id = %info.id, "native runtime thread gone; query dropped");
+            return (empty(), false);
+        }
+        // 留 1s 余量给通道排队；runtime 线程自身先于本上限应答
+        match rx.recv_timeout(SEARCH_RPC_TIMEOUT + Duration::from_secs(1)) {
+            Ok(Ok(qr)) => (qr, false),
+            Ok(Err(SearchQueryError::NotReady)) => {
+                self.warm(info);
+                (empty(), true)
+            }
+            Ok(Err(_)) => (empty(), true),
+            Err(_) => (empty(), true),
+        }
+    }
+
+    /// 同步阻塞查询（既有语义：懒启动 + 5s + 失败即杀）。`--query` 诊断 / invoke 兜底。
+    pub fn query_blocking(&self, info: NativeSpawnInfo, text: String, limit: u32) -> QueryResult {
+        let (tx, rx) = mpsc::channel();
+        if self
+            .tx
+            .send(RuntimeMsg::QueryBlocking {
+                info,
+                text,
+                limit,
+                reply: tx,
+            })
+            .is_err()
+        {
+            return QueryResult {
+                items: vec![],
+                partial: false,
+            };
+        }
+        // 懒启动最坏 = 无界 spawn + 5s 握手 + 5s 查询；15s 盖帽防调用方悬挂
+        rx.recv_timeout(Duration::from_secs(15))
+            .unwrap_or(QueryResult {
+                items: vec![],
+                partial: false,
+            })
+    }
+
+    /// 插件执行（既有语义：懒启动 + 5s + 失败即杀）。用户主动执行，可等待。
+    pub fn invoke(
+        &self,
+        info: NativeSpawnInfo,
+        params: InvokeParams,
+    ) -> Result<InvokeResult, PluginError> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(RuntimeMsg::Invoke {
+                info,
+                params,
+                reply: tx,
+            })
+            .map_err(|_| io_other("native runtime thread gone"))?;
+        rx.recv_timeout(Duration::from_secs(15))
+            .map_err(|_| io_other("native invoke wait timeout"))?
+    }
+
+    /// 后台预热（fire-and-forget）：spawn+握手在独立线程，完成归位 runtime 进程表。
+    pub fn warm(&self, info: NativeSpawnInfo) {
+        let _ = self.tx.send(RuntimeMsg::Warm { info });
+    }
+
+    /// 关停单插件并**同步等待**：覆盖更新路径要求进程确已退出，.exe 才可覆盖。
+    pub fn shutdown_plugin_sync(&self, id: &str) {
+        let (tx, rx) = mpsc::channel();
+        if self
+            .tx
+            .send(RuntimeMsg::ShutdownPlugin {
+                id: id.to_string(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return;
+        }
+        // shutdown 内部最多 1s 轮询 + kill；3s 盖帽
+        let _ = rx.recv_timeout(Duration::from_secs(3));
+    }
+
+    /// 优雅关闭全部进程并收割 runtime 线程。host 退出路径显式调用
+    /// （句柄 Clone 副本不参与关闭——Clone 只共享发送端，无 Drop 副作用）。
+    pub fn shutdown_all(&self) {
+        if self.tx.send(RuntimeMsg::ShutdownAll).is_err() {
+            return;
+        }
+        if let Ok(mut g) = self.join.lock() {
+            if let Some(j) = g.take() {
+                let _ = j.join();
+            }
+        }
+    }
+}
+
+/// 搜索路径的 native 查询快照：host 锁内由 PluginManager 构造（owned，Send），
+/// 调用方在 **host 锁外** [`Self::execute`]。缺省无插件结果时 partial=false。
+pub struct NativeSearchRequest {
+    handle: NativeRuntimeHandle,
+    info: NativeSpawnInfo,
+    input: String,
+    limit: u32,
+}
+
+impl NativeSearchRequest {
+    /// PluginManager::native_search_request 专用构造（字段对 crate 外不透明）。
+    pub(crate) fn new(
+        handle: NativeRuntimeHandle,
+        info: NativeSpawnInfo,
+        input: String,
+        limit: u32,
+    ) -> Self {
+        Self {
+            handle,
+            info,
+            input,
+            limit,
+        }
+    }
+
+    /// 锁外执行：≤ `SEARCH_RPC_TIMEOUT`；未就绪自动后台预热。
+    /// 返回 (结果, partial)：partial=true 表示本轮 native 结果缺席，host 侧如实上报 UI 补查。
+    pub fn execute(self) -> (QueryResult, bool) {
+        self.handle.query_search(self.info, self.input, self.limit)
     }
 }
 

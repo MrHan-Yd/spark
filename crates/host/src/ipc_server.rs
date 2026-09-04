@@ -306,20 +306,24 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                     &JsonRpcResponse::error(id, -32602, "invalid query parameters"),
                 );
             }
-            let items = {
+            // 三段式（PERF-SEARCH ③）：native RPC 是秒级阻塞操作，绝不能在 host
+            // 全局锁内执行（会拖死所有 IPC）。① 锁内：索引+页面插件候选+native 快照；
+            // ② 锁外：native RPC ≤300ms（超时保留进程，未就绪自动后台预热），
+            // 缺席结果以 partial=true 如实上报，UI 延迟补查；③ 合并截断（纯数据，无需锁）。
+            let mut prep = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-                let mut hits = g.search(&params.text);
-                let limit = if params.limit == 0 {
-                    g.config.max_results
-                } else {
-                    params.limit.min(g.config.max_results)
-                };
-                hits.truncate(limit as usize);
-                hits
+                g.search_prep(&params.text, params.limit)
             };
+            let mut partial = false;
+            if let Some(native_req) = prep.native.take() {
+                let (native_result, native_partial) = native_req.execute();
+                prep.hits.extend(native_result.items);
+                partial = native_partial;
+            }
+            prep.hits.truncate(prep.limit as usize);
             let result = QueryResult {
-                items,
-                partial: false,
+                items: prep.hits,
+                partial,
             };
             JsonRpcResponse::result(id, serde_json::to_value(result)?)
         }
@@ -377,12 +381,6 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                         info!(old = %g.config.hotkey_toggle, new = %hk, "hotkey updated");
                         g.config.hotkey_toggle = hk;
                     }
-                }
-                if let Some(value) = params.hide_on_focus_lost {
-                    g.config.hide_on_focus_lost = value;
-                }
-                if let Some(value) = params.hide_on_execute {
-                    g.config.hide_on_execute = value;
                 }
                 if let Some(value) = params.launch_on_startup {
                     g.config.launch_on_startup = value;

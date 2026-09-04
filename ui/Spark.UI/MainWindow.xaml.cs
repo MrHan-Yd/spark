@@ -51,14 +51,17 @@ public sealed partial class MainWindow : Window
     private int _active;
     /// <summary>收藏卡片选中索引（-1 = 未选中，焦点在结果区）；方向键可在结果区 ↔ 收藏区之间移动。</summary>
     private int _favActive = -1;
-    private bool _hideOnDeactivate = true;
     private bool _loaded;
     private bool _visible;
     private bool _gridView;
     private IntPtr _hwnd;
     private int _queryGen;
-    /// <summary>搜索防抖：快速连续输入只发最后一轮查询（配合 _queryGen 丢弃过期结果）。</summary>
-    private const int QueryDebounceMs = 120;
+    /// <summary>搜索防抖：快速连续输入只发最后一轮查询（配合 _queryGen 丢弃过期结果）。
+    /// 80ms：体感"跟手"与合并按键的平衡点；首字符查询不受防抖（见 _lastScheduledQuery）。</summary>
+    private const int QueryDebounceMs = 80;
+    /// <summary>上一次调度查询的文本（UI 线程字段）：为空而本次非空 = 首字符，立即查询不防抖，
+    /// 敲第一个字母结果就走；组词中 ScheduleRefresh 早退不更新，上屏补查按首字符语义立即发。</summary>
+    private string _lastScheduledQuery = "";
     /// <summary>窗口固定宽度（设置已移除宽度滑杆，不再读取 LocalState.Ui.WindowWidth）。</summary>
     private const int LauncherWidth = 800;
     private CancellationTokenSource? _debounceCts;
@@ -133,6 +136,9 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         _startHidden = Environment.GetCommandLineArgs().Any(a => a == "--hidden");
+        // 启动诊断：ctor 各阶段耗时（对齐 ui-crash.log 现有打点风格，量化冷启动）
+        var _ctorSw = System.Diagnostics.Stopwatch.StartNew();
+        long _xamlMs;
 
         // WinUI 3 窗口构造即显示：先隐藏，等 XAML 内容渲染完成（Content.Loaded）再显示，
         // 消除启动时"空白窗口框弹一下就消失"的体感问题。
@@ -140,6 +146,8 @@ public sealed partial class MainWindow : Window
 
         try { InitializeComponent(); }
         catch (Exception ex) { App.Log("InitializeComponent", ex); throw; }
+        _xamlMs = _ctorSw.ElapsedMilliseconds;
+        App.Log("Startup", $"InitializeComponent {_xamlMs}ms");
 
         // pane 切换过渡用的位移变换映射（XAML 字段须在 InitializeComponent 之后才能引用）
         _paneShifts[PaneGeneral] = PaneGeneralShift;
@@ -167,17 +175,21 @@ public sealed partial class MainWindow : Window
         // 箭头键在根上全局接管（handledEventsToo=true：输入框有文本时会先消费箭头键并把事件标为已处理，
         // 普通 KeyDown 收不到；这里在冒泡终点仍能收到），统一只控制下面选中项
         Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnRootKeyDown), true);
-        // 临时诊断：确认注入点击是否产生 XAML pointer 事件（验证 InputInjector 管道）
-        Root.PointerPressed += (_, e) =>
-            App.Log("Pointer", $"pressed at {e.GetCurrentPoint(Root).Position}");
         // 右键菜单：列表/平铺共用（handledEventsToo 保证行内元素命中也能收到）
         ResultList.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
         ResultGrid.AddHandler(UIElement.RightTappedEvent, new RightTappedEventHandler(OnResultRightTapped), true);
         // IME 组词期间不拦截箭头（组词光标移动由输入法管），否则会破坏中文输入
-        QueryBox.TextCompositionStarted += (_, _) => { _composing = true; App.Log("Ime", "composition started"); };
+        // 日志只在状态真正翻转时写一次：个别 TSF 会连发 Started/Ended，逐条同步落盘会拖慢输入
+        QueryBox.TextCompositionStarted += (_, _) =>
+        {
+            if (_composing) return;
+            _composing = true;
+            App.Log("Ime", "composition started");
+        };
         // 组词结束（上屏/取消）补一次查询：组词期间 TextChanged 也在触发，已被 ScheduleRefresh 挂起
         QueryBox.TextCompositionEnded += (_, _) =>
         {
+            if (!_composing) return;
             _composing = false;
             App.Log("Ime", "composition ended");
             ScheduleRefresh(QueryBox.Text ?? "");
@@ -193,7 +205,6 @@ public sealed partial class MainWindow : Window
         _fgHookProc = OnForegroundChanged;        // 背景：系统 Acrylic 真玻璃（macOS vibrancy 同构），深浅主题共用；
         // 系统禁用透明效果时回退纯色面板（ApplyTheme 里赋 _windowBg），任何机器效果一致。
 
-        _hideOnDeactivate = LocalState.Ui.HideOnFocusLost;
         ApplyTheme();
         SetView(LocalState.Ui.DefaultView == "grid");
         CompositionTarget.Rendering += OnFavRendering;
@@ -258,14 +269,15 @@ public sealed partial class MainWindow : Window
                 // 刚显示时忽略失焦（抢前台过程会短暂 Deactivated）
                 if (Environment.TickCount64 < _ignoreDeactivateUntilTicks)
                     return;
-                if (_hideOnDeactivate && _visible && SettingsPanel.Visibility != Visibility.Visible)
+                // 失焦隐藏是固化默认行为（设置页不提供开关）
+                if (_visible && SettingsPanel.Visibility != Visibility.Visible)
                 {
                     HideLauncher();
                     App.Log("Focus", "deactivated -> hide");
                 }
                 else
                 {
-                    App.Log("Focus", $"deactivated skipped: hideOnDeactivate={_hideOnDeactivate} visible={_visible}");
+                    App.Log("Focus", $"deactivated skipped: visible={_visible}");
                 }
                 return;
             }
@@ -300,6 +312,7 @@ public sealed partial class MainWindow : Window
         {
             if (_loaded) return;
             _loaded = true;
+            App.Log("Startup", $"Root.Loaded t+{_ctorSw.ElapsedMilliseconds}ms (XAML {_xamlMs}ms)");
             // 构造时窗口句柄可能未就绪（Acrylic 挂 target 需要），Loaded 后重放一次主题
             try { ApplyTheme(); } catch (Exception ex) { App.Log("Theme", ex); }
             try { await _host.EnsureConnectedAsync(); } catch (Exception ex) { App.Log("HostConnect", ex); }
@@ -312,6 +325,8 @@ public sealed partial class MainWindow : Window
             ApplyFavCollapse(!LocalState.Fav.Expanded, animate: false);
             _ = MaintainHostConnectionAsync();
         };
+
+        App.Log("Startup", $"ctor done {_ctorSw.ElapsedMilliseconds}ms (XAML {_xamlMs}ms)");
     }
 
     // ==================== 主题 ====================
@@ -458,6 +473,9 @@ public sealed partial class MainWindow : Window
     /// 之间浮动，静态色必然在某种背景上突兀。显示前（窗口仍隐藏）采样窗口矩形区域的
     /// 屏幕均值，按 AcrylicSystemBackdrop 的 tint 参数算出感知色，任何背景下外框都与
     /// 玻璃融为一体。窗口可见时采样会把窗口自身算进去，所以只在隐藏时调用（ShowLauncher）。
+    /// 采样必须同步发生在 Show 之前，不得后台化：后台线程的执行时机与 Show 竞态，
+    /// 一旦在窗口可见后才采样，矩形里是窗口自身（玻璃+内容）而非桌面背景，边框色
+    /// 会随结果列表内容/时序漂移（且对已 tint 过的玻璃像素二次叠 tint）。
     /// </summary>
     private void SyncDwmBorderColor()
     {
@@ -668,8 +686,6 @@ public sealed partial class MainWindow : Window
         _pendingHostConfig ??= new HostConfigUpdate
         {
             HotkeyToggle = LocalState.Ui.Hotkey,
-            HideOnFocusLost = LocalState.Ui.HideOnFocusLost,
-            HideOnExecute = LocalState.Ui.HideAfterInvoke,
             LaunchOnStartup = LocalState.Ui.LaunchOnStartup,
         };
         update(_pendingHostConfig);
@@ -719,24 +735,6 @@ public sealed partial class MainWindow : Window
                 {
                     LocalState.Ui.Hotkey = config.HotkeyToggle;
                 }
-                if (LocalState.Ui.HideOnFocusLost != config.HideOnFocusLost)
-                {
-                    pushHost.HideOnFocusLost = LocalState.Ui.HideOnFocusLost;
-                    changed = true;
-                }
-                else
-                {
-                    LocalState.Ui.HideOnFocusLost = config.HideOnFocusLost;
-                }
-                if (LocalState.Ui.HideAfterInvoke != config.HideOnExecute)
-                {
-                    pushHost.HideOnExecute = LocalState.Ui.HideAfterInvoke;
-                    changed = true;
-                }
-                else
-                {
-                    LocalState.Ui.HideAfterInvoke = config.HideOnExecute;
-                }
                 if (LocalState.Ui.LaunchOnStartup != config.LaunchOnStartup)
                 {
                     pushHost.LaunchOnStartup = LocalState.Ui.LaunchOnStartup;
@@ -746,7 +744,6 @@ public sealed partial class MainWindow : Window
                 {
                     LocalState.Ui.LaunchOnStartup = config.LaunchOnStartup;
                 }
-                _hideOnDeactivate = LocalState.Ui.HideOnFocusLost;
                 if (LocalState.Ui.LaunchOnStartup != GetStartupEntry())
                     SetStartupEntry(LocalState.Ui.LaunchOnStartup);
                 SyncSettingsUi();
@@ -757,8 +754,6 @@ public sealed partial class MainWindow : Window
                     QueueHostConfigUpdate(x =>
                     {
                         if (pushHost.HotkeyToggle is not null) x.HotkeyToggle = pushHost.HotkeyToggle;
-                        if (pushHost.HideOnFocusLost is not null) x.HideOnFocusLost = pushHost.HideOnFocusLost;
-                        if (pushHost.HideOnExecute is not null) x.HideOnExecute = pushHost.HideOnExecute;
                         if (pushHost.LaunchOnStartup is not null) x.LaunchOnStartup = pushHost.LaunchOnStartup;
                     });
                 }
@@ -881,6 +876,9 @@ public sealed partial class MainWindow : Window
             Activate();
             QueryBox.Focus(FocusState.Keyboard);
             ResetIme();
+            // ForceForeground 不再做同步重试（见其注释）：这里补异步重试兜底，
+            // 确保真拿到前台（否则点击外面关不掉）。
+            _ = RetryFocusAsync();
             // 失焦到重新抢回前台的链路同样挂不上 TSF（程序化聚焦无效），
             // 补一次真实输入激活（组词进行中会自动跳过，见 KickImeAsync）。
             _ = KickImeAsync();
@@ -1197,7 +1195,7 @@ public sealed partial class MainWindow : Window
             if (hwnd == _hwnd) return;  // 前台变成自己（打开/抢焦点）
             if (!_visible) return;
             if (Environment.TickCount64 < _ignoreDeactivateUntilTicks) return;
-            if (!_hideOnDeactivate || SettingsPanel.Visibility == Visibility.Visible) return;
+            if (SettingsPanel.Visibility == Visibility.Visible) return;
             HideLauncher();
             App.Log("Focus", $"fg hook -> hide (fg=0x{hwnd.ToInt64():X})");
         });
@@ -1217,7 +1215,6 @@ public sealed partial class MainWindow : Window
             onShow: () => DispatcherQueue.TryEnqueue(ShowLauncher),
             onExit: () => DispatcherQueue.TryEnqueue(() =>
             {
-                _hideOnDeactivate = false;
                 _tray?.Dispose();
                 _tray = null;
                 Close();
@@ -1330,6 +1327,7 @@ public sealed partial class MainWindow : Window
 
     public void ShowLauncher()
     {
+        var _showSw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             // 先标记可见 + 保护期，再 Show，避免中间 Deactivated 立刻 Hide
@@ -1349,8 +1347,14 @@ public sealed partial class MainWindow : Window
                 SetWindowPos(_hwnd, IntPtr.Zero, p.X, p.Y, 0, 0,
                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
-            // 采样背景把 DWM 圆角外框设成当前玻璃感知色（详见 SyncDwmBorderColor）
+            // 采样背景把 DWM 圆角外框设成当前玻璃感知色（详见 SyncDwmBorderColor）。
+            // 必须同步在 Show 之前、隐藏态执行：采样内容 = "窗口矩形处的桌面背景"，
+            // 窗口可见后矩形里就是窗口自身（玻璃+内容），把采样挪后台会与下面的 Show
+            // 形成竞态、随时序采到启动器自己（审计 NEEDS_FIX #1 修复：恢复同步 +
+            // 打点验证开销）。SetWindowPos 已在上面先行生效，跨屏采样顺序保持不变。
+            var _borderSw = System.Diagnostics.Stopwatch.StartNew();
             try { SyncDwmBorderColor(); } catch { /* ignore */ }
+            App.Log("Startup", $"SyncDwmBorderColor {_borderSw.ElapsedMilliseconds}ms");
 
             try { _appWindow?.Show(true); } catch { /* ignore */ }
             ShowWindow(_hwnd, 9);  // SW_RESTORE
@@ -1368,7 +1372,14 @@ public sealed partial class MainWindow : Window
             ApplyModeSwitch(open: false, animate: false);
             QueryBox.Text = "";
             _composing = false;  // 清空文本已销毁组词会话；Ended 事件未必触发，防 stale 挡住 kick
+            // 组词中 ScheduleRefresh 早退不更新该字段，此处程序化清空要显式复位，
+            // 否则唤起后第一个字符误走 80ms 防抖而非首字符立即通道
+            _lastScheduledQuery = "";
             _ = RefreshResultsAsync("");
+            // Text="" 已触发 OnQueryChanged → ScheduleRefresh（80ms 防抖）；唤起语义
+            // 固定查空串，上面显式这发已覆盖，取消防抖那次避免每次唤起双重 IPC 查询。
+            // （组词中赋值时 ScheduleRefresh 早退、无新 CTS，取消的是旧句柄，无害。）
+            _debounceCts?.Cancel();
             // 用 Keyboard 状态聚焦 + IME 重建：缓解 Show/Hide 循环后中文输入法
             // 候选窗不弹（详见 ResetIme）。注意：仅靠程序化聚焦+重建不足以挂上
             // TSF 文档管理器，真正的修复在下面的 KickImeAsync（注入真实输入）。
@@ -1400,6 +1411,8 @@ public sealed partial class MainWindow : Window
             // 触发失焦隐藏，保护期过长会把这真实的点击也拦掉（表现为点击外面
             // 没隐藏、第一次热键变"关闭"）。400ms 足够覆盖抢前台过程的瞬态。
             _ignoreDeactivateUntilTicks = Environment.TickCount64 + 400;
+            // 首帧前的同步块总耗时（诊断唤起延迟：动画之前这段越短首帧越快）
+            App.Log("Startup", $"ShowLauncher body {_showSw.ElapsedMilliseconds}ms");
         }
         catch (Exception ex)
         {
@@ -1613,14 +1626,11 @@ public sealed partial class MainWindow : Window
             SetWindowPos(_hwnd, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002); // HWND_NOTOPMOST
             // 保持 AlwaysOnTop 由 OverlappedPresenter 管；这里只是抢焦点
 
-            // 验证是否真的拿到前台；失败快速重试（AttachThreadInput 生效后通常一次成功，
-            // 偶发被前台锁拒绝时补几次。拿不到前台 = 窗口未激活：点击外面时前台无变化，
-            // FgHook/Deactivated 都不触发，窗口无法靠"点击外面"隐藏）
-            for (var i = 0; i < 3 && GetForegroundWindow() != _hwnd; i++)
-            {
-                Thread.Sleep(10);
-                SetForegroundWindow(_hwnd);
-            }
+            // 抢前台的失败重试不在这里同步做（Thread.Sleep 会卡 UI 线程、排在首帧前），
+            // 统一交给调用方跟随的 RetryFocusAsync（异步多轮 + 每轮补聚焦/IME 重建）。
+            // 拿不到前台 = 窗口未激活：点击外面时前台无变化，FgHook/Deactivated 都不
+            // 触发，窗口无法靠"点击外面"隐藏——所以每个 ForceForeground 调用点必须
+            // 保证有 RetryFocusAsync 兜底。
 
             if (fgTid != curTid)
                 AttachThreadInput(fgTid, curTid, false);
@@ -1643,7 +1653,26 @@ public sealed partial class MainWindow : Window
         if (gen != _queryGen) return;
 
         ApplyResults(result, gen, q);
+
+        // host 报 partial（native 插件结果未就绪/超时）：延迟补查一次。
+        // 防风暴：同一 q 只补一次（PartialRequeryQuery 去重）；用户继续输入会推进
+        // _queryGen，补查自然作废（gen 守卫丢弃）。空查询时复位去重标记——
+        // 覆盖"删光后重打同一个词"：上一轮补查可能已被 gen 失配丢弃，重打应重新可补。
+        if (q.Length == 0)
+            PartialRequeryQuery = null;
+        if (result.Partial && PartialRequeryQuery != q)
+        {
+            PartialRequeryQuery = q;
+            await Task.Delay(PartialRequeryDelayMs);
+            if (gen == _queryGen)
+                await RefreshResultsAsync(q);
+        }
     }
+
+    /// <summary>partial 补查去重：最近一次已补查的查询词（同一词只补一次，换词重新算）。</summary>
+    private string? PartialRequeryQuery;
+    /// <summary>partial 补查延迟：给 native 插件预热/慢响应留的窗口。</summary>
+    private const int PartialRequeryDelayMs = 600;
 
     /// <summary>结果落地：id 序列没变就不动集合（退格/微调零闪烁），变了才一次性
     /// 批量替换（单次 Reset，避免逐项 Add 触发 N 次布局）；旧对象按 id 复用保留
@@ -1738,7 +1767,6 @@ public sealed partial class MainWindow : Window
         if (sender is TextBlock tb && tb.DataContext is CandidateDto item)
         {
             RenderTitle(tb, item);
-            App.Log("HL", $"ctx: title='{item.Title}' q='{item.HighlightQuery}' inlines={tb.Inlines.Count} name={tb.Name}");
         }
     }
 
@@ -1840,8 +1868,8 @@ public sealed partial class MainWindow : Window
             ImageSource? src;
             if (IsPluginCandidate(item))
             {
-                // ImageSource 有线程亲和性，Load 必须在 UI 线程构造（与设置页先例一致）。
-                src = PluginIconLoader.Load(item.IconPath);
+                // ImageSource 有线程亲和性，构造必须在 UI 线程；磁盘嗅探在 LoadAsync 内部走后台线程
+                src = await PluginIconLoader.LoadAsync(item.IconPath);
             }
             else
             {
@@ -1866,8 +1894,8 @@ public sealed partial class MainWindow : Window
             ImageSource? src;
             if (IsPluginCandidate(c))
             {
-                // ImageSource 有线程亲和性，Load 必须在 UI 线程构造（与设置页先例一致）。
-                src = PluginIconLoader.Load(c.IconPath);
+                // ImageSource 有线程亲和性，构造必须在 UI 线程；磁盘嗅探在 LoadAsync 内部走后台线程
+                src = await PluginIconLoader.LoadAsync(c.IconPath);
             }
             else
             {
@@ -2021,7 +2049,8 @@ public sealed partial class MainWindow : Window
                     Footer.Text = "已执行：" + title;
                 }
                 catch (Exception ex) { App.Log("FavInvoke", ex); Footer.Text = "执行失败：" + title; }
-                if (LocalState.Ui.HideAfterInvoke) HideLauncher();
+                // 执行后隐藏是固化默认行为（设置页不提供开关）
+                HideLauncher();
             };
             // 右键收藏卡片：取消收藏
             btn.RightTapped += (_, e) => ShowFavCardMenu(btn, e, itemId, title);
@@ -3056,8 +3085,6 @@ public sealed partial class MainWindow : Window
         try
         {
             StartupSwitch.IsChecked = LocalState.Ui.LaunchOnStartup;
-            HideFocusSwitch.IsChecked = LocalState.Ui.HideOnFocusLost;
-            HideInvokeSwitch.IsChecked = LocalState.Ui.HideAfterInvoke;
             BallSwitch.IsChecked = LocalState.Ui.FloatingBallEnabled;
             DevModeSwitch.IsChecked = LocalState.Ui.DeveloperMode;
             ThemeCombo.SelectedIndex = LocalState.Ui.Theme switch { "light" => 2, "dark" => 1, _ => 0 };
@@ -3190,27 +3217,6 @@ public sealed partial class MainWindow : Window
             QueueHostConfigUpdate(x => x.LaunchOnStartup = on);
         }
         catch (Exception ex) { App.Log("StartupConfig", ex); }
-    }
-
-    private void OnToggleHideFocus(object sender, RoutedEventArgs e)
-    {
-        var on = HideFocusSwitch.IsChecked == true;
-        AnimateSwitchToggle(HideFocusSwitch, on, animate: !_syncing);
-        if (_syncing) return;
-        LocalState.Ui.HideOnFocusLost = on;
-        _hideOnDeactivate = on;
-        LocalState.SaveUi();
-        QueueHostConfigUpdate(x => x.HideOnFocusLost = on);
-    }
-
-    private void OnToggleHideInvoke(object sender, RoutedEventArgs e)
-    {
-        var on = HideInvokeSwitch.IsChecked == true;
-        AnimateSwitchToggle(HideInvokeSwitch, on, animate: !_syncing);
-        if (_syncing) return;
-        LocalState.Ui.HideAfterInvoke = on;
-        LocalState.SaveUi();
-        QueueHostConfigUpdate(x => x.HideOnExecute = on);
     }
 
     // ==================== 悬浮球 ====================
@@ -5215,20 +5221,22 @@ public sealed partial class MainWindow : Window
     private void OnQueryChanged(object sender, TextChangedEventArgs e)
         => ScheduleRefresh(QueryBox.Text ?? "");
 
-    /// <summary>查询调度：防抖 120ms 合并快速连续输入；IME 组词期间挂起，
-    /// 组词结束（TextCompositionEnded）再补查，避免中间态拼音反复查询。</summary>
+    /// <summary>查询调度：连续输入防抖合并；IME 组词期间挂起，
+    /// 组词结束（TextCompositionEnded）再补查；首字符（空→非空）立即查询不走防抖。</summary>
     private void ScheduleRefresh(string q)
     {
         _debounceCts?.Cancel();
         if (_composing) return;
+        var immediate = _lastScheduledQuery.Trim().Length == 0 && q.Trim().Length > 0;
+        _lastScheduledQuery = q;
         _debounceCts = new CancellationTokenSource();
         var ct = _debounceCts.Token;
-        _ = RefreshAfterDebounceAsync(q, ct);
+        _ = RefreshAfterDebounceAsync(q, ct, immediate ? 0 : QueryDebounceMs);
     }
 
-    private async Task RefreshAfterDebounceAsync(string q, CancellationToken ct)
+    private async Task RefreshAfterDebounceAsync(string q, CancellationToken ct, int delayMs)
     {
-        try { await Task.Delay(QueryDebounceMs, ct); }
+        try { await Task.Delay(delayMs, ct); }
         catch (TaskCanceledException) { return; }
         if (ct.IsCancellationRequested) return;
         await RefreshResultsAsync(q);
@@ -5522,7 +5530,7 @@ public sealed partial class MainWindow : Window
         await InvokeActionAsync(_items[_active].Id, "open");
     }
 
-    /// <summary>按 action 执行（回车/点击与右键菜单共用；含错误处理与 HideAfterInvoke）。</summary>
+    /// <summary>按 action 执行（回车/点击与右键菜单共用；含错误处理与执行后隐藏）。</summary>
     private async Task InvokeActionAsync(string itemId, string actionId, string? titleOverride = null)
     {
         var item = _items.FirstOrDefault(x => x.Id == itemId);
@@ -5552,11 +5560,9 @@ public sealed partial class MainWindow : Window
             Footer.Text = "执行失败：" + title;
             return;
         }
-        if (LocalState.Ui.HideAfterInvoke)
-        {
-            await Task.Delay(60);
-            HideLauncher();
-        }
+        // 执行后隐藏是固化默认行为（设置页不提供开关）
+        await Task.Delay(60);
+        HideLauncher();
     }
 
     private const string PluginPagePrefix = "plugin:page:";
@@ -5603,11 +5609,9 @@ public sealed partial class MainWindow : Window
             Footer.Text = "插件打开失败：" + title;
             return;
         }
-        if (LocalState.Ui.HideAfterInvoke)
-        {
-            await Task.Delay(60);
-            HideLauncher();
-        }
+        // 执行后隐藏是固化默认行为（设置页不提供开关）
+        await Task.Delay(60);
+        HideLauncher();
     }
 
     /// <summary>

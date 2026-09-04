@@ -26,11 +26,22 @@ public sealed class PluginRowVm : INotifyPropertyChanged
         Permissions = info.Permissions
             .Select(p => new PermissionVm(p, info.Granted.Contains(p)))
             .ToList();
-        if (!string.IsNullOrEmpty(info.Icon) && File.Exists(info.Icon))
+        if (!string.IsNullOrEmpty(info.Icon))
         {
-            // 位图走 WIC，SVG 走 SvgImageSource（见 PluginIconLoader）；失败保持 null → 首字母占位
-            IconImage = PluginIconLoader.Load(info.Icon);
+            // 位图走 WIC，SVG 走 SvgImageSource（见 PluginIconLoader）；失败保持 null → 首字母占位。
+            // 加载含磁盘嗅探已异步化：先渲染字母占位，加载完成回填（fire-and-forget）。
+            _ = LoadIconAsync(info.Icon);
         }
+    }
+
+    private async Task LoadIconAsync(string path)
+    {
+        var src = await PluginIconLoader.LoadAsync(path);
+        if (src is null || ReferenceEquals(IconImage, src)) return;
+        IconImage = src;
+        OnPropertyChanged(nameof(IconImage));
+        OnPropertyChanged(nameof(IconImageVisibility));
+        OnPropertyChanged(nameof(IconTextVisibility));
     }
 
     public string Id => _info.Id;
@@ -99,7 +110,8 @@ public sealed class PluginRowVm : INotifyPropertyChanged
 
     public List<PermissionVm> Permissions { get; }
 
-    public ImageSource? IconImage { get; }
+    /// <summary>异步加载完成前为 null（字母占位），回填后通知可见性翻转。</summary>
+    public ImageSource? IconImage { get; private set; }
 
     public Visibility IconImageVisibility =>
         IconImage is null ? Visibility.Collapsed : Visibility.Visible;

@@ -25,6 +25,45 @@ pub fn record_baseline() {
     }
 }
 
+/// 冷启动后台索引构建：bootstrap 只同步加载历史（毫秒级），Start Menu 全量
+/// 扫描（数百个 .lnk 逐个 COM 解析，几百 ms）放后台线程，完成后带 reconcile
+/// 换入索引。让 main 的热键注册/托盘/UI 拉起不再等索引——开机瞬间按热键即
+/// 响应，索引换入前搜索由内置命令+历史兜底（窗口 <1s）。
+/// 与 30s 定时器路径共用 REFRESHING 闸，防并发双重重建。
+pub fn build_boot_index(host: &SharedHost) {
+    if REFRESHING.swap(true, Ordering::SeqCst) {
+        info!("boot index build skipped: a rebuild is already running");
+        return;
+    }
+    let host2 = host.clone();
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        let mut mem = MemoryIndex::new();
+        for app in enumerate_start_menu_apps() {
+            mem.upsert(app);
+        }
+        if mem.len() < 3 {
+            // 开发/受限环境兜底，与 with_seed_fallback 一致
+            for app in MemoryIndex::with_seed_apps().into_items() {
+                mem.upsert(app);
+            }
+        }
+        let n = mem.len();
+        match host2.lock() {
+            Ok(mut g) => {
+                g.index.swap_memory_with_reconcile(mem);
+                info!(
+                    apps = n,
+                    build_ms = t0.elapsed().as_millis() as u64,
+                    "app index ready (background)"
+                );
+            }
+            Err(e) => warn!(?e, "host lock poisoned; boot index swap skipped"),
+        }
+        REFRESHING.store(false, Ordering::SeqCst);
+    });
+}
+
 /// 检查 Start Menu 是否变化；变了就在后台重建索引并原子换入。
 pub fn poll(host: &SharedHost) {
     let fp = start_menu_fingerprint();

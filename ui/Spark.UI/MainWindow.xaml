@@ -836,32 +836,7 @@
                   <ToggleButton x:Name="StartupSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Checked="OnToggleStartup" Unchecked="OnToggleStartup"/>
                 </Grid>
               </Border>
-              <Border Style="{StaticResource PaneRowBorder}">
-                <Grid ColumnSpacing="16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                  </Grid.ColumnDefinitions>
-                  <StackPanel Spacing="3">
-                    <TextBlock Text="失焦时隐藏" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <TextBlock Text="点击窗口外部时自动隐藏" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"/>
-                  </StackPanel>
-                  <ToggleButton x:Name="HideFocusSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Checked="OnToggleHideFocus" Unchecked="OnToggleHideFocus"/>
-                </Grid>
-              </Border>
-              <Border Style="{StaticResource PaneRowBorder}">
-                <Grid ColumnSpacing="16">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                  </Grid.ColumnDefinitions>
-                  <StackPanel Spacing="3">
-                    <TextBlock Text="执行后隐藏" FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
-                    <TextBlock Text="打开结果后隐藏窗口" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"/>
-                  </StackPanel>
-                  <ToggleButton x:Name="HideInvokeSwitch" Grid.Column="1" Style="{StaticResource SwitchStyle}" Checked="OnToggleHideInvoke" Unchecked="OnToggleHideInvoke"/>
-                </Grid>
-              </Border>
+              <!-- 失焦隐藏 / 执行后隐藏为固化默认行为，不提供开关 -->
               <Border Style="{StaticResource PaneRowBorder}">
                 <Grid ColumnSpacing="16">
                   <Grid.ColumnDefinitions>
@@ -1038,10 +1013,11 @@
                           Padding="14,6" CornerRadius="8" FontSize="12" FontWeight="SemiBold"
                           Background="{StaticResource AccentSoftBrush}" Foreground="{StaticResource TextPrimaryBrush}"
                           BorderThickness="0"/>
+                  <!-- 插件安全页（严格模式/受信任开发者）暂不开放：仅隐藏入口，功能与验签逻辑保持原样 -->
                   <Button x:Name="TabPluginSecurityBtn" Content="插件安全" Click="OnSelectPluginSecurityTab"
                           Padding="14,6" CornerRadius="8" FontSize="12"
                           Background="Transparent" Foreground="{StaticResource TextSecondaryBrush}"
-                          BorderThickness="0"/>
+                          BorderThickness="0" Visibility="Collapsed"/>
                   <Button x:Name="TabMarketplaceBtn" Content="插件市场" Click="OnSelectMarketplaceTab"
                           Padding="14,6" CornerRadius="8" FontSize="12"
                           Background="Transparent" Foreground="{StaticResource TextSecondaryBrush}"

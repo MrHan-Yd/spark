@@ -40,6 +40,18 @@ public sealed class HostIpcClient : IAsyncDisposable
 
     /// <summary>上次尝试拉起 host 进程的时刻（节流，防失败重试风暴重复 spawn）。</summary>
     private long _lastSpawnAttemptTicks;
+    /// <summary>已记过 QueryFallback 日志的连接代（-1 = 尚未记过）。断连期间打字每键一条
+    /// 同步文件 IO 会拖慢输入，同一断连段只记一条，重连成功后复位。</summary>
+    private long _fallbackLoggedGen = -1;
+
+    /// <summary>同一连接代只记一次降级日志（诊断保留首条，其余静默）。</summary>
+    private void LogFallbackOnce(string tag, Exception ex)
+    {
+        var gen = Interlocked.Read(ref _connectionGeneration);
+        if (Interlocked.CompareExchange(ref _fallbackLoggedGen, gen, gen) == gen) return;
+        Interlocked.Exchange(ref _fallbackLoggedGen, gen);
+        App.Log(tag, ex);
+    }
 
     public async Task EnsureConnectedAsync(CancellationToken ct = default)
     {
@@ -78,6 +90,7 @@ public sealed class HostIpcClient : IAsyncDisposable
                     };
                     _loopCts = new CancellationTokenSource();
                     _loopDead = false;
+                    Interlocked.Exchange(ref _fallbackLoggedGen, -1); // 新连接段允许再记一条降级
                     _loopTask = Task.Run(() => ReadLoopAsync(_loopCts.Token, generation));
                     last = null;
                     try { Connected?.Invoke(); } catch { /* 订阅者异常不拖垮连接 */ }
@@ -264,7 +277,7 @@ public sealed class HostIpcClient : IAsyncDisposable
         await EnsureConnectedAsync(ct);
         if (!IsConnected)
         {
-            App.Log("QueryFallback", new InvalidOperationException("not connected"));
+            LogFallbackOnce("QueryFallback", new InvalidOperationException("not connected"));
             return DemoData.Query(text);
         }
 
@@ -273,7 +286,7 @@ public sealed class HostIpcClient : IAsyncDisposable
             var result = await CallAsync("host.query", new { text, limit }, ct);
             if (result.ValueKind == JsonValueKind.Undefined)
             {
-                App.Log("QueryFallback",
+                LogFallbackOnce("QueryFallback",
                     new InvalidOperationException($"undefined result; writerNull={_writer is null}"));
                 return DemoData.Query(text);
             }
@@ -282,7 +295,7 @@ public sealed class HostIpcClient : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            App.Log("QueryFallback", ex);
+            LogFallbackOnce("QueryFallback", ex);
             return DemoData.Query(text);
         }
     }
@@ -587,10 +600,8 @@ public sealed class HostConfigDto
 {
     [JsonPropertyName("hotkey_toggle")]
     public string HotkeyToggle { get; set; } = "Alt+Space";
-    [JsonPropertyName("hide_on_focus_lost")]
-    public bool HideOnFocusLost { get; set; } = true;
-    [JsonPropertyName("hide_on_execute")]
-    public bool HideOnExecute { get; set; } = true;
+    // hide_on_focus_lost / hide_on_execute 已固化为始终开启的默认行为：
+    // host 旧 config 仍会下发这两个字段，此处有意不映射（未知字段反序列化时跳过）。
     [JsonPropertyName("max_results")]
     public uint MaxResults { get; set; } = 50;
     [JsonPropertyName("plugins_dir")]
@@ -627,10 +638,6 @@ public sealed class HostConfigUpdate
 {
     [JsonPropertyName("hotkey_toggle")]
     public string? HotkeyToggle { get; set; }
-    [JsonPropertyName("hide_on_focus_lost")]
-    public bool? HideOnFocusLost { get; set; }
-    [JsonPropertyName("hide_on_execute")]
-    public bool? HideOnExecute { get; set; }
     [JsonPropertyName("launch_on_startup")]
     public bool? LaunchOnStartup { get; set; }
     [JsonPropertyName("strict_mode")]
@@ -645,8 +652,6 @@ public sealed class HostConfigUpdate
     public HostConfigUpdate Clone() => new()
     {
         HotkeyToggle = HotkeyToggle,
-        HideOnFocusLost = HideOnFocusLost,
-        HideOnExecute = HideOnExecute,
         LaunchOnStartup = LaunchOnStartup,
         StrictMode = StrictMode,
         TrustedPubkeys = TrustedPubkeys,
@@ -655,8 +660,6 @@ public sealed class HostConfigUpdate
 
     public bool Equals(HostConfigUpdate? other) => other is not null
         && HotkeyToggle == other.HotkeyToggle
-        && HideOnFocusLost == other.HideOnFocusLost
-        && HideOnExecute == other.HideOnExecute
         && LaunchOnStartup == other.LaunchOnStartup
         && StrictMode == other.StrictMode
         && TrustedPubkeys == other.TrustedPubkeys

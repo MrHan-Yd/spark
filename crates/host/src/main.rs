@@ -83,6 +83,9 @@ fn main() -> Result<()> {
             let hits = host.search(q);
             println!("{}", serde_json::to_string_pretty(&hits)?);
         }
+        // native 运行时在专职线程上，句柄 drop 无副作用（PERF-SEARCH ③）——
+        // 一次性模式 spawn 过的插件进程必须显式收割，否则只能靠插件自觉自退
+        host.shutdown();
         return Ok(());
     }
 
@@ -135,11 +138,15 @@ fn main() -> Result<()> {
         }
     };
 
-    let host = app::HostApp::bootstrap(cli.plugins_dir.as_deref())?;
+    let t0 = std::time::Instant::now();
+    let host = app::HostApp::bootstrap_fast(cli.plugins_dir.as_deref())?;
+    info!(
+        boot_ms = t0.elapsed().as_millis() as u64,
+        "bootstrap_fast done (index building in background)"
+    );
     info!(
         app = spark_core::APP_NAME,
         version = env!("CARGO_PKG_VERSION"),
-        indexed = host.index_len(),
         plugins = host.plugin_count(),
         hotkey = %host.config.hotkey_toggle,
         "spark-host starting"
@@ -147,14 +154,19 @@ fn main() -> Result<()> {
 
     let shared = app::share(host);
     let hub = ipc_server::spawn(shared.clone());
-    // Give pipe a moment to bind before UI connects
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    // 索引后台构建：热键/托盘/UI 不再等 Start Menu 全量扫描（几百 ms）。
+    // 历史已同步加载，默认页立即可用；完成后带 reconcile 换入（见 build_boot_index）。
+    crate::index_watch::build_boot_index(&shared);
 
     if !cli.no_ui {
         try_spawn_ui_on_boot();
     }
 
     let icon = cli.icon.or_else(find_default_icon);
+    info!(
+        t_plus_ms = t0.elapsed().as_millis() as u64,
+        "entering message loop (hotkey registers inside win_loop)"
+    );
     win_loop::run(shared.clone(), hub, icon)?;
     // 消息循环退出后，优雅关闭 native 插件进程（发 shutdown + wait），再退出 host。
     // 不依赖 Arc drop 时机：IPC 线程仍持有 shared 副本，drop 会延后。

@@ -19,29 +19,38 @@ namespace Spark.UI.Services;
 /// 注意：SvgImageSource 真正的解码失败走 OpenFailed/ImageFailed 事件而非抛异常，
 /// 此时与"位图字节损坏"同款表现——Image 区域留白，不再回退占位块；在设置列表的
 /// 观感是"字母占位块隐藏 + 34px 空白"（IconImage 非空 → IconImageVisibility 为 Visible）。
+/// 磁盘 IO（存在性检查/SVG 内容嗅探）在后台线程执行，仅对象构造回 UI 线程
+/// （ImageSource 线程亲和）；同步版 Load 已移除，调用方一律 await LoadAsync。
 /// </summary>
 public static class PluginIconLoader
 {
-    public static ImageSource? Load(string? path)
+    private enum IconFileKind { Bitmap, Svg }
+
+    public static async Task<ImageSource?> LoadAsync(string? path)
     {
-        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+        if (string.IsNullOrEmpty(path)) return null;
+        var kind = await Task.Run(() => Probe(path));
+        if (kind is null) return null;
         try
         {
             var uri = ToFileUri(path);
-            if (IsSvg(path))
-            {
-                // 内容嗅探：防"改了扩展名的位图"这类文件让 Image 区域整块留白，
-                // 返回 null 走占位兜底比留白好。真 SVG 解码失败（如含不支持的 SVG2 特性）无法同步判定。
-                if (!LooksLikeSvg(path)) return null;
-                return new SvgImageSource(uri);
-            }
-            return new BitmapImage(uri);
+            return kind == IconFileKind.Svg ? new SvgImageSource(uri) : new BitmapImage(uri);
         }
         catch (Exception ex)
         {
             App.Log("PluginIcon", ex);
             return null;
         }
+    }
+
+    /// <summary>后台探测：null = 文件缺失，或"声称 svg 但内容不是"；否则返回文件种类。
+    /// 内容嗅探：防"改了扩展名的位图"这类文件让 Image 区域整块留白，
+    /// 返回 null 走占位兜底比留白好。真 SVG 解码失败（如含不支持的 SVG2 特性）无法同步判定。</summary>
+    private static IconFileKind? Probe(string path)
+    {
+        if (!File.Exists(path)) return null;
+        if (!IsSvg(path)) return IconFileKind.Bitmap;
+        return LooksLikeSvg(path) ? IconFileKind.Svg : null;
     }
 
     private static bool IsSvg(string path)
