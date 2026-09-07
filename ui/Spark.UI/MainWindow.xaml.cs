@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -372,7 +373,9 @@ public sealed partial class MainWindow : Window
             ["GridTileBgBrush"] = dark ? 0x08FFFFFFu : 0x0A000000u,
             ["GridTileSelBgBrush"] = dark ? 0x1EFFFFFFu : 0x16000000u,
             ["GridTileSelBorderBrush"] = dark ? 0x40FFFFFFu : 0x40000000u,
-            ["SwitchTrackOffBrush"] = dark ? 0x52303038u : 0x33000000u,
+            // OFF 轨道：深色用原型 rgba(120,120,128,.32)（中灰，深玻璃底上对比够）；
+            // 0x52303038 用户反馈看不清（算术对比仅 ~3/255），勿再取该值
+            ["SwitchTrackOffBrush"] = dark ? 0x52787880u : 0x33000000u,
             ["StarBrush"] = 0xFFFFD60Au,
             // 下拉弹出层：半透明玻璃（深色 75% #1C1C1E / 浅色 75% 白，透出壁纸色斑）
             ["ComboPopupBgBrush"] = dark ? 0xC01C1C1Eu : 0xC0FFFFFFu,
@@ -3077,8 +3080,7 @@ public sealed partial class MainWindow : Window
         Add(shift, "Y", y0, y1);
     }
 
-    /// <summary>打开设置时把 LocalState 同步到控件（期间不触发保存副作用）。
-    /// 开机启动以注册表实际状态为准（用户可能在任务管理器里手动改过），LocalState 仅作缓存。</summary>
+    /// <summary>打开设置时把 LocalState 同步到控件（期间不触发保存副作用）。</summary>
     private void SyncSettingsUi()
     {
         _syncing = true;
@@ -3090,6 +3092,13 @@ public sealed partial class MainWindow : Window
             ThemeCombo.SelectedIndex = LocalState.Ui.Theme switch { "light" => 2, "dark" => 1, _ => 0 };
             ViewCombo.SelectedIndex = LocalState.Ui.DefaultView == "grid" ? 1 : 0;
             UpdateHotkeyPresets(animate: false);
+            // 自绘开关的视觉只由 Checked/Unchecked 事件驱动，而等值赋值不触发事件；
+            // 开机同步又发生在设置面板 Collapsed（模板未实例化）时，事件里的视觉更新
+            // 也会静默跳过。必须显式落定一次，否则重启后首次打开设置，
+            // 已开启的开关画成模板默认的 OFF（用户看到"设置没保存"）。
+            AnimateSwitchToggle(StartupSwitch, StartupSwitch.IsChecked == true, animate: false);
+            AnimateSwitchToggle(BallSwitch, BallSwitch.IsChecked == true, animate: false);
+            AnimateSwitchToggle(DevModeSwitch, DevModeSwitch.IsChecked == true, animate: false);
         }
         finally { _syncing = false; }
     }
@@ -3165,42 +3174,97 @@ public sealed partial class MainWindow : Window
         catch (Exception ex) { App.Log("StartupRegistry", ex); }
     }
 
-    // ==================== 开关视觉（原型 .switch：OFF rgba(120,120,128,.32) / ON #30d158，transition 0.2s） ====================
+    // ==================== 开关视觉（ON #30d158；OFF 轨道 = 主题刷 SwitchTrackOffBrush，transition 0.2s） ====================
 
     private static readonly Color SwitchOnColor = Color.FromArgb(0xFF, 0x30, 0xD1, 0x58);
-    private static readonly Color SwitchOffColor = Color.FromArgb(0x52, 0x78, 0x78, 0x80);
+    private static readonly Color SwitchOffColor = Color.FromArgb(0x52, 0x78, 0x78, 0x80); // 兜底：主题刷缺失时
+    private SolidColorBrush? _switchOnBrush;
+
+    private SolidColorBrush SwitchOnBrush => _switchOnBrush ??= new SolidColorBrush(SwitchOnColor);
+
+    /// <summary>OFF 轨道刷 = 共享主题刷（ApplyTheme 随深浅主题原地改 Color，主题切换实时跟随）。
+    /// 只按状态赋引用、绝不原地改它的 Color——共享刷被改会串掉全应用的 OFF 轨道。</summary>
+    private SolidColorBrush SwitchOffBrush =>
+        Root.Resources.TryGetValue("SwitchTrackOffBrush", out var o) && o is SolidColorBrush b
+            ? b : new SolidColorBrush(SwitchOffColor);
+
+    /// <summary>按开关隔离的动画状态：所有改变视觉的路径（含直落定）都先 Stop 旧动画并递增本开关
+    /// 的代数，使更早的 Completed 失效——窗口级单一计数会跨开关串扰（A 的动画被 B 作废后，
+    /// A 的轨道永久滞留克隆刷、不再跟随主题）。ConditionalWeakTable 不阻虚拟化插件行 GC。</summary>
+    private sealed class SwitchAnimState
+    {
+        public int Gen;
+        public Storyboard? Anim;
+    }
+
+    private static readonly ConditionalWeakTable<ToggleButton, SwitchAnimState> SwitchAnimStates = new();
+
+    private static SwitchAnimState AnimStateOf(ToggleButton toggle) =>
+        SwitchAnimStates.GetValue(toggle, _ => new SwitchAnimState());
 
     /// <summary>开关切换过渡：轨道颜色渐变 + 滑块滑动（200ms ease-out，对齐原型 transition 0.2s）。
     /// 视觉由代码驱动（不用模板内 VSM）：初始化（_syncing）时直接落定终值，用户点击时播动画。
     /// 模板元素经视觉树根 FindName 获取（模板命名作用域内可解析）。</summary>
     private void AnimateSwitchToggle(ToggleButton toggle, bool on, bool animate)
     {
-        if (VisualTreeHelper.GetChildrenCount(toggle) == 0) return;
+        if (VisualTreeHelper.GetChildrenCount(toggle) == 0)
+        {
+            // 设置面板 Collapsed 期间模板未实例化（Collapsed 元素不参与 Measure），
+            // 视觉无从落定：挂 LayoutUpdated 等模板就绪后按当前 IsChecked 补画。
+            // 开机同步（SyncFromHostAsync → SyncSettingsUi）正是走的这条死路。
+            void SettleOnLayout(object? s, object? e)
+            {
+                if (VisualTreeHelper.GetChildrenCount(toggle) == 0) return;
+                toggle.LayoutUpdated -= SettleOnLayout;
+                AnimateSwitchToggle(toggle, toggle.IsChecked == true, animate: false);
+            }
+            toggle.LayoutUpdated += SettleOnLayout;
+            return;
+        }
         var root = (FrameworkElement)VisualTreeHelper.GetChild(toggle, 0);
         var thumbT = root.FindName("ThumbTransform") as TranslateTransform;
         var track = root.FindName("Track") as Border;
-        if (thumbT is null || track?.Background is not SolidColorBrush bg) return;
+        if (thumbT is null || track is null) return;
+
+        var state = AnimStateOf(toggle);
+        // Stop 前先取当前值（动画中读到的是合成值；Stop 后退回基值，连点会跳变）
+        var fromX = thumbT.X;
+        var fromColor = (track.Background as SolidColorBrush)?.Color ?? SwitchOffColor;
+        state.Anim?.Stop();
+        state.Anim = null;
+        state.Gen++;
 
         var toX = on ? 16.0 : 0.0;
-        var toColor = on ? SwitchOnColor : SwitchOffColor;
         if (!animate)
         {
+            // 直落定：按状态赋刷子（OFF=共享主题刷，ON=私有绿刷），不改共享刷的 Color
             thumbT.X = toX;
-            bg.Color = toColor;
+            track.Background = on ? SwitchOnBrush : SwitchOffBrush;
             return;
         }
 
+        // 动画路径：先换上私有克隆刷再播渐变——共享主题刷不能被 Storyboard 原地改色；
+        // 结束后吸附回状态对应的最终刷子（gen 防连点/回滚时旧动画把新状态刷回去）。
+        var animBrush = new SolidColorBrush(fromColor);
+        track.Background = animBrush;
+        var gen = state.Gen;
         var sb = new Storyboard();
         var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
         var d = new Duration(TimeSpan.FromMilliseconds(200));
-        var x = new DoubleAnimation { From = thumbT.X, To = toX, Duration = d, EasingFunction = ease };
+        var x = new DoubleAnimation { From = fromX, To = toX, Duration = d, EasingFunction = ease };
         Storyboard.SetTarget(x, thumbT);
         Storyboard.SetTargetProperty(x, "X");
         sb.Children.Add(x);
-        var c = new ColorAnimation { From = bg.Color, To = toColor, Duration = d, EasingFunction = ease };
-        Storyboard.SetTarget(c, bg);
+        var c = new ColorAnimation { From = fromColor, To = on ? SwitchOnColor : SwitchOffBrush.Color, Duration = d, EasingFunction = ease };
+        Storyboard.SetTarget(c, animBrush);
         Storyboard.SetTargetProperty(c, "Color");
         sb.Children.Add(c);
+        state.Anim = sb;
+        sb.Completed += (_, _) =>
+        {
+            if (gen == state.Gen)
+                track.Background = on ? SwitchOnBrush : SwitchOffBrush;
+        };
         sb.Begin();
     }
 
@@ -3528,6 +3592,8 @@ public sealed partial class MainWindow : Window
         try
         {
             StrictModeSwitch.IsChecked = cfg.StrictMode;
+            // IsChecked 等值赋值不触发事件，自绘视觉须显式落定（与通用页三开关同范式）
+            AnimateSwitchToggle(StrictModeSwitch, StrictModeSwitch.IsChecked == true, animate: false);
             _trustedDevs.Clear();
             foreach (var dto in cfg.TrustedPubkeys)
                 _trustedDevs.Add(new TrustedDevVm(dto));
@@ -3554,8 +3620,11 @@ public sealed partial class MainWindow : Window
 
     private async void OnToggleStrictMode(object sender, RoutedEventArgs e)
     {
-        if (_loadingPluginConfig) return;
         var on = StrictModeSwitch.IsChecked == true;
+        // 先画后守卫（与 OnToggleStartup 同序）：刷新/回滚路径的程序化赋值触发的
+        // Checked/Unchecked 会在守卫处 return，视觉更新必须发生在守卫之前
+        AnimateSwitchToggle(StrictModeSwitch, on, animate: !_loadingPluginConfig);
+        if (_loadingPluginConfig) return;
         if (!await _host.SetConfigAsync(new HostConfigUpdate { StrictMode = on }))
         {
             // 程序化回滚 IsChecked 会重入 Checked/Unchecked 事件（与 OnToggleBall 的

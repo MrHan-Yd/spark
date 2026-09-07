@@ -35,7 +35,7 @@
       <!-- 平铺选中框（中性灰，比平时卡片底明显）：深色 12% 白底 + 25% 白边 -->
       <SolidColorBrush x:Key="GridTileSelBgBrush" Color="#1EFFFFFF"/>
       <SolidColorBrush x:Key="GridTileSelBorderBrush" Color="#40FFFFFF"/>
-      <SolidColorBrush x:Key="SwitchTrackOffBrush" Color="#52303038"/>
+      <SolidColorBrush x:Key="SwitchTrackOffBrush" Color="#52787880"/>
       <SolidColorBrush x:Key="StarBrush" Color="#FFD60A"/>
       <!-- 顶部高光（对应 .launcher-glass::before） -->
       <LinearGradientBrush x:Key="GlassHighlightBrush" StartPoint="0,0" EndPoint="0,1">
@@ -381,9 +381,10 @@
                     </VisualState>
                   </VisualStateGroup>
                 </VisualStateManager.VisualStateGroups>
-                <!-- OFF 轨道：rgba(120,120,128,0.32)（原型值，中性灰比黑灰更"看得出是个开关"）；
-                     ON 绿色由代码动画驱动 -->
-                <Border x:Name="Track" CornerRadius="13" Background="#52787880"/>
+                <!-- OFF 轨道 = 共享主题刷 SwitchTrackOffBrush（ApplyTheme 按深浅主题原地改色，
+                     浅色主题下 20% 黑清晰可见，主题切换时所有 OFF 轨道实时跟随）。
+                     它被全部开关实例共享，绝不能原地改 Color：AnimateSwitchToggle 动画走私有克隆刷 -->
+                <Border x:Name="Track" CornerRadius="13" Background="{StaticResource SwitchTrackOffBrush}"/>
                 <!-- 滑块：白底 + 细描边模拟原型 box-shadow 的立体感 -->
                 <Border x:Name="Thumb" Width="22" Height="22" CornerRadius="11" Background="White"
                         BorderBrush="#33000000" BorderThickness="1"
@@ -926,7 +927,7 @@
               </StackPanel.RenderTransform>
               <!-- 筛选行：关键词（名称/别名/拼音缩写/说明/id）；仅客户端内存过滤，随清单拉取结果显示 -->
               <TextBox x:Name="BuiltinFilterBox" PlaceholderText="筛选：名称 / 拼音缩写（calc、jt）"
-                       FontSize="12" Padding="8,5" CornerRadius="8" VerticalAlignment="Center"
+                       FontSize="12" Padding="8,8" CornerRadius="8" VerticalAlignment="Center"
                        BorderBrush="{StaticResource GlassBorderBrush}"
                        Foreground="{StaticResource TextPrimaryBrush}" Visibility="Collapsed"
                        TextChanged="OnBuiltinFilterChanged"/>
@@ -1367,11 +1368,11 @@
                         <ColumnDefinition Width="Auto"/>
                       </Grid.ColumnDefinitions>
                       <TextBox x:Name="TrustedDevKeyId" PlaceholderText="key_id" Width="140"
-                               FontSize="12" Padding="8,5" CornerRadius="6"
+                               FontSize="12" Padding="8,8" CornerRadius="6"
                                BorderBrush="{StaticResource GlassBorderBrush}"
                                Foreground="{StaticResource TextPrimaryBrush}"/>
                       <TextBox x:Name="TrustedDevPubkey" Grid.Column="1" PlaceholderText="base64 公钥（32 字节 Ed25519）"
-                               FontSize="12" Padding="8,5" CornerRadius="6"
+                               FontSize="12" Padding="8,8" CornerRadius="6"
                                BorderBrush="{StaticResource GlassBorderBrush}"
                                Foreground="{StaticResource TextPrimaryBrush}"/>
                       <Button Grid.Column="2" Click="OnAddTrustedDev" Content="添加" Padding="12,5"
@@ -1431,7 +1432,8 @@
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                               </Grid.ColumnDefinitions>
-                              <TextBox Text="{Binding Url, Mode=TwoWay}" FontSize="11" VerticalAlignment="Center"/>
+                              <!-- 小字号 + 默认 Padding 内容不足 MinHeight=32，文本会顶对齐；MinHeight=0 收紧自适配即居中 -->
+                              <TextBox Text="{Binding Url, Mode=TwoWay}" FontSize="11" VerticalAlignment="Center" MinHeight="0"/>
                               <Button Grid.Column="1" Click="OnRemoveCustomRepoUrl" Padding="8,4"
                                       Background="Transparent" BorderBrush="{StaticResource GlassBorderBrush}"
                                       BorderThickness="1" CornerRadius="6" FontSize="11"
@@ -1473,7 +1475,7 @@
                     <ColumnDefinition Width="Auto"/>
                   </Grid.ColumnDefinitions>
                   <TextBox x:Name="MarketFilterBox" PlaceholderText="筛选：名称 / 描述 / 作者 / id"
-                           FontSize="12" Padding="8,5" CornerRadius="8" VerticalAlignment="Center"
+                           FontSize="12" Padding="8,8" CornerRadius="8" VerticalAlignment="Center"
                            BorderBrush="{StaticResource GlassBorderBrush}"
                            Foreground="{StaticResource TextPrimaryBrush}"
                            TextChanged="OnMarketFilterChanged"/>
@@ -1762,7 +1764,7 @@
                    PlaceholderText="分组名称（最多 8 字）"
                    Background="{StaticResource ChipBgBrush}"
                    BorderBrush="{StaticResource DividerBrush}" BorderThickness="1"
-                   CornerRadius="8" Padding="10,6"
+                   CornerRadius="8" Padding="10,7"
                    Foreground="{StaticResource TextPrimaryBrush}"
                    PlaceholderForeground="{StaticResource TextTertiaryBrush}"
                    KeyDown="OnFavGroupNameKeyDown"/>
