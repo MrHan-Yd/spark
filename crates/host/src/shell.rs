@@ -12,6 +12,24 @@ pub fn shell_open(target: &str) -> Result<()> {
     shell_execute(target, "open")
 }
 
+/// `spark.shell.openExternal`（《插件开发规范》§8.3）：用系统默认程序打开 URL/文件。
+///
+/// 插件桥入口的输入净化：拒绝空串/超长/任何 C0 控制字符（含 CR/LF/NUL——
+/// ShellExecuteW 收到嵌 NUL 的 wide 串会静默截断，控制字符则可能拼出非预期
+/// 命令行）。语义即"系统默认程序打开"，verb 恒为 open，不代执行带参命令。
+pub fn open_external(target: &str) -> Result<()> {
+    if target.is_empty() {
+        bail!("INVALID_ARGS: target 不能为空");
+    }
+    if target.len() > 2048 {
+        bail!("INVALID_ARGS: target 超过 2048 字符上限");
+    }
+    if target.chars().any(|c| (c as u32) < 0x20 || c == '\u{7F}') {
+        bail!("INVALID_ARGS: target 含非法控制字符");
+    }
+    shell_execute(target, "open")
+}
+
 /// Open a file/executable with extra command-line parameters（如 rundll32 环境变量对话框）。
 pub fn shell_open_with_args(file: &str, args: &str) -> Result<()> {
     let wide = to_wide(file);

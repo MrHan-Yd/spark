@@ -26,6 +26,15 @@ public sealed class PluginRowVm : INotifyPropertyChanged
         Permissions = info.Permissions
             .Select(p => new PermissionVm(p, info.Granted.Contains(p)))
             .ToList();
+        // 高危权限 fs.read/fs.write 的授权目录范围（host canonicalize 后的绝对路径）。
+        if (info.FsScopes is { } fsScopes)
+        {
+            foreach (var perm in Permissions.Where(p => p.IsFsScope))
+            {
+                if (fsScopes.TryGetValue(perm.Key, out var dirs))
+                    perm.Scopes.AddRange(dirs);
+            }
+        }
         if (!string.IsNullOrEmpty(info.Icon))
         {
             // 位图走 WIC，SVG 走 SvgImageSource（见 PluginIconLoader）；失败保持 null → 首字母占位。
@@ -207,6 +216,13 @@ public sealed class PermissionVm : INotifyPropertyChanged
 
     public string Key { get; }
 
+    /// <summary>是否为需要目录范围的 fs 权限（fs.read/fs.write，高危，授权时定范围）。</summary>
+    public bool IsFsScope => Key is "fs.read" or "fs.write";
+
+    /// <summary>fs 权限的授权目录范围（host canonicalize 后的绝对路径）。
+    /// 由 PluginRowVm 构造时从 PluginInfoDto.FsScopes 回填，编辑后随 grant 提交。</summary>
+    public List<string> Scopes { get; } = new();
+
     /// <summary>host 侧已知的授权状态；与 <see cref="Granted"/> 相同即为绑定回声。</summary>
     public bool SyncedGranted { get; set; }
 
@@ -230,8 +246,23 @@ public sealed class PermissionVm : INotifyPropertyChanged
     public string Description => Key switch
     {
         "clipboard" => "授权后允许插件在后台自动读取/写入系统剪贴板；你手动复制粘贴、输入的内容不受影响。",
+        "fs.read" => "高危：授权后允许插件读取授权目录范围内的文件；需在「范围」里指定目录，范围外路径会被拒绝。",
+        "fs.write" => "高危：授权后允许插件写入授权目录范围内的文件；需在「范围」里指定目录，范围外路径会被拒绝。",
+        "shell.open" => "授权后允许插件调用系统默认程序打开 URL 或文件。",
         _ => "授权后允许插件自动使用该系统能力；你手动输入/粘贴的内容不受影响。"
     };
+
+    /// <summary>「范围」按钮可见性：仅 fs.read/fs.write 显示（授权时定目录范围）。</summary>
+    public Visibility FsScopeButtonVisibility =>
+        IsFsScope ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>「范围」按钮文案：已配置时带目录数量。</summary>
+    public string FsScopeSummary =>
+        IsFsScope ? (Scopes.Count == 0 ? "范围…" : $"范围({Scopes.Count})") : "";
+
+    /// <summary>范围编辑完成后回推按钮文案（Scopes 集合本身不做 INotify）。</summary>
+    public void NotifyScopesChanged()
+        => OnPropertyChanged(nameof(FsScopeSummary));
 
     private bool _granted;
     public bool Granted
@@ -242,6 +273,7 @@ public sealed class PermissionVm : INotifyPropertyChanged
             if (_granted == value) return;
             _granted = value;
             OnPropertyChanged();
+            OnPropertyChanged(nameof(FsScopeButtonVisibility));
         }
     }
 

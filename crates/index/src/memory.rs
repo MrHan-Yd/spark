@@ -70,6 +70,8 @@ impl MemoryIndex {
                 source: Source::App,
                 actions: vec![Action::open_default()],
                 plugin_id: None,
+                plugin_command: None,
+                plugin_input: None,
             });
         }
         idx

@@ -34,6 +34,15 @@ public sealed class CandidateDto : INotifyPropertyChanged
     [JsonPropertyName("plugin_id")]
     public string? PluginId { get; set; }
 
+    /// <summary>插件候选的触发上下文（host 匹配即权威）：keyword = 触发关键字；
+    /// regex/root = 空串。null = 老 host 未下发（开窗回落首词拆分）。</summary>
+    [JsonPropertyName("plugin_command")]
+    public string? PluginCommand { get; set; }
+
+    /// <summary>去掉关键字前缀后的输入（regex/root = 完整查询文本）；null 同上。</summary>
+    [JsonPropertyName("plugin_input")]
+    public string? PluginInput { get; set; }
+
     /// <summary>Secondary actions (merged shortcut variants, e.g. "Chrome 无痕模式").</summary>
     [JsonPropertyName("actions")]
     public List<ActionDto> Actions { get; set; } = new();

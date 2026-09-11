@@ -10,6 +10,9 @@ use std::path::Path;
 /// 清单（preload API 只增不删，旧清单在新 host 上仍可运行）。
 pub const SUPPORTED_PLUGIN_API_VERSION: u32 = 2;
 
+/// regex feature `pattern` 的字节上限（加载期校验，防超长模式拖慢清单解析）。
+pub const MAX_PATTERN_BYTES: usize = 512;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginRuntime {
@@ -59,6 +62,10 @@ pub struct PluginWindow {
     pub width: u32,
     #[serde(default = "default_height")]
     pub height: u32,
+    /// 清单字段一律 snake_case（与顶层 `api_version` / `features[].type` 一致）。
+    /// `minWidth`/`minHeight`/`alwaysOnTop`/`multiInstance` 是规范文档早期误写成
+    /// camelCase 的写法——由 [`normalize_window_keys`] 在加载前归一化收下，故这里
+    /// 不再挂 `serde(alias)`（别名与正名同现会触发 duplicate field、整份清单加载失败）。
     #[serde(default = "default_min_width")]
     pub min_width: u32,
     #[serde(default = "default_min_height")]
@@ -69,6 +76,11 @@ pub struct PluginWindow {
     pub always_on_top: bool,
     #[serde(default = "default_true")]
     pub frame: bool,
+    /// 是否允许多开（《插件开发规范》§6）：默认 `false` = 再次触发时聚焦已有窗口
+    /// 并推送新输入；`true` = 每次触发都新开一个窗口。native 纯应用插件的 exe
+    /// 生命周期随之变为"最后一个窗口关闭才关停"（UI 侧记账，见 PluginWindowHost）。
+    #[serde(default)]
+    pub multi_instance: bool,
 }
 
 fn default_width() -> u32 {
@@ -97,6 +109,7 @@ impl Default for PluginWindow {
             resizable: true,
             always_on_top: false,
             frame: true,
+            multi_instance: false,
         }
     }
 }
@@ -158,10 +171,39 @@ pub struct PluginManifest {
     pub page: Option<String>,
 }
 
+/// 把清单 `window` 里的 camelCase 键归一化成 snake_case（《插件开发规范》§4.3 早期
+/// 把 `minWidth`/`minHeight`/`alwaysOnTop` 误写成 camelCase，文档已订正，但要兼容
+/// 按旧文档写的存量插件）。
+///
+/// 为什么在解析前改 JSON，而不是在结构体上挂 `serde(alias)`：别名与正名**同时出现**
+/// 时 serde_json 会报 `duplicate field`，整份清单反序列化失败（插件直接加载不了），
+/// 而作者往往只是复制粘贴留了两份。这里改成"正名优先、别名仅补缺"，两个都写也照常加载。
+fn normalize_window_keys(root: &mut serde_json::Value) {
+    const ALIASES: [(&str, &str); 4] = [
+        ("minWidth", "min_width"),
+        ("minHeight", "min_height"),
+        ("alwaysOnTop", "always_on_top"),
+        ("multiInstance", "multi_instance"),
+    ];
+
+    let Some(window) = root.get_mut("window").and_then(|w| w.as_object_mut()) else {
+        return;
+    };
+    for (camel, snake) in ALIASES {
+        if let Some(value) = window.remove(camel) {
+            if !window.contains_key(snake) {
+                window.insert(snake.to_string(), value);
+            }
+        }
+    }
+}
+
 impl PluginManifest {
     pub fn load(path: &Path) -> Result<Self, PluginError> {
         let raw = fs::read_to_string(path)?;
-        let m: Self = serde_json::from_str(&raw)?;
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        normalize_window_keys(&mut value);
+        let m: Self = serde_json::from_value(value)?;
         m.validate()?;
         Ok(m)
     }
@@ -320,20 +362,34 @@ impl PluginFeature {
                 }
             }
             FeatureType::Regex => {
-                if self
-                    .pattern
-                    .as_deref()
-                    .map(|p| p.is_empty())
-                    .unwrap_or(true)
-                {
-                    return Err(PluginError::Manifest(
-                        "regex feature requires 'pattern'".into(),
-                    ));
+                let pat = self.pattern.as_deref().ok_or_else(|| {
+                    PluginError::Manifest("regex feature requires 'pattern'".into())
+                })?;
+                if pat.is_empty() {
+                    return Err(PluginError::Manifest("pattern must not be empty".into()));
                 }
+                // 上限防插件清单塞超长模式；正则本身在加载期编译——非法/过爆的
+                // pattern 直接拒绝加载（搜索热路径只做 is_match，不再编译）。
+                if pat.len() > MAX_PATTERN_BYTES {
+                    return Err(PluginError::Manifest(format!(
+                        "pattern 超过 {MAX_PATTERN_BYTES} 字节上限"
+                    )));
+                }
+                regex_lite::Regex::new(pat)
+                    .map_err(|e| PluginError::Manifest(format!("pattern 不是合法正则: {e}")))?;
             }
             FeatureType::Root => {}
         }
         Ok(())
+    }
+
+    /// `type=regex` 时必填：正则表达式（二期触发，加载期校验可编译）。
+    pub fn pattern(&self) -> Option<&str> {
+        if self.kind == FeatureType::Regex {
+            self.pattern.as_deref()
+        } else {
+            None
+        }
     }
 
     /// 供查询路由用：返回该 feature 的关键字（仅 keyword 类型）。
@@ -386,6 +442,50 @@ mod tests {
     fn keyword_with_space_rejected() {
         let m: PluginManifest = serde_json::from_str(&webview_manifest_json("a b")).unwrap();
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn regex_feature_requires_compilable_pattern() {
+        // 合法 pattern 通过；非法正则 / 缺 pattern / 超长 pattern 加载期拒绝。
+        let mk = |pattern: &str| {
+            format!(
+                r#"{{
+                    "id": "com.spark.test", "name": "Test", "version": "0.1.0", "api_version": 2,
+                    "runtime": "webview", "main": "index.html",
+                    "features": [{{ "type": "regex", "pattern": "{pattern}", "title": "T", "mode": "page" }}]
+                }}"#
+            )
+        };
+        let m: PluginManifest = serde_json::from_str(&mk("^\\\\d+$")).unwrap();
+        m.validate().unwrap();
+        assert_eq!(m.features[0].pattern(), Some("^\\d+$"));
+
+        let bad = mk("[invalid(");
+        let m: PluginManifest = serde_json::from_str(&bad).unwrap();
+        assert!(m.validate().is_err());
+
+        let missing = PluginFeature {
+            kind: FeatureType::Regex,
+            keyword: None,
+            pattern: None,
+            title: "T".into(),
+            subtitle: None,
+            mode: "page".into(),
+            placeholder: None,
+        };
+        assert!(missing.validate().is_err());
+
+        // 超长 pattern 拒绝（直接构造 feature 校验，避免 fixture 里塞 512+ 字节）。
+        let long_feature = PluginFeature {
+            kind: FeatureType::Regex,
+            keyword: None,
+            pattern: Some("a".repeat(MAX_PATTERN_BYTES + 1)),
+            title: "T".into(),
+            subtitle: None,
+            mode: "page".into(),
+            placeholder: None,
+        };
+        assert!(long_feature.validate().is_err());
     }
 
     #[test]
@@ -582,5 +682,63 @@ mod tests {
         // 一方有数字段优先于纯文本。
         assert_eq!(cmp_version("0.0.1", "nope"), Ordering::Greater);
         assert_eq!(cmp_version("nope", "0.0.1"), Ordering::Less);
+    }
+
+    fn manifest_with_window(window: &str) -> String {
+        format!(
+            r#"{{
+                "id": "com.spark.test", "name": "Test", "version": "0.1.0", "api_version": 2,
+                "runtime": "webview", "main": "index.html",
+                "features": [{{ "type": "keyword", "keyword": "t", "title": "T", "mode": "page" }}],
+                "window": {{ {window} }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn window_accepts_snake_case_and_normalizes_documented_camel_case_aliases() {
+        // 经 load() 走真实加载路径（归一化就发生在那里，不是 from_str 的别名松绑）。
+        let tmp =
+            std::env::temp_dir().join(format!("spark_pm_window_alias_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let manifest_path = tmp.join("plugin.json");
+
+        let load_with = |window: &str| -> PluginManifest {
+            fs::write(&manifest_path, manifest_with_window(window)).unwrap();
+            PluginManifest::load(&manifest_path).expect("manifest should load")
+        };
+
+        // 1) 权威命名 = snake_case。
+        let w = load_with(r#""min_width": 300, "always_on_top": true"#)
+            .window
+            .unwrap();
+        assert_eq!(w.min_width, 300);
+        assert!(w.always_on_top);
+        assert!(!w.multi_instance, "默认单开");
+
+        // 2) 规范文档早期误写的 camelCase 必须同样生效：serde 对未知字段不报错，
+        //    没有归一化时按旧文档写的插件会静默丢失窗口设置。
+        let w = load_with(
+            r#""minWidth": 320, "minHeight": 200, "alwaysOnTop": true, "multiInstance": true"#,
+        )
+        .window
+        .unwrap();
+        assert_eq!(w.min_width, 320);
+        assert_eq!(w.min_height, 200);
+        assert!(w.always_on_top);
+        assert!(w.multi_instance);
+
+        // 3) 正名与别名同现：正名优先，且绝不能因 duplicate field 让整份清单加载失败
+        //    （作者复制粘贴留两份是常见失误，不该升级成"插件装不上"）。
+        let w = load_with(
+            r#""min_width": 111, "minWidth": 999, "multi_instance": true, "multiInstance": false"#,
+        )
+        .window
+        .unwrap();
+        assert_eq!(w.min_width, 111, "正名优先于别名");
+        assert!(w.multi_instance, "正名优先于别名");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

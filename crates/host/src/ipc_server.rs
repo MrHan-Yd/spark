@@ -475,7 +475,7 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             }
             {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-                g.plugin_grant(&params.id, params.permissions)?;
+                g.plugin_grant(&params.id, params.permissions, params.fs_scopes)?;
             }
             JsonRpcResponse::result(id, serde_json::json!({ "ok": true }))
         }
@@ -501,9 +501,37 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             if params.id.is_empty() || params.id.len() > 256 {
                 return reply(pipe, &JsonRpcResponse::error(id, -32602, "invalid id"));
             }
-            let info = {
+            // 锁序纪律：锁内只做快照（open_prepare 零目录遍历）；Standard 插件的
+            // 全目录 SHA-256 重验无上界（大插件/网络盘可达秒级），放锁外执行——
+            // 期间搜索热路径与全部 IPC 不受阻塞。重验判 Invalid → 重新拿锁摘标
+            // （sign_state → Invalid，设置页立即可见）并按既有错误语义拒开。
+            let prepared = {
                 let g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-                g.plugin_open(&params.id)?
+                g.plugin_open_prepare(&params.id)?
+            };
+            let info = match &prepared.reverify {
+                None => prepared.info,
+                Some(job) => {
+                    let state = spark_plugin_manager::verify_with_keys(
+                        &job.root,
+                        &job.id,
+                        &job.version,
+                        &prepared.keys,
+                        spark_plugin_manager::REVOKED,
+                    )
+                    .unwrap_or(spark_plugin_manager::SignState::Invalid);
+                    if state == spark_plugin_manager::SignState::Invalid {
+                        let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+                        // 错误值即最终答复（open_fail_invalid 自带 TOCTOU 守卫：
+                        // 同 id 插件在重验期间被覆盖更新时不摘标、报"请重试"）。
+                        return Err(g.plugin_open_fail_invalid(
+                            &params.id,
+                            &job.version,
+                            &job.root,
+                        ));
+                    }
+                    prepared.info
+                }
             };
             JsonRpcResponse::result(id, serde_json::to_value(info)?)
         }
@@ -541,6 +569,8 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
             // ① 锁内：鉴权 + 快照构造（native rpc 只返回 deferred 请求）；
             // ② 锁外：native rpc 的等待（懒启动最坏 15s）——绝不占 host 锁，
             // 否则一次慢插件 RPC 会冻结全部 IPC（含主窗口 host.query 热路径）。
+            // net/fs/shell/clipboard 同纪律：阻塞 HTTP/文件 IO/程序启动/剪贴板
+            // 与图片编解码一律锁外。
             let outcome = {
                 let mut g = host.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
                 g.plugin_api(&params)?
@@ -552,6 +582,24 @@ fn dispatch_line(line: &str, pipe: HANDLE, host: &SharedHost) -> Result<()> {
                 crate::app::PluginApiOutcome::NativePage(page_req) => page_req
                     .execute()
                     .map_err(|e| anyhow::anyhow!("UNAVAILABLE: {e}"))?,
+                // spark.net.fetch：阻塞 HTTP 在锁外执行（纪律同 NativePage）；
+                // 错误已自带 NETWORK_FAILED:/INVALID_ARGS: 前缀，原样透传。
+                crate::app::PluginApiOutcome::Net(net_req) => {
+                    serde_json::to_value(crate::net_fetch::execute(&net_req)?)?
+                }
+                // spark.fs.read/write：阻塞文件 IO 在锁外执行；错误已自带
+                // PERMISSION_SCOPE:/FILE_TOO_LARGE:/INVALID_ARGS: 前缀，原样透传。
+                crate::app::PluginApiOutcome::Fs(fs_req) => {
+                    serde_json::to_value(crate::plugin_fs::execute(&fs_req)?)?
+                }
+                // spark.shell.openExternal：启动默认程序（ShellExecute）在锁外执行。
+                crate::app::PluginApiOutcome::Shell(target) => {
+                    crate::shell::open_external(&target)?;
+                    serde_json::json!({ "ok": true })
+                }
+                // spark.clipboard.*：Win32 剪贴板访问与 WIC 图片编解码在锁外执行
+                // （读图/写图可达数十毫秒，锁内跑会冻结主机全部 IPC）。
+                crate::app::PluginApiOutcome::Clipboard(req) => crate::clipboard::execute(&req)?,
             };
             JsonRpcResponse::result(id, serde_json::json!({ "ok": true, "data": data }))
         }

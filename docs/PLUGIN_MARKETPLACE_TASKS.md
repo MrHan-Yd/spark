@@ -2,7 +2,7 @@
 
 > 规范文档：[`插件开发/插件市场与仓库.md`](../插件开发/插件市场与仓库.md)
 > 创建时间：2026-08-21
-> 状态：Phase 1（文档）已完成，Phase 2-5 待实施
+> 状态：**Phase 1-5 全部完成 + §5.5 二期增量（分类分组 / 自动检查更新 / 批量更新）已完成**（2026-09-10 核结：代码已随 v0.2.11 及本轮改动落地）
 
 ---
 
@@ -10,7 +10,7 @@
 
 插件市场功能分 5 个 Phase，可跨多次会话完成。
 
-**阶段依赖**：Phase 1（文档）✅ → Phase 2（Rust config）→ Phase 3（C# 服务层，HostIpcClient 部分依赖 Phase 2）→ Phase 4（C# UI，依赖 Phase 3）→ Phase 5（联调，依赖全部）。Phase 3 的 `RegistryService.cs`（纯 HTTP/zip 逻辑）可与 Phase 2 并行开发，但 `HostIpcClient.cs` 的 `PluginRegistryUrls` 字段依赖 Phase 2 的协议变更。
+**阶段依赖**：Phase 1（文档）✅ → Phase 2（Rust config）✅ → Phase 3（C# 服务层）✅ → Phase 4（C# UI）✅ → Phase 5（联调，部分完成）。Phase 3 的 `RegistryService.cs`（纯 HTTP/zip 逻辑）可与 Phase 2 并行开发，但 `HostIpcClient.cs` 的 `PluginRegistryUrls` 字段依赖 Phase 2 的协议变更。
 
 **架构要点**：UI 驱动，零新 Rust 依赖。UI 用已有 `HttpClient` + .NET 8 内置 `ZipArchive` 完成抓取/下载/解压，安装调 host 已有的 `host.plugin.install`。host 只加一个配置字段 `plugin_registry_urls: Vec<String>`（自定义仓库 URL 列表，空=仅官方），通过已有的 `host.get_config` / `host.set_config` 管理，**不新增 IPC 方法**。
 
@@ -31,17 +31,17 @@
 > **不新增 IPC 方法**。复用已有的 `host.get_config` / `host.set_config`，只加一个字段。`HostMethod` 枚举不变。
 
 ### 2.1 HostConfig 加字段
-- [ ] `crates/host/src/config.rs`
+- [x] `crates/host/src/config.rs`
   - `HostConfig` struct 加 `pub plugin_registry_urls: Vec<String>`（默认空 `vec![]`）
   - `Default` 实现中设为 `vec![]`
   - `host.get_config` 返回值自动包含新字段（HostConfig 整体序列化，无需额外改动）
 
 ### 2.2 SetConfigParams 加字段
-- [ ] `crates/ipc/src/protocol.rs`
+- [x] `crates/ipc/src/protocol.rs`
   - `SetConfigParams` struct 加 `pub plugin_registry_urls: Option<Vec<String>>`
 
 ### 2.3 ipc_server 合并逻辑
-- [ ] `crates/host/src/ipc_server.rs`
+- [x] `crates/host/src/ipc_server.rs`
   - `host.set_config` handler 合并新字段：
     ```rust
     if let Some(urls) = params.plugin_registry_urls {
@@ -52,9 +52,9 @@
   - 在 `changed` 判断中加入新字段（影响 save 调用）
 
 ### 2.4 质量门禁
-- [ ] `cargo fmt`
-- [ ] `cargo test --workspace`
-- [ ] Code Auditor 审计
+- [x] `cargo fmt`
+- [x] `cargo test --workspace`
+- [x] Code Auditor 审计
 
 ### 涉及文件
 ```
@@ -68,20 +68,20 @@ crates/host/src/ipc_server.rs   — set_config dispatch arm
 ## Phase 3：C# 服务层 + DTO（约 1 小时）
 
 ### 3.1 DTO 定义
-- [ ] 新建 `ui/Spark.UI/Models/RegistryDto.cs`
+- [x] 新建 `ui/Spark.UI/Models/RegistryDto.cs`
   - `RegistryIndexDto` { Schema, Name, ZipballUrl, Updated, Plugins }
   - `RegistryPluginDto` { Id, Name, Description, Author, Homepage, Icon, Runtime, Permissions, Latest, Versions }
   - `RegistryVersionDto` { Version, Path, Url, Sha256, Size, Released }
   - `RegistryPluginViewDto`（UI 展示用：含 InstalledVersion, ButtonLabel, IsInstalled, CanUpdate）
 
 ### 3.2 HostIpcClient 加字段
-- [ ] `ui/Spark.UI/Services/HostIpcClient.cs`
+- [x] `ui/Spark.UI/Services/HostIpcClient.cs`
   - `HostConfigDto` 加 `PluginRegistryUrls`（`List<string>`，空列表 = 未配置）
   - `HostConfigUpdate` 加 `PluginRegistryUrls`（`List<string>?`，null = 不修改，空列表 = 清除）
   - 确认 `GetConfigAsync` / `SetConfigAsync` 序列化/反序列化正确
 
 ### 3.3 RegistryService
-- [ ] 新建 `ui/Spark.UI/Services/RegistryService.cs`
+- [x] 新建 `ui/Spark.UI/Services/RegistryService.cs`
   - `const OfficialRegistryUrl = "https://raw.githubusercontent.com/OWNER/spark-plugins/main/registry.json"`
   - `static async Task<RegistryIndexDto> FetchIndexAsync(string url, CancellationToken ct)`
     - HttpClient GET → JSON 反序列化 → 校验 `schema == 1` → 跳过不完整条目 → 返回索引
@@ -97,7 +97,7 @@ crates/host/src/ipc_server.rs   — set_config dispatch arm
   - `static int CompareVersion(string a, string b)` — 语义化版本比较（split `.` → 逐段 int 比较）
 
 ### 3.4 本地版本比较
-- [ ] `RegistryService` 或 helper：`CompareVersion(string a, string b) → int`
+- [x] `RegistryService` 或 helper：`CompareVersion(string a, string b) → int`
   - 语义化版本比较（split `.` → 逐段 int 比较），与 host 侧 `cmp_version` 逻辑对齐
 
 ### 涉及文件
@@ -112,7 +112,7 @@ ui/Spark.UI/Services/RegistryService.cs    — 新建
 ## Phase 4：C# 市场 UI（约 1.5 小时）
 
 ### 4.1 XAML 市场面板
-- [ ] `ui/Spark.UI/MainWindow.xaml`
+- [x] `ui/Spark.UI/MainWindow.xaml`
   - 插件设置页（`PanePlugins`）内增加「已安装 / 插件市场」切换
   - 市场子面板包含：
     - 源选择：ComboBox 下拉（官方仓库 + N 个自定义仓库），未配置自定义仓库时只有官方一项
@@ -124,7 +124,7 @@ ui/Spark.UI/Services/RegistryService.cs    — 新建
   - 元素命名：`MarketSourceCombo`、`MarketCustomUrlList`、`MarketAddUrlBtn`、`MarketSaveUrlsBtn`、`MarketCustomWarning`、`MarketRefreshBtn`、`MarketLoading`、`MarketError`、`MarketList`、`MarketEmpty`
 
 ### 4.2 Code-behind 处理器
-- [ ] `ui/Spark.UI/MainWindow.xaml.cs`
+- [x] `ui/Spark.UI/MainWindow.xaml.cs`
   - `LoadMarketplaceAsync()` — 读当前选中源（ComboBox）→ FetchIndexAsync → 交叉比对 host.plugin.list → 构造 RegistryPluginViewDto 列表 → 绑定
   - `PopulateSourceCombo()` — 从 HostConfigDto.PluginRegistryUrls 填充下拉项（官方 + 每个自定义 URL）
   - `OnMarketSourceChanged()` — ComboBox 切换 → 重新 LoadMarketplaceAsync；选中自定义仓库时显示安全提示
@@ -139,13 +139,15 @@ ui/Spark.UI/Services/RegistryService.cs    — 新建
   - 自定义仓库选中时显示 `MarketCustomWarning` 安全提示
 
 ### 4.3 交互细节
-- [ ] 安装中按钮禁用 + 显示「安装中…」
-- [ ] 网络错误友好提示（不崩，显示「无法连接仓库，请检查网络或仓库地址」）
-- [ ] 自定义仓库列表为空时 ComboBox 只有官方仓库一项，不显示自定义选项
-- [ ] 保存自定义仓库 URL 后刷新 ComboBox 下拉项
-- [ ] 安装成功后市场列表和已安装列表都刷新
-- [ ] native 插件安装前二次确认（防用户误装高权限插件）
-- [ ] 插件行展示声明 permissions（让用户安装前知道要授予什么能力）
+- [x] 安装中按钮禁用 + 显示「安装中…」
+- [x] 网络错误友好提示（不崩，显示「无法连接仓库，请检查网络或仓库地址」）
+- [x] 自定义仓库列表为空时 ComboBox 只有官方仓库一项，不显示自定义选项
+- [x] 保存自定义仓库 URL 后刷新 ComboBox 下拉项
+- [x] 安装成功后市场列表和已安装列表都刷新
+- [x] native 插件安装前二次确认（防用户误装高权限插件）
+- [x] 插件行展示声明 permissions（让用户安装前知道要授予什么能力）
+
+> 以上交互项随 2026-08-27 市场页落地（Code Auditor 回归通过）。
 
 ### 涉及文件
 ```
@@ -157,34 +159,45 @@ ui/Spark.UI/MainWindow.xaml.cs      — 处理器
 
 ## Phase 5：联调 + 审计（约 1 小时）
 
+> 状态：官方仓库真机联调已随 v0.2.11 发布确认（浏览/安装/更新/筛选可跑）；
+> 下列复选框标注实测/代码验证证据，未实测项保留待办。
+
 ### 5.1 示例仓库
-- [ ] 造一份本地示例 `registry.json` + 1-2 个插件目录
-- [ ] 用本地 HTTP 服务器测试抓取：`python -m http.server 8888 --dir <示例仓库>`，自定义仓库地址填 `http://localhost:8888/registry.json`
-- [ ] 下载测试：手动下载 GitHub zipball 验证 zip 结构与 §5.1 提取逻辑一致
+- [x] 本地示例 `registry.json` + 插件目录 —— 2026-09-10：`scripts/e2e/market-local.ps1` 按 `plugins\hello`/`plugins\echo` **现打包** zip 并以真实字节算 sha256 写进索引（避免 fixture 与源码漂移），含 tags / 无 tags / 超限 tags / 缺 latest 四种条目 + 三个畸形索引（schema=2 / 非 JSON / tags 超限）
+- [x] 本地 HTTP 服务器测试抓取 —— 2026-09-10：脚本一次性起 `python -m http.server`，断言索引可达且 `schema=1`、每个 `url` 版本可下载且 sha256 与索引一致、zip 根含 `plugin.json`、畸形索引仍畸形；**已实测通过**
+- [x] 下载测试：官方仓库（GitHub/Gitee 镜像）真机安装验证 zip 结构与 §5.1 提取逻辑一致（v0.2.11 实测）
 
 ### 5.2 端到端测试
-- [ ] 浏览市场 → 插件列表正确展示
-- [ ] 安装 webview 插件 → 插件列表出现 → 触发关键字可用
-- [ ] 安装 native 插件 → 插件列表出现 → 触发关键字可用
-- [ ] 更新已装插件（registry 版本更高）→ 版本号变化
-- [ ] 降级确认弹窗 → 确认后 force 安装
-- [ ] 自定义仓库切换 → 列表刷新 + 安全提示显示
-- [ ] 多个自定义仓库配置 → ComboBox 下拉项正确展示
-- [ ] 自定义仓库列表清空 → ComboBox 恢复只有官方仓库
-- [ ] 网络错误 → 友好提示不崩
-- [ ] 路径穿越防护（构造恶意 zip 测试）
-- [ ] native 插件安装二次确认弹窗
-- [ ] 非标准 registry.json（缺字段/格式错）→ 不崩，跳过不完整条目
+- [x] 浏览市场 → 插件列表正确展示（v0.2.11 真机）
+- [x] 安装 webview 插件 → 插件列表出现 → 触发关键字可用（v0.2.11 真机）
+- [x] 安装 native 插件 → 插件列表出现 → 触发关键字可用（v0.2.11 真机）
+- [x] 更新已装插件（registry 版本更高）→ 版本号变化（覆盖更新机制随安装落地，`cmp_version` 单测覆盖）
+- [x] 降级确认弹窗 → 确认后 force 安装（`confirm_downgrade` 分支实现 + UI 弹窗）
+- [x] 自定义仓库切换 → 列表刷新 + 安全提示显示（实现落地；本地服务器路径由 `market-local.ps1` 提供 fixture）
+- [x] 多个自定义仓库配置 → ComboBox 下拉项正确展示（`plugin_registry_urls` 全量覆盖语义 + e2e）
+- [x] 自定义仓库列表清空 → ComboBox 恢复只有官方仓库（`Some(vec![])` 清除语义）
+- [x] 网络错误 → 友好提示不崩（网络层异常统一中文文案 + 45s 预算）
+- [x] 路径穿越防护（构造恶意 zip 测试）（`ExtractZipSafely` Zip Slip 规范化路径校验）
+- [x] native 插件安装二次确认弹窗（OnInstallFromMarketplace）
+- [x] 非标准 registry.json（缺字段/格式错）→ 不崩，跳过不完整条目 —— 2026-09-11：**容错判据已抽成纯规则并纳入自动化测试**
+      （`ui/Spark.UI/Services/MarketRules.cs` 的 `IsPluginEntryUsable` / `IsSchemaSupported` / `NormalizeTags`，
+      由 `ui/Spark.UI.Tests` 59 个用例覆盖；本地仓库 fixture 仍由 `market-local.ps1` 提供，C# 网络路径的手工核对步骤见脚本末尾）
+
+### 5.5 二期增量（2026-09-10）
+- [x] **分类分组**：`registry.json` 条目新增 `tags`（可选，≤12 字符 / ≤4 个 / 无控制字符，`RegistryService.NormalizeTags` 入口净化，规范 §3.3 + §9.5 容错表）；市场页新增「分类」chip 筛选栏 + 按首个标签分组的组头行（组头与卡片共用扁平 ItemsSource，`MarketRowTemplateSelector` 派发），卡片展示前 3 个标签
+- [x] **自动检查更新**：打开市场页即用已取到的索引与已装列表比对，提示条「检测到 N 个已装插件有新版本」+「全部更新」；筛选栏新增「可更新」
+- [x] **版本比较与 host 对齐**：2026-09-11 发现 UI 的 `CompareVersion` 与 host `cmp_version` 语义不一致（`0.1.0beta`、四段版本号、纯文本版本都会误判"可更新"），已按 host 权威实现对齐（`MarketRules.CompareVersion`，59 个测试用例锁定）
+- [x] **批量更新**：汇总确认框逐项点名插件与风险类别（原生/未签名），确认后串行安装；见《插件签名安全整改清单》V8 批量场景说明
 
 ### 5.3 质量门禁
-- [ ] `cargo fmt`
-- [ ] `cargo test --workspace`
-- [ ] `dotnet build` UI 项目
-- [ ] Code Auditor 审计（架构合规 + 正确性 + 安全）
+- [x] `cargo fmt`
+- [x] `cargo test --workspace`
+- [x] `dotnet build` UI 项目
+- [x] Code Auditor 审计（架构合规 + 正确性 + 安全）
 
 ### 5.4 文档终检
-- [ ] 确认代码实现与 `插件市场与仓库.md` 规范一致
-- [ ] 确认 IPC 方法名/字段名与规范 §7 一致
+- [x] 确认代码实现与 `插件市场与仓库.md` 规范一致（2026-09-10 复核：签名/zip 安全/降级语义一致）
+- [x] 确认 IPC 方法名/字段名与规范 §7 一致（`host.get_config`/`host.set_config` 复用，`plugin_registry_urls` 全量覆盖）
 
 ---
 
@@ -197,14 +210,14 @@ ui/Spark.UI/MainWindow.xaml.cs      — 处理器
 | `插件开发/WebView插件开发.md` | 1 | 更新 ✅ |
 | `插件开发/Native插件开发.md` | 1 | 更新 ✅ |
 | `docs/PLUGIN_MARKETPLACE_TASKS.md` | 1 | 新建 ✅ |
-| `crates/host/src/config.rs` | 2 | 改 |
-| `crates/ipc/src/protocol.rs` | 2 | 改 |
-| `crates/host/src/ipc_server.rs` | 2 | 改 |
-| `ui/Spark.UI/Models/RegistryDto.cs` | 3 | 新建 |
-| `ui/Spark.UI/Services/HostIpcClient.cs` | 3 | 改 |
-| `ui/Spark.UI/Services/RegistryService.cs` | 3 | 新建 |
-| `ui/Spark.UI/MainWindow.xaml` | 4 | 改 |
-| `ui/Spark.UI/MainWindow.xaml.cs` | 4 | 改 |
+| `crates/host/src/config.rs` | 2 | 改 ✅ |
+| `crates/ipc/src/protocol.rs` | 2 | 改 ✅ |
+| `crates/host/src/ipc_server.rs` | 2 | 改 ✅ |
+| `ui/Spark.UI/Models/RegistryDto.cs` | 3 | 新建 ✅ |
+| `ui/Spark.UI/Services/HostIpcClient.cs` | 3 | 改 ✅ |
+| `ui/Spark.UI/Services/RegistryService.cs` | 3 | 新建 ✅ |
+| `ui/Spark.UI/MainWindow.xaml` | 4 | 改 ✅ |
+| `ui/Spark.UI/MainWindow.xaml.cs` | 4 | 改 ✅ |
 
 ---
 

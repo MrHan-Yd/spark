@@ -38,32 +38,64 @@ jobs:
         shell: pwsh
         run: ./scripts/build_installer.ps1 -Version "$($env:GITHUB_REF_NAME.TrimStart('v'))" -Tag "$env:GITHUB_REF_NAME" -UiDir "dist-publish"
 
-      # ── 官方插件签名（三期 §9.3）─────────────────────────────────────────
-      # 仅在配置了 SPARK_SIGNING_KEY_V1 secret 且 plugins/dist/ 下有已打包的官方插件
-      # 目录时才签名；二者缺一即跳过（打包流水线就绪前为 no-op，不阻塞 release）。
-      # 私钥从 CI secret 注入，落盘为 keys/spark-official-v1.key（被 .gitignore 忽略）。
-      - name: Sign official plugins
+      # ── 官方插件打包 + 签名（三期 §9.3）─────────────────────────────────────
+      # pack_plugins.ps1 完成"构建 native exe → 装配 plugins/dist/<id>/<version>/ →
+      # 签名（可选）→ 打 packages\*.spark-plugin → 生成 registry.json"整条链路。
+      # **顺序不可拆**：签名必须落在打包 zip 之前，否则包内缺 signature.json；
+      # 脚本内部已固定 stage → sign → pack，故打包与签名合并为同一步。
+      # 签名后还会跑 spark-sign check-registry，确保每个版本目录都有有效官方签名
+      # （仓库准入），失败即让 release 挂掉，避免发出未签名的官方仓库。
+      # 私钥从 CI secret 注入、落盘 keys/spark-official-v1.key（被 .gitignore 忽略）；
+      # secret 未配置时只打包不签名（保持"不阻塞 release"的既有语义）。
+      # 输出经 Tee-Object 落 signing-log.txt 并上传 CI 产物（审计用；私钥本身永不落日志）。
+      - name: Pack and sign official plugins
         shell: pwsh
         env:
           SPARK_SIGNING_KEY_V1: ${{ secrets.SPARK_SIGNING_KEY_V1 }}
         run: |
-          cargo build --release -p spark-sign
+          $ErrorActionPreference = 'Stop'
+          $log = "signing-log.txt"
+          # 先把脚本输出收进变量（异常因此必然传播到 catch），再落日志——避免 `*>&1 | Tee`
+          # 把 error 流并成输出后吞掉失败信号。
+          function Invoke-Pack([string[]]$PackArgs) {
+            $text = & "$PWD/scripts/pack_plugins.ps1" @PackArgs *>&1
+            $text | Tee-Object -FilePath $log -Append
+            if (-not $?) { throw "pack_plugins.ps1 失败（args: $($PackArgs -join ' ')）" }
+          }
           if ([string]::IsNullOrEmpty($env:SPARK_SIGNING_KEY_V1)) {
-            Write-Host "SPARK_SIGNING_KEY_V1 secret 未配置，跳过签名。"
+            "skip: SPARK_SIGNING_KEY_V1 secret 未配置，只打包不签名" | Tee-Object -FilePath $log
+            Invoke-Pack @('-OutDir', 'plugins/dist')
             exit 0
           }
           $keyFile = "keys/spark-official-v1.key"
           Set-Content -Path $keyFile -Value $env:SPARK_SIGNING_KEY_V1 -NoNewline
-          $dist = "plugins/dist"
-          if (-not (Test-Path $dist)) {
-            Write-Host "plugins/dist 不存在，无已打包插件可签名，跳过。"
-            exit 0
+          "sign plugins/dist @ $(Get-Date -Format o) (key_id=spark-official-v1)" | Tee-Object -FilePath $log
+          try {
+            Invoke-Pack @('-OutDir', 'plugins/dist', '-Sign', '-KeyFile', $keyFile)
+          } catch {
+            ($_ | Out-String) | Tee-Object -FilePath $log -Append
+            throw
           }
-          Get-ChildItem $dist -Directory | ForEach-Object {
-            $pluginDir = $_.FullName
-            Write-Host "Signing $pluginDir"
-            cargo run --release -p spark-sign -- sign --dir $pluginDir --key $keyFile --key-id spark-official-v1
-          }
+
+      # 打包 + 签名产物随 Release 一起发布（registry.json 与 packages\ 供官方仓库发布/直链安装）。
+      - name: Upload plugin warehouse artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-warehouse
+          path: |
+            plugins/dist/registry.json
+            plugins/dist/packages/*.spark-plugin
+          if-no-files-found: ignore
+
+      # 签名日志随 Release 构建产物上传（审计/追溯用，不入仓库）。
+      - name: Upload signing log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-log
+          path: signing-log.txt
+          if-no-files-found: ignore
 
       - name: Publish GitHub Release
         env:

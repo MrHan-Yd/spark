@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using Microsoft.UI;
 using Microsoft.UI.Input;
@@ -32,6 +33,11 @@ public sealed partial class PluginWindow : Window
 
     private bool _webReady;
     private bool _closing;
+
+    /// <summary>出站收口用：已记过日志的被拦主机（同一 host 每窗口只记一次，防插件刷日志）。</summary>
+    private readonly HashSet<string> _blockedHosts = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>出站收口累计拦截数（审计口径；不做限流）。</summary>
+    private int _blockedRequests;
 
     // WM_GETMINMAXINFO 子类化：让用户拖拽边框时也遵守清单 min_width/min_height。
     private readonly SUBCLASSPROC _minMaxProc = MinMaxWndProc;
@@ -217,6 +223,12 @@ public sealed partial class PluginWindow : Window
                 e.State = CoreWebView2PermissionState.Deny;
             };
 
+            // 插件页出站收口（《插件开发规范》§12）：页面内一切 http/https 出站请求
+            // （fetch/XHR/子资源）在此拦死——插件唯一的出网通道是 spark.net.fetch，
+            // 由 host 按 net 权限鉴权并留痕。少了这一层，插件随手 fetch() 就绕过了
+            // net 权限门与用户授权，直接做数据外传/追踪像素。
+            InstallOutboundGuard(core);
+
             await core.AddScriptToExecuteOnDocumentCreatedAsync(BuildBootstrapScript(input, command, rawQuery));
             await core.AddScriptToExecuteOnDocumentCreatedAsync(LoadPreloadShim());
             Dbg("preload scripts injected");
@@ -293,6 +305,71 @@ public sealed partial class PluginWindow : Window
         App.Log("PluginNav", $"blocked {_info.Id} -> {e.Uri}");
     }
 
+    /// <summary>
+    /// 插件页出站收口（引擎层）：<see cref="OnNavigationStarting"/> 只拦顶层导航，
+    /// 拦不住页面里 fetch/XHR/&lt;img&gt;/&lt;script&gt; 这类子资源请求——两者合起来才是
+    /// 完整的"插件页出不了网"。过滤器注册 <c>*</c> + <c>All</c> 后覆盖全部请求上下文
+    /// （Document/Fetch/XmlHttpRequest/Image/Script/Font/EventSource/Ping/...）。
+    /// </summary>
+    private void InstallOutboundGuard(CoreWebView2 core)
+    {
+        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+        core.WebResourceRequested += OnWebResourceRequested;
+    }
+
+    /// <summary>
+    /// 放行插件自身虚拟主机与非网络协议（file/data/blob/about/devtools——开发期
+    /// DevTools 与 data: 内联资源要能正常走），其余 http/https 一律 403 拒绝。
+    ///
+    /// 整个回调包 try/catch：这是 WinRT 事件回调，异常向上冒可能直接 failfast 崩溃
+    /// 进程（页面是完全不可信的第三方内容，请求参数可能触发任何边缘分支）。拦截失败
+    /// 时兜底把 Response 置空（请求按正常网络路径继续），失败半径退回"没拦住这一次"，
+    /// 绝不升级成"插件页把 Spark 整个搞崩"。
+    /// </summary>
+    private void OnWebResourceRequested(CoreWebView2 sender, CoreWebView2WebResourceRequestedEventArgs e)
+    {
+        try
+        {
+            if (Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri)
+                && !uri.Host.Equals(VirtualHost, StringComparison.OrdinalIgnoreCase)
+                && (uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                    || uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+            {
+                BlockOutbound(sender, e, uri.Host);
+            }
+            // 解析不出绝对 URI 的请求（blob/data/about 等）按原样放行：它们不产生
+            // 网络出站，拒绝会误伤页面正常渲染。
+        }
+        catch (Exception ex)
+        {
+            App.Log("PluginOutboundGuard", ex);
+            try { e.Response = null; } catch { /* 已无补救手段，忽略 */ }
+        }
+    }
+
+    /// <summary>本窗口出站拦截的日志去重表上限：超出后只累计计数不再记 host，
+    /// 防恶意页面用海量随机域名（http://&lt;random&gt;.evil）把这张表撑成内存泄漏。</summary>
+    private const int MaxLoggedBlockedHosts = 256;
+
+    private void BlockOutbound(CoreWebView2 sender, CoreWebView2WebResourceRequestedEventArgs e, string host)
+    {
+        // 同一 host 只记一次日志：插件页可能成百上千次重试，逐条记会刷爆 host.log。
+        if (_blockedHosts.Count < MaxLoggedBlockedHosts && _blockedHosts.Add(host))
+        {
+            App.Log("PluginOutboundBlocked",
+                $"{_info.Id} 出站请求已拦截 -> {e.Request.Uri}（插件出网必须走 spark.net.fetch）");
+        }
+        if (_blockedRequests < int.MaxValue) _blockedRequests++;
+
+        // 响应体不 dispose：WebView2 是异步读取该流的，提前释放会读到空 body。
+        var body = new MemoryStream(Encoding.UTF8.GetBytes(
+            $"Spark: 插件页禁止直接出网，已拦截 {e.Request.Uri}。"
+            + "请在 plugin.json 声明 net 权限并改用 spark.net.fetch()。"));
+        e.Response = sender.Environment.CreateWebResourceResponse(
+            body.AsRandomAccessStream(), 403, "Blocked by Spark",
+            "Content-Type: text/plain; charset=utf-8");
+    }
+
     // ─── 消息桥 ──────────────────────────────────────────────────────────
 
     private async void OnWebMessage(CoreWebView2 sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -337,12 +414,12 @@ public sealed partial class PluginWindow : Window
     /// <summary>
     /// host 拒绝特权能力调用时在窗口顶部给出可见提示——授权开关必须"名实相符"，
     /// 不能让页面静默降级后用户以为权限没被管控。
-    /// 仅覆盖走桥鉴权的能力（clipboard、window.set_always_on_top）；notify/fs/net/shell
+    /// 仅覆盖走桥鉴权的能力（clipboard、window.set_always_on_top、net）；notify/fs/shell
     /// 仍由 preload guarded() 本地快拦静默失败，属既有分期行为。
     /// </summary>
     private void ShowPermissionDenied(string capability, string method)
     {
-        // 在途 IPC 最长 8s（rpc 能力 20s），续体可能晚于关窗恢复——与 PostReply 同语义短路，
+        // 在途 IPC 最长 8s（rpc 20s、net 30s），续体可能晚于关窗恢复——与 PostReply 同语义短路，
         // 不触碰已拆树的 PermBar（async void 异常会直接崩进程）。
         if (_closing) return;
         var name = PermissionDisplayName(capability, method);
@@ -367,19 +444,15 @@ public sealed partial class PluginWindow : Window
         };
     }
 
-    /// <summary>host 以 "CODE: detail" 形式回错误消息，这里还原成规范 §8.6 的 error.code。</summary>
+    /// <summary>
+    /// host 以 "CODE: detail" 形式回错误消息，这里还原成规范 §8.6 的 error.code。
+    /// 识别表与兜底语义都在 <see cref="PluginErrorCodes"/>（测试工程直接链接那份源文件，
+    /// 保证"识别表 = 规范表"有自动化护栏）。
+    /// </summary>
     private static (string Code, string Message) ClassifyError(Exception ex)
     {
         var msg = ex.Message ?? "";
-        foreach (var code in new[]
-                 {
-                     "PERMISSION_DENIED", "PERMISSION_SCOPE", "NETWORK_FAILED",
-                     "INVALID_ARGS", "UNAVAILABLE"
-                 })
-        {
-            if (msg.Contains(code, StringComparison.Ordinal)) return (code, msg);
-        }
-        return ("UNAVAILABLE", msg);
+        return (PluginErrorCodes.Classify(msg), msg);
     }
 
     private void PostReply(int seq, bool ok, JsonElement data, string? code, string? message)
@@ -507,9 +580,19 @@ public sealed partial class PluginWindow : Window
         if (_webReady) PostEvent("close", null);
         try { Web.Close(); } catch (Exception ex) { App.Log("PluginWebClose", ex); }
         // native 纯应用插件：exe 生命周期与页面绑定，关窗即以无 id notification 通知 host
-        // 关停进程（host 侧对 webview 插件无操作）。fire-and-forget，不阻塞窗口销毁；
-        // 通知写入先于连接释放，管道缓冲数据 host 仍可读。
-        _ = NotifyPageClosedAsync();
+        // 关停进程（host 侧对 webview 插件无操作）。多开插件（window.multi_instance）下
+        // 只有最后一个窗口关闭才通知——否则关掉一个窗就把 exe 杀了，其余窗口的
+        // spark.rpc 全断。fire-and-forget，不阻塞窗口销毁；通知写入先于连接释放，
+        // 管道缓冲数据 host 仍可读。
+        if (PluginWindowHost.HasOtherOpen(_info.Id, this))
+        {
+            // 还有兄弟窗口：不发关停通知，但仍要释放本窗口的 IPC 连接。
+            _ = _host.DisposeAsync();
+        }
+        else
+        {
+            _ = NotifyPageClosedAsync();
+        }
     }
 
     private async Task NotifyPageClosedAsync()

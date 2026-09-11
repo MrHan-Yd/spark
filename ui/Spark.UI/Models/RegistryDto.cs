@@ -2,13 +2,59 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
+using Spark.UI.Services;
 using Windows.UI;
 
 namespace Spark.UI.Models;
+
+/// <summary>
+/// registry.json <c>tags</c> 的容错反序列化：三方仓库不可信，tags 数组里混入数字/
+/// 对象等非字符串项时，System.Text.Json 会在 Deserialize 阶段抛 JsonException——
+/// 净化入口（RegistryService.NormalizeTags）根本执行不到，整个索引加载失败。
+/// 此 converter 在反序列化层就只收字符串项、其余静默丢弃，实现"先容错、后净化"：
+/// 数值/布尔等标量直接跳过；嵌套对象/数组必须 <see cref="Utf8JsonReader.Skip()"/>
+/// 整体消费，否则逐 token 走进嵌套结构会在内层 EndArray 提前退出、读序脱同步。
+/// 非数组（含 JSON null——STJ 默认 HandleNull=false 不进 converter、属性被置 null）
+/// 由调用侧 <c>NormalizeTags</c> 兜底归一为空表。
+/// </summary>
+public sealed class TolerantStringListConverter : JsonConverter<List<string>>
+{
+    public override List<string> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var list = new List<string>();
+        if (reader.TokenType != JsonTokenType.StartArray)
+        {
+            return list; // null / 非数组（手写错形）：空表，不挂掉整源
+        }
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+        {
+            if (reader.TokenType == JsonTokenType.String)
+            {
+                list.Add(reader.GetString()!);
+            }
+            else if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray)
+            {
+                reader.Skip(); // 整体消费嵌套容器，读序保持与外层数组对齐
+            }
+        }
+        return list;
+    }
+
+    public override void Write(Utf8JsonWriter writer, List<string> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartArray();
+        foreach (var s in value)
+        {
+            writer.WriteStringValue(s);
+        }
+        writer.WriteEndArray();
+    }
+}
 
 /// <summary>
 /// 插件市场仓库索引根对象 (registry.json)
@@ -65,6 +111,15 @@ public sealed class RegistryPluginDto
 
     [JsonPropertyName("versions")]
     public List<RegistryVersionDto> Versions { get; set; } = new();
+
+    /// <summary>registry.json <c>tags</c>（可选，市场分类分组用，规范 §3.3）：一个插件可归
+    /// 多个分类。列表按 <b>首个标签</b>归组显示，其余标签仍可在「分类」筛选栏里检索到。
+    /// 三方仓库不可信，标签在 <see cref="Services.RegistryService.FetchIndexAsync"/> 入口统一净化
+    /// （去空/限长/限量/去重），全部非法时归入「未分类」；反序列化层的非字符串项
+    /// 容错见 <see cref="TolerantStringListConverter"/>。</summary>
+    [JsonPropertyName("tags")]
+    [JsonConverter(typeof(TolerantStringListConverter))]
+    public List<string> Tags { get; set; } = new();
 }
 
 /// <summary>
@@ -133,6 +188,26 @@ public sealed class RegistryPluginViewDto : INotifyPropertyChanged
     public string Runtime => Plugin.Runtime;
     public string VersionText => TargetVersion.Version;
     public bool IsNative => string.Equals(Plugin.Runtime, "native", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>归组用的分类标签（净化后的 registry.json tags）。</summary>
+    public IReadOnlyList<string> Tags => Plugin.Tags;
+
+    /// <summary>列表分组键：取首个标签；无标签（或标签全非法被净化掉）归入「未分类」。
+    /// 一个插件只能出现在一个组里，否则多标签插件会在列表里重复出现、安装状态难以对齐。
+    /// 纯规则在 <see cref="MarketRules.PrimaryTag"/>（测试工程链接该源文件直接单测）。</summary>
+    public string PrimaryTag => MarketRules.PrimaryTag(Plugin.Tags);
+
+    /// <summary>未打标签插件的归组名（与真实标签可能重名，故用常量而非字面量比较）。</summary>
+    public const string UntaggedGroup = MarketRules.UntaggedGroup;
+
+    /// <summary>卡片上的标签 chips（超过 3 个只显前 3 个 + 省略号，避免撑高卡片）。</summary>
+    public string TagsSummary => MarketRules.TagsSummary(Plugin.Tags);
+
+    public Visibility TagsVisibility =>
+        Plugin.Tags.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>是否为分组头行（卡片模板靠它隐藏；DataTemplateSelector 之外的兜底）。</summary>
+    public bool IsHeader => false;
 
     public string? InstalledVersion { get; set; }
     public bool IsInstalled => !string.IsNullOrEmpty(InstalledVersion);

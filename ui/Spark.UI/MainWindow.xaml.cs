@@ -3880,13 +3880,26 @@ public sealed partial class MainWindow : Window
     {
         if ((sender as FrameworkElement)?.DataContext is not PermissionVm perm) return;
         if (perm.Granted == perm.SyncedGranted) return;   // 绑定回声
-
         var row = _pluginRows.FirstOrDefault(r => r.Permissions.Contains(perm));
         if (row is null) return;
 
-        // grant 是全量覆盖：把该插件当前所有已勾选的权限一起提交。
+        // fs.*（规范 §7 高危权限）：授权时定范围——勾选 on 且尚无目录时先弹
+        // 范围编辑器，取消/未选任何目录则回滚勾选、不落授权。
+        if (perm.Granted && perm.IsFsScope && perm.Scopes.Count == 0)
+        {
+            if (!await EditFsScopesAsync(perm))
+            {
+                perm.Granted = false;
+                return;
+            }
+        }
+
+        // grant 是全量覆盖：把该插件当前所有已勾选的权限一起提交；
+        // fs 范围随本次提交整表替换（与 permissions 全量覆盖语义一致）。
         var granted = row.Permissions.Where(p => p.Granted).Select(p => p.Key).ToList();
-        if (await _host.PluginGrantAsync(row.Id, granted))
+        var scopes = row.Permissions.Where(p => p.IsFsScope)
+            .ToDictionary(p => p.Key, p => p.Scopes.ToList());
+        if (await _host.PluginGrantAsync(row.Id, granted, scopes))
         {
             foreach (var p in row.Permissions) p.SyncedGranted = p.Granted;
             // 收回权限后已开着的窗口仍持有旧 granted 快照，关掉它强制重新取。
@@ -3898,6 +3911,93 @@ public sealed partial class MainWindow : Window
             perm.Granted = perm.SyncedGranted;
             SetPluginStatus($"{row.Name} 权限更新失败");
         }
+    }
+
+    /// <summary>fs 权限行的「范围…」按钮：编辑目录范围并即时回写 host
+    /// （不勾选权限也可预配置；fs 调用按"已授权 + 在范围内"双条件鉴权）。</summary>
+    private async void OnFsScopeEdit(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not PermissionVm perm) return;
+        var row = _pluginRows.FirstOrDefault(r => r.Permissions.Contains(perm));
+        if (row is null) return;
+
+        if (!await EditFsScopesAsync(perm)) return;   // 取消：保持存量范围
+        // 已提交的授权状态 + 本行的当前范围整表提交（不夹带未同步的勾选变化）。
+        var granted = row.Permissions.Where(p => p.SyncedGranted).Select(p => p.Key).ToList();
+        var scopes = row.Permissions.Where(p => p.IsFsScope)
+            .ToDictionary(p => p.Key, p => p.Scopes.ToList());
+        if (await _host.PluginGrantAsync(row.Id, granted, scopes))
+        {
+            // 范围变化后已开窗口仍持旧快照（host 每次调用按存量范围校验，
+            // 范围收紧需重取）——关窗强制重开。
+            if (perm.SyncedGranted) PluginWindowHost.CloseIfOpen(row.Id);
+            SetPluginStatus($"{row.Name} 文件范围已更新（{perm.Scopes.Count} 个目录）");
+        }
+        else
+        {
+            SetPluginStatus($"{row.Name} 文件范围保存失败");
+        }
+    }
+
+    /// <summary>fs 权限的目录范围编辑器（ContentDialog 代码构建）：列表 +
+    /// 添加目录（FolderPicker）+ 移除；「确定」要求至少 1 个目录。
+    /// 返回 true = 用户确认（Scopes 已同步为编辑结果）；false = 取消/未选目录
+    /// （调用方回滚，不改存量范围）。</summary>
+    private async Task<bool> EditFsScopesAsync(PermissionVm perm)
+    {
+        if (Root.XamlRoot is null) return false;
+        var working = new ObservableCollection<string>(perm.Scopes);
+        var hint = new TextBlock
+        {
+            Text = "插件只能访问这些目录内的文件；范围外路径会被拒绝（PERMISSION_SCOPE）。",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+        };
+        if (Root.Resources.TryGetValue("TextSecondaryBrush", out var secondary) && secondary is Brush secondaryBrush)
+            hint.Foreground = secondaryBrush;
+        var list = new ListBox
+        {
+            ItemsSource = working,
+            MaxHeight = 220,
+            MinHeight = 44,
+        };
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(0, 4, 0, 0) };
+        var addBtn = new Button { Content = "添加目录…" };
+        var delBtn = new Button { Content = "移除所选", IsEnabled = false };
+        buttons.Children.Add(addBtn);
+        buttons.Children.Add(delBtn);
+        var stack = new StackPanel { Spacing = 8, Width = 430 };
+        stack.Children.Add(hint);
+        stack.Children.Add(list);
+        stack.Children.Add(buttons);
+
+        var dialog = new ContentDialog
+        {
+            Title = $"{perm.Display} · 目录范围",
+            Content = stack,
+            PrimaryButtonText = "确定",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Root.XamlRoot,
+        };
+        list.SelectionChanged += (s, e) => delBtn.IsEnabled = list.SelectedItem is string;
+        addBtn.Click += async (s, e) =>
+        {
+            var dir = await PickFolderAsync("选择授权目录");
+            if (dir is not null && !working.Contains(dir)) working.Add(dir);
+        };
+        delBtn.Click += (s, e) =>
+        {
+            if (list.SelectedItem is string sel) working.Remove(sel);
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result != ContentDialogResult.Primary) return false;
+        if (working.Count == 0) return false;   // 无目录视为取消（fs 调用会全被拒）
+        perm.Scopes.Clear();
+        foreach (var d in working) perm.Scopes.Add(d);
+        perm.NotifyScopesChanged();
+        return true;
     }
 
     private async void OnUninstallPlugin(object sender, RoutedEventArgs e)
@@ -3994,6 +4094,81 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>单文件选择器（限指定扩展名）；取消返回 null。WinUI3 需显式绑定 HWND。</summary>
+    private async Task<string?> PickOpenFileAsync(string commitText, params string[] extensions)
+    {
+        try
+        {
+            var picker = new Windows.Storage.Pickers.FileOpenPicker
+            {
+                SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.ComputerFolder,
+                CommitButtonText = commitText,
+            };
+            foreach (var ext in extensions) picker.FileTypeFilter.Add(ext);
+            InitializeWithWindow.Initialize(picker, _hwnd);
+            var file = await picker.PickSingleFileAsync();
+            return file?.Path;
+        }
+        catch (Exception ex)
+        {
+            App.Log("PickFile", ex);
+            SetPluginStatus("打开文件选择器失败：" + ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>「安装 .spark-plugin」：选包 → UI 侧安全解压（Zip Slip/配额，
+    /// 同市场安装）→ 复用 host.plugin.install（签名/版本策略同一条路，规范 §3）。</summary>
+    private async void OnInstallSparkPluginFile(object sender, RoutedEventArgs e)
+    {
+        var file = await PickOpenFileAsync("安装插件包", ".spark-plugin", ".zip");
+        if (file is null) return;
+        string? tempDir = null;
+        try
+        {
+            tempDir = await RegistryService.ExtractLocalSparkPluginAsync(file);
+            var outcome = await _host.PluginInstallAsync(tempDir);
+            switch (outcome.Action)
+            {
+                case "installed":
+                    SetPluginStatus($"已安装{SignSuffix(outcome.SignState)}：{outcome.Id}");
+                    break;
+                case "updated":
+                    PluginWindowHost.CloseIfOpen(outcome.Id);
+                    SetPluginStatus($"已更新到 v{outcome.Version}{SignSuffix(outcome.SignState)}");
+                    break;
+                case "confirm_downgrade":
+                {
+                    var msg = $"检测到旧版本\n已装 v{outcome.PreviousVersion}，将安装 v{outcome.Version}\n是否继续覆盖安装？";
+                    if (!await ConfirmDestructiveAsync(msg))
+                    {
+                        SetPluginStatus("已取消");
+                        break;
+                    }
+                    PluginWindowHost.CloseIfOpen(outcome.Id);
+                    var forced = await _host.PluginInstallAsync(tempDir, force: true);
+                    SetPluginStatus(forced.Action == "updated"
+                        ? $"已降级安装到 v{forced.Version}{SignSuffix(forced.SignState)}"
+                        : $"已安装{SignSuffix(forced.SignState)}：{forced.Id}");
+                    break;
+                }
+                default:
+                    SetPluginStatus($"已安装{SignSuffix(outcome.SignState)}：{outcome.Id}");
+                    break;
+            }
+            await LoadPluginsAsync();
+        }
+        catch (Exception ex)
+        {
+            App.Log("InstallSparkPluginFile", ex);
+            SetPluginStatus("安装失败：" + ex.Message);
+        }
+        finally
+        {
+            RegistryService.CleanupTemp(tempDir);
+        }
+    }
+
     // ==================== 插件市场 ====================
 
     private readonly List<RegistryPluginViewDto> _marketPlugins = new();
@@ -4008,6 +4183,13 @@ public sealed partial class MainWindow : Window
     private readonly List<string> _marketSourceUrls = new();
     /// <summary>当前市场加载所用源的 registry URL（官方门控/安装 zipball 解析依据），随每次加载刷新。</summary>
     private string _currentMarketSourceUrl = RegistryService.OfficialRegistryUrl;
+
+    /// <summary>当前选中的分类标签（null = 全部）；由「分类」筛选栏 chip 点击切换（规范 §3.3 tags）。</summary>
+    private string? _marketActiveTag;
+
+    /// <summary>分类 chip 的配色（惰性从 Root.Resources 取一次）。主题切换是原地改这些
+    /// SolidColorBrush 的 Color，引用保持有效，故 chip 自动跟随深/浅主题。</summary>
+    private MarketChipPalette? _marketChipPalette;
 
     private sealed class CustomRepoUrlVm : INotifyPropertyChanged
     {
@@ -4288,7 +4470,9 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
-    /// 市场列表筛选：关键词 + 状态，仅内存过滤 _marketPlugins（数据源不动），ItemsSource 指向筛选副本。
+    /// 市场列表筛选：分类标签 + 关键词 + 安装/签名状态，仅内存过滤 _marketPlugins（数据源不动）。
+    /// 结果按首个标签（<see cref="RegistryPluginViewDto.PrimaryTag"/>）分组，分组头作为普通行插进
+    /// 扁平 ItemsSource、由 MarketRowSelector 派发行模板；只有一组时不插组头（单组标题纯噪音）。
     /// 安装成功回填写原 DTO（与筛选视图同一实例），按钮/角标状态照常原位刷新。
     /// 已知的瞬态不一致（accepted）：如"未安装"筛选激活时安装成功，卡片原位保留在已不再匹配的
     /// 视图里（显示"已是最新"），下次筛选变更/刷新自愈——重算 membership 会打断原位回填与退场动画。
@@ -4304,32 +4488,174 @@ public sealed partial class MainWindow : Window
         }
 
         var kw = MarketFilterBox.Text?.Trim() ?? "";
-        var view = new List<RegistryPluginViewDto>(_marketPlugins.Count);
+        var stateIndex = MarketFilterCombo.SelectedIndex;
+        var matched = new List<RegistryPluginViewDto>(_marketPlugins.Count);
         foreach (var it in _marketPlugins)
         {
-            if (MatchesMarketFilter(it, kw, MarketFilterCombo.SelectedIndex)) view.Add(it);
+            if (MatchesMarketFilter(it, kw, stateIndex, _marketActiveTag)) matched.Add(it);
+        }
+
+        var groups = GroupByPrimaryTag(matched);
+        var view = new List<object>(matched.Count + groups.Count);
+        if (groups.Count > 1)
+        {
+            foreach (var g in groups)
+            {
+                view.Add(new MarketGroupHeaderVm(g.Tag, g.Items.Count));
+                view.AddRange(g.Items);
+            }
+        }
+        else
+        {
+            view.AddRange(matched);
         }
 
         // 筛选结果与当前视图逐项一致时跳过 ItemsSource 重赋值：整表替换会重建
         // 容器，打断安装中卡片的状态回填动画并重置滚动位置（逐键筛选的抖动源）。
+        // 组头行按值比较（Tag+Count）：组头每次筛选都会 new，引用比较恒 false，
+        // 有分组（tags 存在）时防抖会整体失效 → 逐键整表重赋值。
         var skipReassign = false;
-        if (MarketList.ItemsSource is List<RegistryPluginViewDto> cur && cur.Count == view.Count)
+        if (MarketList.ItemsSource is List<object> cur && cur.Count == view.Count)
         {
             skipReassign = true;
             for (var i = 0; i < view.Count; i++)
             {
-                if (!ReferenceEquals(cur[i], view[i])) { skipReassign = false; break; }
+                if (cur[i] is MarketGroupHeaderVm h && view[i] is MarketGroupHeaderVm g)
+                {
+                    if (!string.Equals(h.Tag, g.Tag, StringComparison.OrdinalIgnoreCase)
+                        || h.Count != g.Count)
+                    {
+                        skipReassign = false;
+                        break;
+                    }
+                }
+                else if (!ReferenceEquals(cur[i], view[i]))
+                {
+                    skipReassign = false;
+                    break;
+                }
             }
         }
         if (!skipReassign) MarketList.ItemsSource = view;
 
-        MarketList.Visibility = view.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-        MarketFilterEmpty.Visibility = view.Count > 0 ? Visibility.Collapsed : Visibility.Visible;
+        MarketList.Visibility = matched.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        MarketFilterEmpty.Visibility = matched.Count > 0 ? Visibility.Collapsed : Visibility.Visible;
     }
 
-    /// <summary>索引序与 XAML ComboBoxItem 一一对应：0全部 1未安装 2已安装 3官方 4已签名 5待签名 6签名失效。</summary>
-    private static bool MatchesMarketFilter(RegistryPluginViewDto it, string keyword, int selectedIndex)
+    /// <summary>
+    /// 按首个标签分组：组内保持仓库索引顺序（不动作者给的排序），组间顺序由
+    /// <see cref="MarketRules.GroupOrder"/> 决定（按插件数降序、「未分类」恒排最后——
+    /// 它是兜底组，不该占着"最热门分类"的位置）。纯规则在 MarketRules，测试工程可直接单测。
+    /// </summary>
+    private static List<(string Tag, List<RegistryPluginViewDto> Items)> GroupByPrimaryTag(
+        List<RegistryPluginViewDto> matched)
     {
+        var buckets = new Dictionary<string, List<RegistryPluginViewDto>>(StringComparer.OrdinalIgnoreCase);
+        var primaryTags = new List<string>(matched.Count);
+        foreach (var it in matched)
+        {
+            var key = it.PrimaryTag;
+            primaryTags.Add(key);
+            if (!buckets.TryGetValue(key, out var list))
+            {
+                list = new List<RegistryPluginViewDto>();
+                buckets[key] = list;
+            }
+            list.Add(it);
+        }
+
+        return MarketRules.GroupOrder(primaryTags)
+            .Select(tag => (Tag: tag, Items: buckets[tag]))
+            .ToList();
+    }
+
+    /// <summary>
+    /// 重建「分类」筛选栏：统计全部插件声明过的标签（含非首个标签，故一个插件可被多个 chip
+    /// 检索到），按出现次数降序，「全部」恒在首位。一个标签都没有（索引未打标）时整条隐藏。
+    /// 重建后若当前选中的标签已不存在（换源/索引更新），自动退回「全部」，避免停在空结果上。
+    /// </summary>
+    private void RebuildMarketTagBar()
+    {
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var order = new List<string>();
+        foreach (var it in _marketPlugins)
+        {
+            foreach (var t in it.Tags)
+            {
+                if (counts.TryGetValue(t, out var n)) counts[t] = n + 1;
+                else { counts[t] = 1; order.Add(t); }
+            }
+        }
+
+        if (_marketActiveTag is not null && !counts.ContainsKey(_marketActiveTag))
+        {
+            _marketActiveTag = null;
+        }
+
+        if (counts.Count == 0)
+        {
+            MarketTagBar.ItemsSource = null;
+            MarketTagScroll.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var palette = _marketChipPalette ??= BuildMarketChipPalette();
+        var chips = new List<MarketTagChipVm>(counts.Count + 1)
+        {
+            new(tag: null, label: "全部", count: _marketPlugins.Count, palette)
+            {
+                IsSelected = _marketActiveTag is null,
+            },
+        };
+        foreach (var tag in order
+                     .OrderByDescending(t => counts[t])
+                     .ThenBy(t => t, StringComparer.CurrentCulture))
+        {
+            chips.Add(new MarketTagChipVm(tag, tag, counts[tag], palette)
+            {
+                IsSelected = string.Equals(tag, _marketActiveTag, StringComparison.OrdinalIgnoreCase),
+            });
+        }
+
+        MarketTagBar.ItemsSource = chips;
+        MarketTagScroll.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>分类 chip 的主题画刷（懒建一次；缺任一资源键时抛异常，属启动期资源缺失应尽早暴露）。</summary>
+    private MarketChipPalette BuildMarketChipPalette() => new(
+        bgOff: (Brush)Root.Resources["ChipBgBrush"],
+        borderOff: (Brush)Root.Resources["GlassBorderBrush"],
+        fgOff: (Brush)Root.Resources["TextSecondaryBrush"],
+        bgOn: (Brush)Root.Resources["AccentSoftBrush"],
+        borderOn: (Brush)Root.Resources["AccentBrush"],
+        fgOn: (Brush)Root.Resources["TextPrimaryBrush"]);
+
+    /// <summary>
+    /// 分类 chip 点击：切换当前分类并重筛。选中态就地更新（不整栏重建），
+    /// 避免每次点击都把整排按钮重建一遍造成闪烁。
+    /// </summary>
+    private void OnMarketTagClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn || btn.DataContext is not MarketTagChipVm chip) return;
+
+        _marketActiveTag = chip.Tag;
+        if (MarketTagBar.ItemsSource is IEnumerable<MarketTagChipVm> chips)
+        {
+            foreach (var c in chips) c.IsSelected = ReferenceEquals(c, chip);
+        }
+        ApplyMarketFilter();
+    }
+
+    /// <summary>索引序与 XAML ComboBoxItem 一一对应：0全部 1未安装 2已安装 3官方 4已签名 5待签名 6签名失效 7可更新。</summary>
+    private static bool MatchesMarketFilter(RegistryPluginViewDto it, string keyword, int selectedIndex,
+        string? tag)
+    {
+        // 分类筛选：按"任一标签命中"匹配（一个插件可归多个分类，规范 §3.3）。
+        if (!MarketRules.MatchesTag(it.Tags, tag))
+        {
+            return false;
+        }
+
         var stateOk = selectedIndex switch
         {
             1 => !it.IsInstalled,
@@ -4338,14 +4664,17 @@ public sealed partial class MainWindow : Window
             4 => it.DisplaySignState == PluginSignState.ThirdParty,
             5 => it.PendingSignBadge,
             6 => it.DisplaySignState == PluginSignState.Invalid,
+            7 => it.CanUpdate,
             _ => true,
         };
         if (!stateOk) return false;
         if (keyword.Length == 0) return true;
+        // 标签也参与关键词匹配：搜"翻译"应能搜到打了该标签、但名字里没有"翻译"的插件。
         return ContainsIgnoreCase(it.Name, keyword)
             || ContainsIgnoreCase(it.Description, keyword)
             || ContainsIgnoreCase(it.Author, keyword)
-            || ContainsIgnoreCase(it.Id, keyword);
+            || ContainsIgnoreCase(it.Id, keyword)
+            || it.Tags.Any(t => ContainsIgnoreCase(t, keyword));
     }
 
     private static bool ContainsIgnoreCase(string? haystack, string needle)
@@ -4418,6 +4747,8 @@ public sealed partial class MainWindow : Window
             var empty = _marketPlugins.Count == 0;
             MarketEmpty.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
             MarketFilterRow.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
+            RebuildMarketTagBar();
+            RefreshMarketUpdateNotice();
             ApplyMarketFilter();
         }
         catch (Exception ex)
@@ -4428,6 +4759,8 @@ public sealed partial class MainWindow : Window
             _currentRegistry = null;
             _marketPlugins.Clear();
             MarketFilterRow.Visibility = Visibility.Collapsed;
+            RebuildMarketTagBar();
+            RefreshMarketUpdateNotice();
             ApplyMarketFilter();
             MarketList.Visibility = Visibility.Collapsed; // 与成功路径保持 MarketEmpty/MarketList 互斥不变量
             MarketEmpty.Visibility = Visibility.Visible;
@@ -4457,15 +4790,43 @@ public sealed partial class MainWindow : Window
     private async void OnInstallFromMarketplace(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is not RegistryPluginViewDto item) return;
+        await InstallMarketItemAsync(item, sender as Button);
+    }
+
+    /// <summary>
+    /// 安装/更新一个市场插件。卡片按钮与「全部更新」两条入口共用同一份逻辑。
+    /// <paramref name="btn"/> 为 null（批量更新）时只做状态回填、不驱动按钮水体动画——
+    /// 批量时卡片可能未 realize 或已滚出视口。
+    /// <paramref name="batchConfirmed"/> = true 表示调用方已用汇总确认框把"未签名/原生"
+    /// 风险逐项列出并取得用户确认，故跳过逐项二次确认（不是放宽：确认内容等价且更集中）。
+    /// </summary>
+    private async Task InstallMarketItemAsync(RegistryPluginViewDto item, Button? btn,
+        bool batchConfirmed = false)
+    {
         if (item.IsInstalling) return;
-        var btn = sender as Button;
 
         // await 前置位防重入：原生确认框期间再点会被 IsInstalling 守卫挡住
         item.IsInstalling = true;
         item.InstallProgress = 0;
         StartInstallWave(btn);
 
-        if (item.IsNative)
+        // 未签名安装确认（签名任务 Phase 4.3，整改清单 V8 响亮确认）：包内/索引
+        // 均无签名时响亮确认"来源可信"——本地验证无 signature.json（索引也无
+        // signature 字段）即 Unsigned。
+        if (!batchConfirmed && item.DisplaySignState == PluginSignState.Unsigned)
+        {
+            var confirmUnsigned = await ConfirmDestructiveAsync(
+                $"插件「{item.Name}」未签名\n无法验证来源与完整性（未带有效 signature.json）。" +
+                "请确认来源可信，确认安装？");
+            if (!confirmUnsigned)
+            {
+                item.IsInstalling = false;
+                StopInstallWave(btn);
+                return;
+            }
+        }
+
+        if (!batchConfirmed && item.IsNative)
         {
             var confirmNative = await ConfirmDestructiveAsync(
                 $"插件「{item.Name}」为原生插件 (Native)\n拥有操作系统完整执行权限。确认安装？");
@@ -4590,6 +4951,8 @@ public sealed partial class MainWindow : Window
             {
                 item.UpdateInstalledState(done.Version, done.SignState);
                 SetMarketStatus(null);
+                // 更新检查结果随装机状态变化（可更新数减少 → 归零时收起提示条）
+                RefreshMarketUpdateNotice();
             }
             // 按钮可能已被容器回收重绑：只排空仍属于本条目的按钮（回收时已由
             // DataContextChanged/Unloaded 钩子复位过）
@@ -4597,8 +4960,106 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    // ==================== 市场安装按钮·水体波浪 ====================
+    // ==================== 市场更新检查（打开市场页即比对版本） ====================
 
+    /// <summary>
+    /// 刷新「N 个插件可更新」提示条。数据来自 <see cref="LoadMarketplaceAsync"/> 的
+    /// 版本比对结果（<see cref="RegistryPluginViewDto.CanUpdate"/>），无需额外请求——
+    /// 打开市场页时索引与已装列表都已取到，顺手算出来即"自动检查更新"。
+    /// 没有可更新插件（或列表为空）时整条收起。批量更新进行中禁用按钮防重入。
+    /// </summary>
+    private void RefreshMarketUpdateNotice()
+    {
+        if (MarketUpdateNotice is null || MarketUpdateNoticeText is null) return;
+
+        var updatable = _marketPlugins.Where(p => p.CanUpdate).ToList();
+        if (updatable.Count == 0)
+        {
+            MarketUpdateNotice.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var names = string.Join("、", updatable.Take(3).Select(p => p.Name));
+        if (updatable.Count > 3) names += $" 等 {updatable.Count} 个";
+        MarketUpdateNoticeText.Text =
+            $"检测到 {updatable.Count} 个已装插件有新版本：{names}。";
+        MarketUpdateNotice.Visibility = Visibility.Visible;
+        MarketUpdateAllBtn.IsEnabled = !_updatingAll;
+    }
+
+    private bool _updatingAll;
+
+    /// <summary>
+    /// 「全部更新」：按列表顺序逐个走与单卡安装完全相同的逻辑（同一函数），
+    /// 逐个 await 串行——并发下载会互相抢带宽、且 host 安装本身要抢插件目录写锁。
+    /// 未签名/原生插件的风险在汇总确认框里逐项列出并取得一次明确确认，之后
+    /// 逐个安装不再弹窗（确认内容等价、避免 N 次重复弹窗）。
+    /// </summary>
+    private async void OnUpdateAllMarket(object sender, RoutedEventArgs e)
+    {
+        if (_updatingAll) return;
+        var targets = _marketPlugins.Where(p => p.CanUpdate && !p.IsInstalling).ToList();
+        if (targets.Count == 0)
+        {
+            RefreshMarketUpdateNotice();
+            return;
+        }
+        // 防重入前置（对齐 InstallMarketItemAsync 的"await 前置位"纪律）：汇总
+        // 确认框本身是 await，置位若放在 confirm 之后，快速连点会在覆盖层生效前
+        // 重入 → 第二次 ShowAsync 抛"同时只能一个 ContentDialog"，异常落在
+        // async void 直接崩进程。从置位到首个 await 之间是纯同步代码，无重入窗口。
+        _updatingAll = true;
+        var ok = 0;
+        var failed = new List<string>();
+        try
+        {
+            // 汇总确认：把"未签名""原生（完整系统权限）"两类风险逐项点名，
+            // 而不是笼统说一句"将更新 N 个插件"。
+            var msg = new System.Text.StringBuilder();
+            msg.Append($"将更新 {targets.Count} 个插件：\n");
+            foreach (var t in targets)
+            {
+                msg.Append($"\n· {t.Name}  v{t.InstalledVersion} → v{t.VersionText}");
+                if (t.IsNative) msg.Append("（原生插件，拥有完整系统权限）");
+                if (t.DisplaySignState == PluginSignState.Unsigned) msg.Append("（未签名，无法验证来源）");
+            }
+            if (!await ConfirmDestructiveAsync(msg.ToString())) return;
+
+            MarketUpdateAllBtn.IsEnabled = false;
+            foreach (var t in targets)
+            {
+                try
+                {
+                    await InstallMarketItemAsync(t, btn: null, batchConfirmed: true);
+                    // 成功与否以卡片状态判定：安装成功会回填 InstalledVersion 到目标版本
+                    if (!t.CanUpdate) ok++;
+                    else failed.Add(t.Name);
+                }
+                catch (Exception ex)
+                {
+                    App.Log("UpdateAllMarket", ex);
+                    failed.Add(t.Name);
+                }
+            }
+        }
+        finally
+        {
+            _updatingAll = false;
+            // 按钮态恢复放在 finally：确认取消 / 批量异常路径批量已结束，但方法
+            // 提前返回不会再走到尾部刷新——确认框打开期间并发的单卡安装续体可能
+            // 已把按钮按"_updatingAll=true"置为禁用，不复位就卡死到下次无关刷新
+            // （完成路径下这里多刷一次无害）。
+            RefreshMarketUpdateNotice();
+        }
+
+        SetMarketStatus(
+            failed.Count == 0
+                ? $"已更新 {ok} 个插件。"
+                : $"已更新 {ok} 个插件，失败 {failed.Count} 个：{string.Join("、", failed)}",
+            isError: failed.Count > 0);
+    }
+
+    // ==================== 市场安装按钮·水体波浪 ====================
     /// <summary>按钮 → 水体动画状态。按按钮隔离（多插件可并发安装，谁的动画谁停），
     /// 避免窗口级单槽被并发安装互相覆盖导致半途冻结/永久泄漏。</summary>
     private sealed class WaveState
@@ -5711,7 +6172,12 @@ public sealed partial class MainWindow : Window
     {
         Footer.Text = "打开插件：" + title;
         var rawQuery = QueryBox.Text ?? "";
-        var (command, input) = SplitPluginQuery(rawQuery);
+        // 触发上下文以 host 候选为准（匹配即权威）：keyword = (关键字, 去前缀
+        // 剩余)；regex/root = (空, 完整查询)——首词拆分对无关键字前缀的
+        // regex/root 候选会拆错，host 未下发时才回落拆分（老 host 兼容）。
+        var (command, input) = item.PluginInput is not null
+            ? (item.PluginCommand ?? "", item.PluginInput)
+            : SplitPluginQuery(rawQuery);
         try
         {
             var info = await _host.PluginOpenAsync(pluginId, input, command);

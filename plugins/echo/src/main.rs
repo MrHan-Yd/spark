@@ -29,6 +29,8 @@ impl Plugin for Echo {
                 target: None,
             }],
             plugin_id: Some(self.id().into()),
+            plugin_command: None,
+            plugin_input: None,
         })
     }
 

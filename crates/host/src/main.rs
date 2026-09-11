@@ -11,6 +11,8 @@ mod config;
 mod hotkey;
 mod index_watch;
 mod ipc_server;
+mod net_fetch;
+mod plugin_fs;
 mod probe;
 mod shell;
 mod single_instance;

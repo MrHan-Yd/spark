@@ -15,6 +15,11 @@ pub struct PluginState {
     pub enabled: BTreeMap<String, bool>,
     #[serde(default)]
     pub granted: BTreeMap<String, Vec<String>>,
+    /// 高危权限 `fs.read`/`fs.write` 的授权目录范围（《插件开发规范》§7：
+    /// "需用户在授权时指定范围"）。plugin_id → 权限 → 用户勾选的目录列表
+    /// （存绝对路径；fs 调用按前缀包含校验，越界抛 PERMISSION_SCOPE）。
+    #[serde(default)]
+    pub fs_scopes: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 impl PluginState {
@@ -75,6 +80,11 @@ impl PluginState {
 
     pub fn granted_of(&self, id: &str) -> Vec<String> {
         self.granted.get(id).cloned().unwrap_or_default()
+    }
+
+    /// 插件的 fs 授权目录范围（权限 → 目录列表；未配置返回空表）。
+    pub fn fs_scopes_of(&self, id: &str) -> BTreeMap<String, Vec<String>> {
+        self.fs_scopes.get(id).cloned().unwrap_or_default()
     }
 }
 

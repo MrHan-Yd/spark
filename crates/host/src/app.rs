@@ -9,8 +9,8 @@ use spark_core::{ensure_data_dir, Action, Candidate, Query, Source};
 use spark_index::{AppIndex, SearchIndex};
 use spark_ipc::{InvokeParams, InvokeResult, PluginApiParams, TrustedPubkeyEntry};
 use spark_plugin_manager::{
-    KeyKind, KeywordMatch, NativePageRequest, PluginInfo, PluginInstallOutcome, PluginManager,
-    PluginOpenInfo, TrustedKey,
+    FeatureType, KeyKind, KeywordMatch, NativePageRequest, OpenPrepared, PluginInfo,
+    PluginInstallOutcome, PluginManager, TrustedKey,
 };
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -89,10 +89,21 @@ pub struct SearchPrep {
 
 /// `plugin_api` 的执行计划：`Done` = 已在 host 锁内完成、data 即回包；
 /// `NativePage` = native 页面转发请求，调用方**放锁后** `execute`（native RPC
-/// 等待最坏 15s，绝不占 host 锁）。
+/// 等待最坏 15s，绝不占 host 锁）；`Net` = spark.net.fetch 请求，锁内只完成
+/// 鉴权+参数校验，阻塞 HTTP 由调用方**放锁后** `net_fetch::execute`；
+/// `Fs` = spark.fs.read/write，锁内只完成鉴权+路径形状校验（零 IO），真实
+/// 文件 IO 与范围 canonicalize 由调用方**放锁后** `plugin_fs::execute`（磁盘
+/// /网络盘 IO 可能阻塞数十秒，纪律同 Net/NativePage）；`Shell` =
+/// spark.shell.openExternal，锁内校验 target 形状，锁外启动系统默认程序；
+/// `Clipboard` = spark.clipboard.*，锁内只完成鉴权+参数解析，Win32 剪贴板访问与
+/// WIC 图片编解码（读图/写图可达数十毫秒）由调用方**放锁后** `clipboard::execute`。
 pub enum PluginApiOutcome {
     Done(serde_json::Value),
     NativePage(NativePageRequest),
+    Net(crate::net_fetch::NetRequest),
+    Fs(crate::plugin_fs::PluginFsRequest),
+    Shell(String),
+    Clipboard(crate::clipboard::ClipboardRequest),
 }
 
 /// 手动实现 Debug：deferred 请求持有子进程句柄（不可 derive），委托其手动 Debug。
@@ -101,6 +112,10 @@ impl std::fmt::Debug for PluginApiOutcome {
         match self {
             Self::Done(v) => f.debug_tuple("Done").field(v).finish(),
             Self::NativePage(req) => f.debug_tuple("NativePage").field(req).finish(),
+            Self::Net(req) => f.debug_tuple("Net").field(req).finish(),
+            Self::Fs(req) => f.debug_tuple("Fs").field(req).finish(),
+            Self::Shell(t) => f.debug_tuple("Shell").field(t).finish(),
+            Self::Clipboard(req) => f.debug_tuple("Clipboard").field(req).finish(),
         }
     }
 }
@@ -131,6 +146,14 @@ impl HostApp {
                 let at = next_top.min(hits.len());
                 hits.insert(at, cand);
                 next_top += 1;
+            }
+        }
+        // 二期触发方式（§5.2/§5.3）：regex/root 候选**追加**在主列表尾部，
+        // 不抢占应用/关键字结果（root 由开发者声明，规范已提示谨慎使用）。
+        for m in self.plugins.find_trigger_matches(text) {
+            if let Some(mut cand) = self.build_plugin_candidate(&m) {
+                cand.score = 50.0; // 稳定低于关键字/应用命中的追加位次
+                hits.push(cand);
             }
         }
         hits
@@ -172,7 +195,9 @@ impl HostApp {
             .map(|ic| p.root.join(ic).to_string_lossy().into_owned());
         let target = format!("plugin:page:{}", p.manifest.id);
         Some(Candidate {
-            id: format!("plugin:{}:{}", p.manifest.id, m.keyword),
+            // id 叠 feature_index：同插件 keyword 恰为 "root" + root feature、
+            // 或同插件两条相同 pattern 的 regex feature 会撞 id，产生双候选同键。
+            id: format!("plugin:{}:{}:{}", p.manifest.id, m.feature_index, m.keyword),
             title: f.title.clone(),
             subtitle,
             target: Some(target.clone()),
@@ -186,6 +211,14 @@ impl HostApp {
                 target: Some(target),
             }],
             plugin_id: Some(p.manifest.id.clone()),
+            // 触发上下文即权威（匹配时确定）：keyword = (关键字, 去前缀剩余)；
+            // regex/root = (空, 完整查询)。UI 开窗直接取用，不再自行拆分输入。
+            plugin_command: Some(if f.kind == FeatureType::Keyword {
+                m.keyword.clone()
+            } else {
+                String::new()
+            }),
+            plugin_input: Some(m.input.clone()),
         })
     }
 
@@ -337,16 +370,35 @@ impl HostApp {
         Ok(self.plugins.set_enabled(id, enabled)?)
     }
 
-    pub fn plugin_grant(&mut self, id: &str, perms: Vec<String>) -> Result<()> {
-        Ok(self.plugins.grant(id, perms)?)
+    pub fn plugin_grant(
+        &mut self,
+        id: &str,
+        perms: Vec<String>,
+        fs_scopes: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    ) -> Result<()> {
+        Ok(self.plugins.grant(id, perms, fs_scopes)?)
     }
 
     pub fn plugin_devload(&mut self, dir: &str) -> Result<String> {
         Ok(self.plugins.load_dev_dir(Path::new(dir))?)
     }
 
-    pub fn plugin_open(&self, id: &str) -> Result<PluginOpenInfo> {
-        Ok(self.plugins.open(id)?)
+    /// 入口页打开预检（锁内）：只做快照，零目录遍历。Standard 插件的现场签名
+    /// 重验由调用方放锁后执行（见 [`HostApp::plugin_open_fail_invalid`]）。
+    pub fn plugin_open_prepare(&self, id: &str) -> Result<OpenPrepared> {
+        Ok(self.plugins.open_prepare(id)?)
+    }
+
+    /// open 现场重验判 Invalid 的收尾：摘标（内存 `sign_state` → Invalid，带
+    /// version/root TOCTOU 守卫）+ 返回拒开错误。签名直接返回错误值本身——
+    /// 恒失败，不留"调用方还得 unreachable 兜底"的隐式契约。
+    pub fn plugin_open_fail_invalid(
+        &mut self,
+        id: &str,
+        version: &str,
+        root: &Path,
+    ) -> anyhow::Error {
+        self.plugins.open_fail_invalid(id, version, root).into()
     }
 
     /// 插件页面窗口关闭通知（UI → host）：native 纯应用插件的 exe 生命周期与页面
@@ -374,10 +426,11 @@ impl HostApp {
         self.plugins.plugins_dir()
     }
 
-    /// `spark.*` 特权能力桥的**锁内准备段**：校验声明+授权后执行 clipboard/notify/db；
-    /// native `rpc` 只做快照构造返回 deferred 请求，由调用方**放锁后**
-    /// `NativePageRequest::execute`——native RPC 等待（懒启动最坏 15s）绝不占
-    /// host 锁（native.rs 模块注释的锁序纪律）。
+    /// `spark.*` 特权能力桥的**锁内准备段**：校验声明+授权后执行 clipboard
+    /// /notify/db；`rpc`（native 页面转发）、`net`（HTTP）、`fs`（文件 IO）、
+    /// `shell`（启动默认程序）只做快照/校验构造返回 deferred 请求，由调用方
+    /// **放锁后** execute——等待与阻塞 IO 绝不占 host 锁（native.rs/net_fetch.rs
+    /// /plugin_fs.rs 模块注释的锁序纪律）。
     pub fn plugin_api(&mut self, params: &PluginApiParams) -> Result<PluginApiOutcome> {
         let declared = self.plugins.declared_permissions(&params.plugin_id);
         let granted = self.plugins.granted(&params.plugin_id);
@@ -395,9 +448,12 @@ impl HostApp {
                 if !has("clipboard") {
                     bail!("PERMISSION_DENIED: clipboard");
                 }
-                Ok(PluginApiOutcome::Done(
-                    self.plugin_api_clipboard(&params.method, &params.args)?,
-                ))
+                // 锁内只做鉴权 + 参数解析（零 IO）；剪贴板访问与 WIC 图片编解码由
+                // ipc_server 放锁后 clipboard::execute 执行（纪律同 net/fs/shell）。
+                Ok(PluginApiOutcome::Clipboard(clipboard::parse_request(
+                    &params.method,
+                    &params.args,
+                )?))
             }
             "notify" => {
                 if !has("notify") {
@@ -423,33 +479,71 @@ impl HostApp {
                     Err(e) => bail!("UNAVAILABLE: {e}"),
                 }
             }
-            other => bail!("UNAVAILABLE: capability {other}"),
-        }
-    }
-
-    fn plugin_api_clipboard(
-        &self,
-        method: &str,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        match method {
-            "read_text" => {
-                let text = clipboard::read_text()?;
-                Ok(serde_json::json!({ "text": text }))
-            }
-            "write_text" => {
-                #[derive(serde::Deserialize)]
-                struct Args {
-                    text: String,
+            "net" => {
+                if !has("net") {
+                    bail!("PERMISSION_DENIED: net");
                 }
-                let a: Args = serde_json::from_value(args.clone())?;
-                clipboard::write_text(&a.text)?;
-                Ok(serde_json::json!({ "ok": true }))
+                if params.method != "fetch" {
+                    let m = &params.method;
+                    bail!("INVALID_ARGS: net method {m}");
+                }
+                // 锁内只做鉴权 + args 纯校验（零 IO）；阻塞 HTTP 由 ipc_server
+                // 放锁后 net_fetch::execute 执行（纪律同 native rpc：不占 host 锁）。
+                Ok(PluginApiOutcome::Net(crate::net_fetch::parse_request(
+                    &params.args,
+                )?))
             }
-            // preload 已声明 readImage，但 host 端图片编码尚未实现；
-            // 返回明确 UNAVAILABLE 而非 INVALID_ARGS，避免开发者误判为参数错误。
-            "read_image" => bail!("UNAVAILABLE: clipboard.read_image 尚未实现"),
-            other => bail!("INVALID_ARGS: clipboard method {other}"),
+            "fs" => {
+                // fs.read / fs.write 各自独立鉴权（高危权限，规范 §7），范围
+                // 目录由用户授权时指定（plugins-state.json 的 fs_scopes）。
+                let perm = match params.method.as_str() {
+                    "read" => "fs.read",
+                    "write" => "fs.write",
+                    other => bail!("INVALID_ARGS: fs method {other}"),
+                };
+                if !has(perm) {
+                    bail!("PERMISSION_DENIED: {perm}");
+                }
+                let op = if params.method == "read" {
+                    crate::plugin_fs::FsOp::Read
+                } else {
+                    crate::plugin_fs::FsOp::Write
+                };
+                // 锁内只做鉴权 + args 纯校验（零 IO）；范围 canonicalize 与真实
+                // 读写由 ipc_server 放锁后 plugin_fs::execute 执行。
+                let scopes = self
+                    .plugins
+                    .fs_scopes_of(&params.plugin_id)
+                    .remove(perm)
+                    .unwrap_or_default();
+                Ok(PluginApiOutcome::Fs(crate::plugin_fs::parse_request(
+                    op,
+                    &params.args,
+                    scopes,
+                )?))
+            }
+            "shell" => {
+                if !has("shell.open") {
+                    bail!("PERMISSION_DENIED: shell.open");
+                }
+                if params.method != "open_external" {
+                    let m = &params.method;
+                    bail!("INVALID_ARGS: shell method {m}");
+                }
+                let target = params
+                    .args
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("INVALID_ARGS: shell.openExternal 需要 target 字符串")
+                    })?;
+                // 锁内只做形状校验；启动默认程序在锁外（shell::open_external 会
+                // 再做一次控制字符/长度净化，两道关口职责不同：这里保证 deferred
+                // 数据形状，锁外保证 ShellExecute 输入合法）。
+                Ok(PluginApiOutcome::Shell(target.to_string()))
+            }
+            other => bail!("UNAVAILABLE: capability {other}"),
         }
     }
 
@@ -629,6 +723,144 @@ mod tests {
         }
     }
 
+    /// 同 write_webview_plugin，但清单声明指定权限（net 等授权路径测试用）。
+    fn write_webview_plugin_perm(dir: &Path, id: &str, keyword: &str, perms: &[&str]) {
+        fs::create_dir_all(dir).unwrap();
+        let perms_json = serde_json::to_string(perms).unwrap();
+        let json = format!(
+            r#"{{ "id": "{id}", "name": "T", "version": "0.1.0", "api_version": 2,
+                 "runtime": "webview", "main": "index.html", "permissions": {perms_json},
+                 "features": [{{ "type": "keyword", "keyword": "{keyword}", "title": "T", "mode": "page" }}] }}"#
+        );
+        fs::write(dir.join("plugin.json"), json).unwrap();
+        fs::write(dir.join("index.html"), "<html></html>").unwrap();
+    }
+
+    #[test]
+    fn plugin_api_net_gate_and_parse() {
+        let tmp = std::env::temp_dir().join("spark_host_net_api");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut app = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
+
+        // 未声明 net 权限 → PERMISSION_DENIED（声明+授权双门禁，同 clipboard）。
+        write_webview_plugin(&tmp.join("com.spark.n1"), "com.spark.n1", "n1");
+        app.plugins.load_dev_dir(&tmp.join("com.spark.n1")).unwrap();
+        let err = app
+            .plugin_api(&api_params("com.spark.n1", "net", "fetch"))
+            .unwrap_err();
+        assert!(err.to_string().contains("PERMISSION_DENIED"), "{err}");
+
+        // 声明了但用户未授权 → PERMISSION_DENIED。
+        write_webview_plugin_perm(&tmp.join("com.spark.n2"), "com.spark.n2", "n2", &["net"]);
+        app.plugins.load_dev_dir(&tmp.join("com.spark.n2")).unwrap();
+        let err = app
+            .plugin_api(&api_params("com.spark.n2", "net", "fetch"))
+            .unwrap_err();
+        assert!(err.to_string().contains("PERMISSION_DENIED"), "{err}");
+
+        // 声明 + 授权 → 返回 deferred 请求（锁内仅校验，HTTP 在锁外执行）。
+        app.plugins
+            .grant("com.spark.n2", vec!["net".to_string()], None)
+            .unwrap();
+        let mut params = api_params("com.spark.n2", "net", "fetch");
+        params.args = serde_json::json!({ "url": "http://127.0.0.1:9/x" });
+        match app.plugin_api(&params).unwrap() {
+            PluginApiOutcome::Net(req) => {
+                assert_eq!(req.method, "GET");
+                assert_eq!(req.url, "http://127.0.0.1:9/x");
+            }
+            other => panic!("expected Net outcome, got {other:?}"),
+        }
+
+        // 授权后 args 不合法 → INVALID_ARGS（而非权限错误）。
+        let mut params = api_params("com.spark.n2", "net", "fetch");
+        params.args = serde_json::json!({ "url": "ftp://x" });
+        let err = app.plugin_api(&params).unwrap_err();
+        assert!(err.to_string().contains("INVALID_ARGS"), "{err}");
+
+        // method 非 fetch → INVALID_ARGS（net 只开 fetch 一个方法）。
+        let mut params = api_params("com.spark.n2", "net", "list");
+        params.args = serde_json::json!({ "url": "http://127.0.0.1:9/x" });
+        let err = app.plugin_api(&params).unwrap_err();
+        assert!(err.to_string().contains("INVALID_ARGS"), "{err}");
+    }
+
+    #[test]
+    fn plugin_api_fs_and_shell_gate_and_parse() {
+        // fs：fs.read/fs.write 独立鉴权 + 锁内纯校验 + 范围快照下发；
+        // shell：shell.open 门禁 + deferred target。
+        let tmp = std::env::temp_dir().join("spark_host_fs_api");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut app = host_with_dirs(tmp.join("plugins"), tmp.join("data"));
+        write_webview_plugin_perm(
+            &tmp.join("com.spark.f"),
+            "com.spark.f",
+            "f",
+            &["fs.read", "fs.write", "shell.open"],
+        );
+        app.plugins.load_dev_dir(&tmp.join("com.spark.f")).unwrap();
+
+        // 未授权 → PERMISSION_DENIED。
+        let err = app
+            .plugin_api(&api_params("com.spark.f", "fs", "read"))
+            .unwrap_err();
+        assert!(err.to_string().contains("PERMISSION_DENIED"), "{err}");
+        let err = app
+            .plugin_api(&api_params("com.spark.f", "shell", "open_external"))
+            .unwrap_err();
+        assert!(err.to_string().contains("PERMISSION_DENIED"), "{err}");
+        // 授权只授 fs.read 时调 write → PERMISSION_DENIED（独立权限）。
+        app.plugins
+            .grant("com.spark.f", vec!["fs.read".to_string()], None)
+            .unwrap();
+        let mut params = api_params("com.spark.f", "fs", "write");
+        params.args = serde_json::json!({ "path": "C:\\x.txt", "text": "x" });
+        let err = app.plugin_api(&params).unwrap_err();
+        assert!(err.to_string().contains("PERMISSION_DENIED"), "{err}");
+
+        // fs.read 授权（无范围）：锁内产出 deferred 请求（scopes 空，锁外
+        // execute 报 PERMISSION_SCOPE——不占锁）。
+        app.plugins
+            .grant(
+                "com.spark.f",
+                vec![
+                    "fs.read".to_string(),
+                    "fs.write".to_string(),
+                    "shell.open".to_string(),
+                ],
+                None,
+            )
+            .unwrap();
+        let mut params = api_params("com.spark.f", "fs", "read");
+        params.args = serde_json::json!({ "path": "C:\\data\\a.txt" });
+        match app.plugin_api(&params).unwrap() {
+            PluginApiOutcome::Fs(req) => {
+                assert_eq!(req.op, crate::plugin_fs::FsOp::Read);
+                assert_eq!(req.path, "C:\\data\\a.txt");
+                assert!(req.scopes.is_empty());
+            }
+            other => panic!("expected Fs outcome, got {other:?}"),
+        }
+        // 相对路径 → INVALID_ARGS（锁内即拒，零 IO）。
+        let mut params = api_params("com.spark.f", "fs", "read");
+        params.args = serde_json::json!({ "path": "relative/x.txt" });
+        let err = app.plugin_api(&params).unwrap_err();
+        assert!(err.to_string().contains("INVALID_ARGS"), "{err}");
+
+        // shell.open 授权：deferred target 回传。
+        let mut params = api_params("com.spark.f", "shell", "open_external");
+        params.args = serde_json::json!({ "target": "https://example.com" });
+        match app.plugin_api(&params).unwrap() {
+            PluginApiOutcome::Shell(target) => assert_eq!(target, "https://example.com"),
+            other => panic!("expected Shell outcome, got {other:?}"),
+        }
+        // 空 target → INVALID_ARGS。
+        let mut params = api_params("com.spark.f", "shell", "open_external");
+        params.args = serde_json::json!({ "target": "" });
+        let err = app.plugin_api(&params).unwrap_err();
+        assert!(err.to_string().contains("INVALID_ARGS"), "{err}");
+    }
+
     #[test]
     fn plugin_api_rpc_returns_deferred_for_native_only() {
         // rpc 准备段：native 插件返回 deferred 请求（等待在锁外执行，本测试不执行）；
@@ -691,20 +923,20 @@ mod tests {
         let mut app = host_with_translator_plugins(&tmp);
 
         let hits = app.search("翻译");
-        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:0:翻译");
         assert_eq!(hits[0].score, 100.0);
-        assert_eq!(hits[1].id, "plugin:com.spark.trl:翻译器");
+        assert_eq!(hits[1].id, "plugin:com.spark.trl:0:翻译器");
         assert_eq!(hits[1].score, 89.0);
 
         // 只有前缀（无精确命中）：前缀候选置顶
         let hits = app.search("翻");
-        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:0:翻译");
         assert_eq!(hits[0].score, 90.0);
 
         // 前缀带参进入参数阶段后不再给前缀建议：只剩精确路由的带参候选
         let hits = app.search("翻译 1");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:0:翻译");
     }
 
     #[test]
@@ -718,9 +950,9 @@ mod tests {
 
         let hits = app.search("翻译");
         assert_eq!(hits.len(), 3); // 精确 + 两个真前缀候选
-        assert_eq!(hits[0].id, "plugin:com.spark.fy:翻译");
-        assert_eq!(hits[1].id, "plugin:com.spark.trl:翻译器");
-        assert_eq!(hits[2].id, "plugin:com.spark.zn:翻译指南");
+        assert_eq!(hits[0].id, "plugin:com.spark.fy:0:翻译");
+        assert_eq!(hits[1].id, "plugin:com.spark.trl:0:翻译器");
+        assert_eq!(hits[2].id, "plugin:com.spark.zn:0:翻译指南");
         assert!(hits[0].score > hits[1].score && hits[1].score > hits[2].score);
     }
 
@@ -739,14 +971,14 @@ mod tests {
             .unwrap();
 
         let hits = app.search("echo");
-        assert_eq!(hits[0].id, "plugin:com.spark.np:echo");
+        assert_eq!(hits[0].id, "plugin:com.spark.np:0:echo");
         assert_eq!(hits[0].score, 100.0);
         assert_eq!(hits[0].target.as_deref(), Some("plugin:page:com.spark.np"));
         assert_eq!(hits[0].source, Source::Plugin);
 
         // 前缀建议同样适用。
         let hits = app.search("ech");
-        assert_eq!(hits[0].id, "plugin:com.spark.np:echo");
+        assert_eq!(hits[0].id, "plugin:com.spark.np:0:echo");
 
         // 无 features 的 native：不产候选（页面走卡片「打开」）。
         assert!(app
@@ -756,6 +988,6 @@ mod tests {
 
         // 带参候选：input 语义与 webview 一致（UI 拆 "echo hi" → input="hi"）。
         let hits = app.search("echo hi");
-        assert_eq!(hits[0].id, "plugin:com.spark.np:echo");
+        assert_eq!(hits[0].id, "plugin:com.spark.np:0:echo");
     }
 }

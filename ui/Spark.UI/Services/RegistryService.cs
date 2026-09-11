@@ -41,6 +41,21 @@ public static class RegistryService
     /// <summary>官方仓库 zipball 回退地址（索引未声明 zipball_url 时使用）。</summary>
     public const string OfficialZipballUrl = "https://github.com/MrHan-Yd/spark-plugins/archive/refs/heads/master.zip";
 
+    /// <summary>市场分类：单个标签的最大长度。纯规则（连同上限常量）已抽到
+    /// <see cref="MarketRules"/>——那里不依赖 WinUI，测试工程直接链接源文件即可单测。</summary>
+    public const int MaxTagLength = MarketRules.MaxTagLength;
+
+    /// <summary>市场分类：单个插件最多保留的标签数（见 <see cref="MarketRules"/>）。</summary>
+    public const int MaxTagsPerPlugin = MarketRules.MaxTagsPerPlugin;
+
+    /// <summary>
+    /// 标签净化（registry.json 是三方不可信数据，规范 §9.5 容错）：Trim → 非空 → 拒控制字符
+    /// → 限长 → 按忽略大小写去重 → 限量。不合法标签静默丢弃（不因此拒绝整个插件条目）；
+    /// 全部标签都不合法时返回空表，该插件在 UI 归入「未分类」组。
+    /// 实现在 <see cref="MarketRules.NormalizeTags"/>（纯规则、可单测），这里只保留对外入口。
+    /// </summary>
+    public static List<string> NormalizeTags(List<string>? raw) => MarketRules.NormalizeTags(raw);
+
     /// <summary>Gitee 官方仓库 zipball（repository/archive 直链，302 到签名下载地址）。</summary>
     public const string OfficialZipballUrlGitee = "https://gitee.com/han-yongding/spark-plugins/repository/archive/master.zip";
 
@@ -213,14 +228,15 @@ public static class RegistryService
                 var index = JsonSerializer.Deserialize<RegistryIndexDto>(json, options)
                     ?? throw new InvalidDataException("registry.json 内容为空或格式不正确");
 
-                if (index.Schema != 1)
+                if (!MarketRules.IsSchemaSupported(index.Schema))
                 {
                     throw new NotSupportedException($"不支持的 registry schema 版本：{index.Schema} (要求 schema=1)");
                 }
 
-                // 过滤掉数据不完整的条目，避免 UI 崩坏
+                // 规范 §9.5「跳过不完整的插件条目」：id/latest 任一缺失即整条丢弃，
+                // 其余条目照常展示（判据抽成纯规则，测试工程可直接单测）。
                 index.Plugins = index.Plugins
-                    .Where(p => !string.IsNullOrWhiteSpace(p.Id) && !string.IsNullOrWhiteSpace(p.Latest))
+                    .Where(p => MarketRules.IsPluginEntryUsable(p.Id, p.Latest))
                     .ToList();
 
                 // 第三方 registry.json 不可信：显式 null 会把 C# 属性初始化的默认值覆写为 null。
@@ -235,6 +251,7 @@ public static class RegistryService
                     p.Icon = p.Icon ?? "";
                     p.Runtime = p.Runtime ?? "webview";
                     p.Permissions = p.Permissions ?? new List<string>();
+                    p.Tags = NormalizeTags(p.Tags);
                     p.Versions = p.Versions is null
                         ? new List<RegistryVersionDto>()
                         : p.Versions.Where(v => v is not null).ToList();
@@ -363,48 +380,11 @@ public static class RegistryService
 
     /// <summary>
     /// 比较两个语义化版本号 (例如 "0.2.1" 与 "0.1.9")
-    /// 返回 >0 表示 a > b; =0 表示 a == b; <0 表示 a < b
+    /// 返回 &gt;0 表示 a &gt; b; =0 表示 a == b; &lt;0 表示 a &lt; b
     /// 与 host 端 cmp_version 风格一致：显式去掉 'v'/'V' 前缀再分段比较。
+    /// 实现在 <see cref="MarketRules.CompareVersion"/>（纯规则、可单测），这里只保留对外入口。
     /// </summary>
-    public static int CompareVersion(string? a, string? b)
-    {
-        if (string.IsNullOrEmpty(a) && string.IsNullOrEmpty(b)) return 0;
-        if (string.IsNullOrEmpty(a)) return -1;
-        if (string.IsNullOrEmpty(b)) return 1;
-
-        // 对齐 host 的 parse_version_tuple：跳过前导非数字（兼容 "v0.1.0"）
-        var normA = TrimLeadingNonDigits(a);
-        var normB = TrimLeadingNonDigits(b);
-
-        var segsA = normA.Split('.');
-        var segsB = normB.Split('.');
-        var len = Math.Max(segsA.Length, segsB.Length);
-
-        for (int i = 0; i < len; i++)
-        {
-            var partA = i < segsA.Length ? segsA[i] : "0";
-            var partB = i < segsB.Length ? segsB[i] : "0";
-
-            if (int.TryParse(partA, out var numA) && int.TryParse(partB, out var numB))
-            {
-                if (numA != numB) return numA.CompareTo(numB);
-            }
-            else
-            {
-                var cmp = string.Compare(partA, partB, StringComparison.OrdinalIgnoreCase);
-                if (cmp != 0) return cmp;
-            }
-        }
-        return 0;
-    }
-
-    /// <summary>跳过前导非 ASCII 数字字符，对齐 host 端 parse_version_tuple 的 trim_start_matches。</summary>
-    private static string TrimLeadingNonDigits(string s)
-    {
-        int i = 0;
-        while (i < s.Length && !char.IsAsciiDigit(s[i])) i++;
-        return i == 0 ? s : s[i..];
-    }
+    public static int CompareVersion(string? a, string? b) => MarketRules.CompareVersion(a, b);
 
     /// <summary>
     /// 下载 GitHub 仓库 zipball 并提取指定插件目录
@@ -551,55 +531,8 @@ public static class RegistryService
 
             Directory.CreateDirectory(tempExtractDir);
 
-            using (var archive = ZipFile.OpenRead(tempZip))
-            {
-                if (archive.Entries.Count > MaxEntryCount)
-                {
-                    throw new InvalidDataException($"Zip 包内文件过多 ({archive.Entries.Count} > {MaxEntryCount})");
-                }
-
-                long totalBytes = 0;
-                var rootPathWithSlash = Path.GetFullPath(tempExtractDir);
-                if (!rootPathWithSlash.EndsWith(Path.DirectorySeparatorChar.ToString()))
-                {
-                    rootPathWithSlash += Path.DirectorySeparatorChar;
-                }
-
-                foreach (var entry in archive.Entries)
-                {
-                    if (string.IsNullOrEmpty(entry.FullName) || entry.FullName.EndsWith('/')) continue;
-
-                    var destPath = Path.GetFullPath(Path.Combine(tempExtractDir, entry.FullName));
-                    if (!destPath.StartsWith(rootPathWithSlash, StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw new InvalidDataException($"检测到潜在的 Zip Slip 路径穿越攻击: {entry.FullName}");
-                    }
-
-                    totalBytes += entry.Length;
-                    if (totalBytes > MaxUnpackSize)
-                    {
-                        throw new InvalidDataException($"解压总大小超过配额限制 ({MaxUnpackSize / 1024 / 1024} MiB)");
-                    }
-
-                    var dir = Path.GetDirectoryName(destPath);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
-                    entry.ExtractToFile(destPath, overwrite: true);
-                }
-
-                if (!File.Exists(Path.Combine(tempExtractDir, "plugin.json")))
-                {
-                    // 若包内包含一层单根目录，尝试查找
-                    var subDirs = Directory.GetDirectories(tempExtractDir);
-                    if (subDirs.Length == 1 && File.Exists(Path.Combine(subDirs[0], "plugin.json")))
-                    {
-                        return subDirs[0];
-                    }
-                    throw new FileNotFoundException("插件 zip 包根目录缺少 plugin.json");
-                }
-            }
-
-            return tempExtractDir;
+            var pluginRoot = ExtractZipSafely(tempZip, tempExtractDir);
+            return pluginRoot ?? tempExtractDir;
         }
         catch
         {
@@ -610,6 +543,97 @@ public static class RegistryService
         {
             try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
         }
+    }
+
+    /// <summary>
+    /// 解压本地 .spark-plugin 文件（规范 §3 安装方式：zip 根目录直接是插件文件）。
+    /// 与市场安装同一套安全校验（§9：体积配额 + 文件数配额 + Zip Slip 规范化
+    /// 路径校验 + plugin.json 存在性），复用 host.plugin.install 的签名/版本策略。
+    /// 返回插件根目录（temp，调用方负责 CleanupTemp）。
+    /// </summary>
+    public static async Task<string> ExtractLocalSparkPluginAsync(
+        string pluginZipPath, CancellationToken ct = default)
+    {
+        var tempExtractDir = Path.Combine(Path.GetTempPath(), $"spark_plugin_{Guid.NewGuid():N}");
+        try
+        {
+            if (!File.Exists(pluginZipPath))
+                throw new FileNotFoundException("插件包不存在", pluginZipPath);
+            var size = new FileInfo(pluginZipPath).Length;
+            if (size > MaxZipSize)
+                throw new InvalidDataException($"插件包体积过大 ({size / 1024 / 1024} MiB > {MaxZipSize / 1024 / 1024} MiB)");
+            ct.ThrowIfCancellationRequested();
+
+            // 真异步：解压是纯同步磁盘 IO（合法包可达数千文件/数十 MiB），留在
+            // UI 线程会让主窗口冻结数十秒；挪到工作线程执行，await 真正让出
+            // （不带 ConfigureAwait(false)——调用方是 UI 事件处理器，续体须回 UI 线程）。
+            var root = await Task.Run(() => ExtractZipSafely(pluginZipPath, tempExtractDir), ct);
+            return root ?? tempExtractDir;
+        }
+        catch
+        {
+            CleanupTemp(tempExtractDir);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 规范 §9 解压安全核（直链 zip 与本地 .spark-plugin 共用）：数量/Zip Slip/解压配额
+    /// 三重校验 + plugin.json 存在性（含"单根目录包"识别）。返回插件根目录
+    /// （包内单根目录时为该子目录），plugin.json 缺失抛 FileNotFoundException。
+    /// </summary>
+    private static string? ExtractZipSafely(string zipPath, string tempExtractDir)
+    {
+        Directory.CreateDirectory(tempExtractDir);
+
+        using (var archive = ZipFile.OpenRead(zipPath))
+        {
+            if (archive.Entries.Count > MaxEntryCount)
+            {
+                throw new InvalidDataException($"Zip 包内文件过多 ({archive.Entries.Count} > {MaxEntryCount})");
+            }
+
+            long totalBytes = 0;
+            var rootPathWithSlash = Path.GetFullPath(tempExtractDir);
+            if (!rootPathWithSlash.EndsWith(Path.DirectorySeparatorChar.ToString()))
+            {
+                rootPathWithSlash += Path.DirectorySeparatorChar;
+            }
+
+            foreach (var entry in archive.Entries)
+            {
+                if (string.IsNullOrEmpty(entry.FullName) || entry.FullName.EndsWith('/')) continue;
+
+                var destPath = Path.GetFullPath(Path.Combine(tempExtractDir, entry.FullName));
+                if (!destPath.StartsWith(rootPathWithSlash, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException($"检测到潜在的 Zip Slip 路径穿越攻击: {entry.FullName}");
+                }
+
+                totalBytes += entry.Length;
+                if (totalBytes > MaxUnpackSize)
+                {
+                    throw new InvalidDataException($"解压总大小超过配额限制 ({MaxUnpackSize / 1024 / 1024} MiB)");
+                }
+
+                var dir = Path.GetDirectoryName(destPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                entry.ExtractToFile(destPath, overwrite: true);
+            }
+        }
+
+        if (File.Exists(Path.Combine(tempExtractDir, "plugin.json")))
+        {
+            return tempExtractDir;
+        }
+        // 包内含一层单根目录时以该子目录为插件根（常见打包形态）。
+        var subDirs = Directory.GetDirectories(tempExtractDir);
+        if (subDirs.Length == 1 && File.Exists(Path.Combine(subDirs[0], "plugin.json")))
+        {
+            return subDirs[0];
+        }
+        throw new FileNotFoundException("插件 zip 包根目录缺少 plugin.json");
     }
 
     private static async Task DownloadToFileAsync(string url, string destPath, long maxBytes, CancellationToken ct, Action<DownloadProgressReport>? progress = null)

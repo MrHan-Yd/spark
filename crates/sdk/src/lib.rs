@@ -192,6 +192,8 @@ mod tests {
                     target: None,
                 }],
                 plugin_id: Some(self.id().into()),
+                plugin_command: None,
+                plugin_input: None,
             })
         }
         fn invoke(&mut self, params: InvokeParams) -> InvokeResult {

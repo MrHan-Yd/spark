@@ -65,6 +65,37 @@
     };
   }
 
+  // ── 出站收口第二层（《插件开发规范》§12）──────────────────────────────
+  // 引擎层（PluginWindow 的 WebResourceRequested）已拦死 http/https——
+  // fetch/XHR/子资源/sendBeacon(EventSource、Ping 上下文) 都过不去。但下面这些
+  // 通道不走 HTTP 请求栈、引擎层拦不到，故在页面侧一并封死：
+  //   WebSocket / WebTransport：HTTP 升级后的长连接；
+  //   RTCPeerConnection：UDP 直连，可经 DataChannel 外传数据。
+  // 本脚本先于页面任何代码执行，此处取走原生构造器并替换为拒绝桩（不可重定义、
+  // 不可枚举），页面拿不到原生引用。插件出网请统一走 spark.net.fetch()。
+  function denyChannel(name) {
+    return function () {
+      throw sparkError('PERMISSION_DENIED',
+        '插件页禁止使用 ' + name + '，请改用 spark.net.fetch()（需 net 权限）');
+    };
+  }
+
+  ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection']
+    .forEach(function (name) {
+      if (!(name in window)) return;
+      try {
+        Object.defineProperty(window, name, {
+          value: denyChannel(name),
+          writable: false,
+          configurable: false,
+          enumerable: false
+        });
+      } catch (e) {
+        // 个别宿主不允许重定义时静默降级：引擎层仍拦 HTTP，WebRTC 场景另有
+        // PermissionRequested 全拒兜底。
+      }
+    });
+
   // ── 事件 ───────────────────────────────────────────────────────────────
   var listeners = Object.create(null);
 
@@ -113,7 +144,13 @@
       readImage: function () {
         return call('clipboard', 'read_image')
           .then(function (r) { return (r && r.data) || null; });
-      }
+      },
+      // 一次读全部支持格式（规范 §8.3）：分次调用 readText/readImage 之间剪贴板
+      // 可能被别的进程改动，插件会拿到"文本来自 A、图片来自 B"的错配组合，
+      // 故提供一次打开剪贴板读全部格式的入口。
+      read: clipReadItem,
+      // 写剪贴板（覆盖全部内容）：{ text?, imagePng? } 至少给一项。
+      write: clipWriteItem
     },
 
     notify: {
@@ -140,26 +177,65 @@
       return call('rpc', String(method || ''), args === undefined ? null : args);
     },
 
-    // 以下能力 host 端尚未实现：preload 提供 API 桩，调用统一返回 UNAVAILABLE。
-    // 这样开发者照规范写不会拿到 TypeError，而是清晰的“未实现”错误。
+    // 与 clipboard 同策略：不做 granted 本地快拦，每次调用交给 host 按
+    // "声明+授权"鉴权——中途在插件管理勾选"访问网络"后，已开窗口无需重开
+    // 即时生效；被拒错误也会冒给宿主 UI 显示可见的权限提示。
     net: {
       fetch: function (url, init) {
-        return guarded('net', 'net', 'fetch')({ url: String(url), init: init || null });
+        return call('net', 'fetch', { url: String(url), init: init || null })
+          .then(function (r) {
+            // host 回 { status, headers, bodyText }；这里包装成规范 §8.3 形状
+            // { status, headers, text(), json() }。
+            var bodyText = (r && r.bodyText) || '';
+            // headers 用 null 原型对象（服务端可控键名，__proto__ 等不会触发原型
+            // 链行为），补自有 hasOwnProperty 绑定——插件照 Record 惯例调用
+            // headers.hasOwnProperty(k) 不会因缺原型拿到 TypeError；先补后冻结
+            // （strict 模式下冻结后赋值会抛 TypeError）。
+            var headers = Object.assign(Object.create(null), (r && r.headers) || {});
+            headers.hasOwnProperty = Object.prototype.hasOwnProperty;
+            Object.freeze(headers);
+            // 空响应体（204/空体）json() 按 null 处理——JSON.parse('') 会抛语法
+            // 错，报 INVALID_ARGS 会让开发者把"无内容"误判成参数/格式问题。
+            if (bodyText === '') return { status: (r && r.status) || 0, headers: headers, text: function () { return Promise.resolve(bodyText); }, json: function () { return Promise.resolve(null); } };
+            return {
+              status: (r && r.status) || 0,
+              headers: headers,
+              text: function () { return Promise.resolve(bodyText); },
+              json: function () {
+                return new Promise(function (resolve, reject) {
+                  try { resolve(JSON.parse(bodyText)); }
+                  catch (e) {
+                    reject(sparkError('INVALID_ARGS', '响应不是合法 JSON: ' + e.message));
+                  }
+                });
+              }
+            };
+          });
       }
     },
 
+    // shell/fs 与 clipboard/net 同策略：不做 granted 本地快拦，每次调用交给
+    // host 按"声明+授权"鉴权——中途在插件管理里勾选/配置后，已开着的窗口
+    // 无需重开即时生效；被拒错误也会冒给宿主 UI 显示可见的权限提示。
     shell: {
       openExternal: function (target) {
-        return guarded('shell.open', 'shell', 'open_external')({ target: String(target) });
+        return call('shell', 'open_external', { target: String(target) })
+          .then(function () { return undefined; });
       }
     },
 
     fs: {
       read: function (path) {
-        return guarded('fs.read', 'fs', 'read')({ path: String(path) });
+        return call('fs', 'read', { path: String(path) })
+          .then(function (r) { return (r && r.text) || ''; });
       },
       write: function (path, text) {
-        return guarded('fs.write', 'fs', 'write')({ path: String(path), text: String(text) });
+        // 漏传 text 的调用会被 String() 变成 "undefined" 静默写盘——显式拒绝。
+        if (text === undefined || text === null) {
+          return Promise.reject(sparkError('INVALID_ARGS', 'fs.write 需要 text 参数'));
+        }
+        return call('fs', 'write', { path: String(path), text: String(text) })
+          .then(function (r) { return (r && r.ok) === true; });
       }
     },
 
@@ -191,13 +267,50 @@
       .then(function () { return undefined; });
   }
 
+  // 一次读全部支持格式（规范 §8.3）：分次调用 readText/readImage 之间剪贴板可能被
+  // 别的进程改动，插件会拿到"文本来自 A、图片来自 B"的错配组合，故提供一次打开
+  // 剪贴板读全部格式的入口。无任何支持格式 → null（与 readImage 的 null 语义一致）。
+  function clipReadItem() {
+    return call('clipboard', 'read_all').then(function (r) {
+      var types = (r && r.types) || [];
+      if (!types.length) return null;
+      return {
+        types: types,
+        text: (r && r.text) || null,
+        imagePng: (r && r.image_png) || null,
+        has: function (type) { return types.indexOf(String(type)) >= 0; }
+      };
+    });
+  }
+
+  // 写剪贴板（覆盖全部内容）：{ text?, imagePng? } 至少给一项；两者同时给出时
+  // 两种格式都写入、由接收方自选（标准剪贴板行为，不是"二选一"）。
+  // imagePng 与 readImage/read 的返回对称：裸 base64，不含 data: 前缀
+  // （带前缀时宽容剥掉）。
+  function clipWriteItem(item) {
+    item = item || {};
+    var text = (item.text === undefined || item.text === null) ? null : String(item.text);
+    var imagePng = (item.imagePng === undefined || item.imagePng === null)
+      ? null : String(item.imagePng);
+    if (text === null && imagePng === null) {
+      return Promise.reject(sparkError('INVALID_ARGS',
+        'clipboard.write 需要 text 或 imagePng 至少一项'));
+    }
+    if (imagePng !== null && imagePng.indexOf('data:') === 0) {
+      var comma = imagePng.indexOf(',');
+      if (comma >= 0) imagePng = imagePng.slice(comma + 1);
+    }
+    return call('clipboard', 'write_item', { text: text, image_png: imagePng })
+      .then(function () { return undefined; });
+  }
+
   var shimClipboard = Object.freeze({
     readText: clipReadText,
     writeText: clipWriteText,
-    // 复杂格式（ClipboardItem）host 端未实现，显式拒绝而非静默失败，
-    // 避免开发者把能力缺口误判成权限或参数问题。
-    read: function () { return Promise.reject(sparkError('UNAVAILABLE', 'clipboard.read 未实现，请使用 readText')); },
-    write: function () { return Promise.reject(sparkError('UNAVAILABLE', 'clipboard.write 未实现，请使用 writeText')); }
+    // 多格式读写（规范 §8.3 spark.clipboard.read/write）复用同一批 host 方法，
+    // 与 spark.clipboard 同一函数引用（页面改写 spark.clipboard 也换不掉它）。
+    read: clipReadItem,
+    write: clipWriteItem
   });
   // 替换失败安全：极老引擎上 delete/defineProperty 可能抛错，退化为原生入口，
   // 此时 host 桥仍是权威防线（页面伪造 postMessage 过不了 host 的声明+授权校验）。

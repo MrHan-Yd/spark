@@ -6,8 +6,14 @@
 - **性能与分层原则**：热路径逻辑（Hot Path）只进 `crates/`，**绝对不要**把索引、热键或核心计算逻辑做进 UI 层。
 - **UI 参考说明**：HTML 原型 `ui-prototype/` 仅作为设计与视觉参考，**不是**生产环境 UI 代码，切勿直接迁移其实现。
 - **提交与质量门禁**：
-    - 每次代码交付/提交前必须通过：`cargo test --workspace`
+    - 每次代码交付/提交前必须通过：`cargo test --workspace`（Rust 全量）
+      以及 `dotnet test ui/Spark.UI.Tests/Spark.UI.Tests.csproj`（C# 市场规则/错误码层）；
+      一条命令跑完两者：`.\scripts\test.ps1`
     - 只要包含 Rust 相关改动，必须执行：`cargo fmt`
+    - 纯规则（不依赖 WinUI 的判断逻辑）一律放 `ui/Spark.UI/Services/MarketRules.cs`
+      或 `PluginErrorCodes.cs` 并配测试：这两个文件被 `ui/Spark.UI.Tests` 以
+      `<Compile Include>` 直接链接编译，**必须保持零 WinUI 依赖**（引入 WinUI 类型
+      会让测试工程编译不过——这是刻意设计的护栏）。
 
 ---
 

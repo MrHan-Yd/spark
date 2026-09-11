@@ -65,6 +65,14 @@ pub struct Candidate {
     pub source: Source,
     pub actions: Vec<Action>,
     pub plugin_id: Option<String>,
+    /// 插件候选的触发上下文（仅 `source=plugin` 时由 host 填写，匹配即权威）：
+    /// keyword 命中 = `(关键字, 去前缀剩余)`；regex/root 命中 = `(空, 完整查询)`。
+    /// UI 开窗直接取用，不再自行拆分输入——两侧对同一次触发算出一致的
+    /// `spark.input.*`（regex/root 候选没有关键字前缀，UI 首词拆分会拆错）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_input: Option<String>,
 }
 
 impl Candidate {
@@ -80,6 +88,8 @@ impl Candidate {
             source: Source::App,
             actions: vec![Action::open_default(), Action::reveal()],
             plugin_id: None,
+            plugin_command: None,
+            plugin_input: None,
         }
     }
 }

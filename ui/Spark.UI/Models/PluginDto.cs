@@ -70,6 +70,11 @@ public sealed class PluginInfoDto
     /// </summary>
     [JsonPropertyName("sign_state")]
     public string SignState { get; set; } = "unsigned";
+
+    /// <summary>高危权限 fs.read/fs.write 的授权目录范围（权限 → 目录列表；
+    /// host grant 时 canonicalize 过的绝对路径）。老 host 未返回时为 null。</summary>
+    [JsonPropertyName("fs_scopes")]
+    public Dictionary<string, List<string>>? FsScopes { get; set; }
 }
 
 /// <summary>
@@ -187,4 +192,10 @@ public sealed class PluginWindowDto
 
     [JsonPropertyName("frame")]
     public bool Frame { get; set; } = true;
+
+    /// <summary>是否允许多开（清单 window.multi_instance，默认 false = 再次触发聚焦已有窗口）。
+    /// true 时每次触发都新开一个窗口；native 纯应用插件的 exe 随之改为"最后一个窗口
+    /// 关闭才关停"（见 <see cref="Services.PluginWindowHost"/> 的窗口记账）。</summary>
+    [JsonPropertyName("multi_instance")]
+    public bool MultiInstance { get; set; }
 }

@@ -1,6 +1,6 @@
 # WebView 插件开发
 
-> 状态：**一期已实现**（2026-08-20）
+> 状态：**已实现**（一期 2026-08-20；二期触发 regex/root、fs/shell/readImage、.spark-plugin 安装 2026-09-10）
 > 适用版本：清单 `api_version: 2`
 > 面向：前端开发者（HTML/CSS/JS），无需 Rust/C#
 > 完整契约见 [插件开发规范.md](./插件开发规范.md)
@@ -112,21 +112,25 @@ UTF-8 无 BOM 的 JSON。WebView 插件相关字段：
 
 ### 4.2 `window`
 
+> 字段名一律 **snake_case**（与清单其余字段一致）。
+
 | 子字段 | 类型 | 默认 | 说明 |
 |--------|------|------|------|
 | `width` / `height` | number | 480 / 360 | 初始尺寸（逻辑像素） |
-| `minWidth` / `minHeight` | number | 240 / 180 | 最小尺寸 |
+| `min_width` / `min_height` | number | 240 / 180 | 最小尺寸 |
 | `resizable` | bool | true | 可否调整大小 |
-| `alwaysOnTop` | bool | false | 默认置顶 |
+| `always_on_top` | bool | false | 默认置顶 |
 | `frame` | bool | true | 显示系统标题栏；`false` 由插件自绘 |
+| `multi_instance` | bool | false | 是否允许多开；`false` = 再次触发聚焦已有窗口（§6） |
 
 ---
 
 ## 5. 触发方式 `features`
 
-`features` 数组定义用户如何进入插件。一期只支持 `type: keyword` + `mode: page`。
+`features` 数组定义用户如何进入插件。每个 feature 描述一个触发入口；
+`keyword`（一期）与 `regex`/`root`（二期，已实现）均支持。
 
-### 5.1 `type: keyword`（关键字触发，一期主推）
+### 5.1 `type: keyword`（关键字触发，主推）
 
 用户在主输入框输 `<keyword> <参数>`，主列表出现一条插件命令项，回车开窗。
 
@@ -151,12 +155,24 @@ UTF-8 无 BOM 的 JSON。WebView 插件相关字段：
 
 进入插件后 `spark.input.text` = 去掉 `tr ` 前缀后的内容。
 
-### 5.2 二期触发方式（未实现）
+### 5.2 二期触发方式（已实现）
 
-- `type: regex`：主输入框匹配正则时追加入口（如输入 IP 自动出现查询插件）。
-- `type: root`：挂在根输入框，每次输入都参与匹配（配合 `spark.onInput` 实时响应）。
+- **`type: regex`（正则匹配）**：主输入框内容（截断 256 字符）匹配 `pattern` 时，主列表
+  **追加**该插件入口（不抢占应用/关键字结果）。适合"输入 IP 自动出现 IP 查询插件"。
+  `pattern` 在插件加载期编译校验（非法正则拒绝加载，上限 512 字节）。
 
-一期不要使用，不会被识别。
+  ```json
+  { "type": "regex", "pattern": "^\\d{1,3}(\\.\\d{1,3}){3}$",
+    "title": "IP 查询", "subtitle": "查询 IP 归属地", "mode": "page" }
+  ```
+
+  进入插件后 `spark.input.text` = **完整查询文本**（无关键字前缀可去），
+  `spark.input.command` 为空串。
+
+- **`type: root`（无前缀挂载）**：插件挂在根输入框上，任意非空查询都会在主列表
+  **尾部**出现该插件入口（"每次输入都参与匹配"，常配合 `spark.onInput` 实时响应）。
+  **谨慎使用**：它让插件候选出现在所有搜索里，影响主列表观感与搜索性能；
+  输入上下文同 regex（完整文本、空 command）。
 
 ---
 
@@ -164,7 +180,7 @@ UTF-8 无 BOM 的 JSON。WebView 插件相关字段：
 
 页面加载时 Spark 注入 `window.spark`（只读、不可重写）。所有返回 Promise 的方法均异步。**未授权能力在页面侧即拒绝，host 侧二次鉴权。**
 
-> 下方标注 ✅ = 一期已实现，🚧 = 规范已定但未实现。
+> 下方标注 ✅ = 已实现。
 
 ### 6.1 输入上下文 `spark.input` ✅
 
@@ -239,17 +255,18 @@ const result = await spark.rpc('get_config', { key: 'value' })   // args 任意 
 spark.dev.openDevTools()
 ```
 
-### 6.9 待实现 🚧
-
-以下在规范中已定义，一期未实现，调用会抛 `UNAVAILABLE`：
+### 6.9 网络 / Shell / 文件 ✅
 
 | API | 权限 | 说明 |
 |-----|------|------|
-| `spark.net.fetch(url, init)` | `net` | 网络请求，走 host 代理 |
-| `spark.shell.openExternal(path)` | `shell.open` | 系统默认程序打开 |
-| `spark.fs.read(path)` / `spark.fs.write(path, text)` | `fs.read` / `fs.write` | 高危，授权定范围 |
+| `spark.net.fetch(url, init)` | `net` | 网络请求，走 host 代理（WinHTTP 直连）；回 `{status, headers, text(), json()}`；请求体 ≤1MB、响应体 ≤10MB、总预算 25s；响应体为 UTF-8 文本；重定向禁 https→http 降级跳转 |
+| `spark.shell.openExternal(target)` | `shell.open` | 用系统默认程序打开 URL/文件 |
+| `spark.fs.read(path)` / `spark.fs.write(path, text)` | `fs.read` / `fs.write` | 高危：只能读写**授权目录范围内**的文件（设置-插件中配置目录范围），范围外抛 `PERMISSION_SCOPE`；单文件/单次 ≤10MB 文本 |
 
-### 6.9 自定义预加载 `preload.js` ✅
+`net.fetch` 细节见 [插件开发规范.md](./插件开发规范.md) §8.3 net 语义 v1；
+fs 范围语义见 §7 权限表。
+
+### 6.10 自定义预加载 `preload.js` ✅
 
 清单声明 `preload` 字段时，Spark 在 `spark` 注入后、页面代码前额外执行该脚本。用于注入自定义全局工具或封装 `spark.*`。
 
@@ -267,15 +284,15 @@ window.myStore = {
 
 清单声明所需能力，**首次启用/打开时用户授权**。未声明的调用抛 `PERMISSION_DENIED`。
 
-| 权限 | 解锁 API | 风险 | 一期 |
+| 权限 | 解锁 API | 风险 | 状态 |
 |------|----------|------|------|
-| `clipboard` | `spark.clipboard.*` | 中 | ✅ |
+| `clipboard` | `spark.clipboard.*`（含 `readImage` → base64 PNG 或 null） | 中 | ✅ |
 | `notify` | `spark.notify.*` | 低 | ✅ |
 | `window.alwaysOnTop` | `spark.window.setAlwaysOnTop` | 低 | ✅ |
 | `db` | `spark.db.*` | 无 | ✅ 默认开放，无需声明 |
-| `net` | `spark.net.*` | 中 | 🚧 |
-| `shell.open` | `spark.shell.openExternal` | 中 | 🚧 |
-| `fs.read` / `fs.write` | `spark.fs.*` | 高 | 🚧 |
+| `net` | `spark.net.*` | 中 | ✅ |
+| `shell.open` | `spark.shell.openExternal` | 中 | ✅ |
+| `fs.read` / `fs.write` | `spark.fs.*` | 高 | ✅ 授权时配置目录范围，范围外 `PERMISSION_SCOPE` |
 
 错误码：`PERMISSION_DENIED` / `PERMISSION_SCOPE` / `NETWORK_FAILED` / `INVALID_ARGS` / `UNAVAILABLE`。
 
@@ -324,7 +341,7 @@ translate.spark-plugin  (zip)
 
 - **一期**：手动分发 `.spark-plugin`，用户在设置 → 插件 → 从本地安装。
 - **二期**：插件市场（官方/自定义仓库 + registry.json 索引 + 一键安装/更新）。仓库搭建与发布流程见 [插件市场与仓库.md](./插件市场与仓库.md)。
-- **签名**：官方插件随仓库 CI 自动签名（Ed25519，详见 [插件签名规范.md](./插件签名规范.md)）；三方签名待后续子阶段。未签名插件仍可安装，UI 不显"官方"角标。
+- **签名**：官方插件随仓库 CI 自动签名（Ed25519，详见 [插件签名规范.md](./插件签名规范.md)）；三方开发者可自助签名，用户导入其公钥（设置-插件-受信任开发者）后显示"已签名"角标（已实现）。未签名插件仍可安装，UI 不显"官方"角标。
 
 #### 通过插件市场发布
 
@@ -381,8 +398,8 @@ spark-host.exe --no-ui --plugins-dir D:/demo/test01/spark/plugins
 ## 11. 安全约束
 
 1. `spark.*` 是受信任通道，不要在插件页内 `eval` 不可信内容。
-2. `net`（待实现）走 host 代理，host 可记录/限流，不得绕过。
-3. `fs`（待实现）高危权限授权时限定目录，不得越界。
+2. `net` 走 host 代理（WinHTTP 直连、禁 https→http 降级重定向），host 可记录/限流，不得绕过。
+3. `fs` 高危权限：调用路径必须在用户授权的目录范围内（设置-插件中配置），范围外一律 `PERMISSION_SCOPE`，不得越界。
 4. 不得收集用户隐私上传未声明用途的服务器。
 5. 市场上架（二期）将强制代码签名；本地开发免签名。
 

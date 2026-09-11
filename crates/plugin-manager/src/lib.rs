@@ -26,6 +26,7 @@ pub use signing::{
 pub use state::PluginState;
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -72,6 +73,10 @@ pub struct PluginInfo {
     pub has_page: bool,
     /// 签名状态：`official` / `third_party` / `unsigned` / `invalid`（snake_case 序列化）。
     pub sign_state: SignState,
+    /// 高危权限 `fs.read`/`fs.write` 的用户授权目录范围（规范 §7，授权时定范围）。
+    /// 序列化形状：`{"fs.read": ["D:\\dir"], "fs.write": []}`。
+    #[serde(default)]
+    pub fs_scopes: BTreeMap<String, Vec<String>>,
 }
 
 /// `install_from_dir` 的执行结果：告知 UI 是新装、覆盖更新还是需要确认降级。
@@ -118,6 +123,27 @@ pub struct PluginOpenInfo {
     pub icon_abs: Option<String>,
 }
 
+/// `open_prepare` 的锁内预检产物：`info` 随时可回给 UI；Standard 插件另带一个
+/// 需在 host 锁外执行的现场重验任务与本次验签要用的可信密钥表快照。
+#[derive(Debug, Clone)]
+pub struct OpenPrepared {
+    pub info: PluginOpenInfo,
+    /// `Some` = 带 signature.json 的 Standard 插件，需放锁后重验（见 [`ReverifyJob`]）。
+    pub reverify: Option<ReverifyJob>,
+    /// 可信密钥表快照（锁外重验用；表只有几条，克隆成本可忽略）。
+    pub keys: Vec<TrustedKey>,
+}
+
+/// 现场重验任务：对插件目录全量重算哈希并验签。目录大小无上界（大插件/网络盘
+/// 可达秒级），因此必须在 host 锁外执行——这是锁序纪律针对的"无界磁盘 IO"，
+/// 不能与热路径共享锁。
+#[derive(Debug, Clone)]
+pub struct ReverifyJob {
+    pub root: std::path::PathBuf,
+    pub id: String,
+    pub version: String,
+}
+
 /// 关键字路由匹配结果。
 #[derive(Debug, Clone)]
 pub struct KeywordMatch {
@@ -156,6 +182,11 @@ pub struct PluginManager {
     /// 验签一律走此合并表：官方判定只看内置 `KeyKind::Official` 条目，
     /// 用户表恒为 `KeyKind::ThirdParty`（"已签名"角标），无法伪冒官方。
     trusted_keys: Vec<TrustedKey>,
+    /// 搜索热路径的 regex 编译缓存（pattern 字符串 → 编译结果）。
+    /// 清单加载期已校验可编译，miss 极少见（老版本扫描残留/清单热改）；
+    /// 编译失败的 pattern 缓存 None，不再每次查询重复尝试。Arc 免去热路径
+    /// 上的 Regex 深克隆（插件卸载/重装/换目录时整体清空，无悬挂引用）。
+    regex_cache: HashMap<String, Option<std::sync::Arc<regex_lite::Regex>>>,
 }
 
 impl PluginManager {
@@ -173,6 +204,7 @@ impl PluginManager {
             state,
             native: NativeRuntimeHandle::default(),
             trusted_keys: crate::signing::TRUSTED_KEYS.to_vec(),
+            regex_cache: HashMap::new(),
         }
     }
 
@@ -297,6 +329,7 @@ impl PluginManager {
             sign_state: SignState::Unsigned,
         });
         info!(id = %id, dev_dir = %dir.display(), "loaded dev plugin");
+        self.regex_cache.clear(); // 清单可能热改，pattern 缓存整体失效（键控缓存防悬挂）
         self.warn_keyword_conflicts();
         Ok(id)
     }
@@ -511,6 +544,7 @@ impl PluginManager {
             sign_state,
         });
         info!(id = %id, new = %new_version, old = %old_version, "updated plugin");
+        self.regex_cache.clear(); // 清单可能换 pattern，缓存整体失效
         self.warn_keyword_conflicts();
         Ok(PluginInstallOutcome {
             id,
@@ -542,6 +576,8 @@ impl PluginManager {
         self.plugins.remove(pos);
         self.state.enabled.remove(id);
         self.state.granted.remove(id);
+        self.state.fs_scopes.remove(id);
+        self.regex_cache.clear(); // 卸载的插件 pattern 不再参与匹配，缓存整体失效
         self.state.save_to(&self.state_path())?;
         info!(id, "uninstalled plugin");
         Ok(())
@@ -559,7 +595,77 @@ impl PluginManager {
         Ok(())
     }
 
-    pub fn grant(&mut self, id: &str, perms: Vec<String>) -> Result<(), PluginError> {
+    /// 授权权限（全量覆盖）+ 可选更新 fs 授权目录范围。
+    ///
+    /// `fs_scopes` 语义与 permissions 全量覆盖一致：`None` = 不修改；
+    /// `Some(map)` = 整表替换该插件的 `fs.read`/`fs.write` 授权目录。目录在
+    /// 写入前 `canonicalize`（解析符号链接/相对段，后续 fs 调用按真实路径
+    /// 做前缀包含校验）。错误路径保持原子：任一 scope key 不是 `fs.read`/`fs.write`
+    /// 即整体拒绝（Err）——该校验发生在**任何内存/落盘变更之前**，`granted` 与
+    /// 既有 fs 范围原样保留；目录不可访问的条目跳过（收窄方向，安全，非整体拒绝）。
+    pub fn grant(
+        &mut self,
+        id: &str,
+        perms: Vec<String>,
+        fs_scopes: Option<BTreeMap<String, Vec<String>>>,
+    ) -> Result<(), PluginError> {
+        // 先整表校验再变更：scope key 合法性是零 IO 的纯检查，必须抢在
+        // `granted` 写入之前完成，否则 Err 路径会出现"内存已生效、磁盘未落盘"
+        // 的半套状态，等下一次无关操作的 save_to 把它顺手持久化。
+        if let Some(map) = &fs_scopes {
+            for perm in map.keys() {
+                if perm != "fs.read" && perm != "fs.write" {
+                    return Err(PluginError::Manifest(format!(
+                        "fs_scopes 只支持 fs.read/fs.write，收到 '{perm}'"
+                    )));
+                }
+            }
+        }
+        let mut canon: Option<BTreeMap<String, Vec<String>>> = None;
+        if let Some(map) = fs_scopes {
+            let mut canon_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (perm, dirs) in map {
+                let mut out = Vec::new();
+                for dir in dirs {
+                    if dir.trim().is_empty() {
+                        continue;
+                    }
+                    // 失效条目跳过（收窄方向，安全）而非整体拒绝：grant 是全量
+                    // 覆盖语义，UI 每次授权都回发整表——某条目录后来被删/掉线
+                    // 时整单拒绝会连带挡住该插件无关权限的修改。跳过并记日志，
+                    // 全失效时 fs 调用按"未配置范围"拒绝（fail-closed）。
+                    let c = match fs::canonicalize(&dir) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(dir = %dir, err = %e, "fs 范围目录不可访问，已跳过（范围收窄）");
+                            continue;
+                        }
+                    };
+                    if !c.is_dir() {
+                        warn!(dir = %dir, "fs 范围不是目录，已跳过（范围收窄）");
+                        continue;
+                    }
+                    // 剥掉 canonicalize 的 \\?\ verbatim 前缀（UNC 还原 \\），
+                    // 落盘人可读的规范绝对路径。canonicalize 为本地元数据 IO
+                    // （毫秒级），授权是用户设置动作、非热路径，可接受锁内执行。
+                    let s = c.to_string_lossy();
+                    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                        format!(r"\\{rest}")
+                    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                        rest.to_string()
+                    } else {
+                        s.into_owned()
+                    };
+                    out.push(stripped);
+                }
+                canon_map.insert(perm, out);
+            }
+            canon = Some(canon_map);
+        }
+        // 校验与规范化全部通过后才动状态，从这里起不再有可失败的**状态变更**
+        // （紧随的 find 若失败此时零变更，无害）。save_to 的磁盘 IO 失败时
+        // 内存已变更——与 set_enabled 等既有写路径的取舍一致：错误上报给调用方，
+        // 重试即重落盘。
         let p = self
             .plugins
             .iter_mut()
@@ -567,8 +673,16 @@ impl PluginManager {
             .ok_or_else(|| PluginError::Manifest(format!("plugin not found: {id}")))?;
         p.granted = perms.clone();
         self.state.granted.insert(id.to_string(), perms);
+        if let Some(canon) = canon {
+            self.state.fs_scopes.insert(id.to_string(), canon);
+        }
         self.state.save_to(&self.state_path())?;
         Ok(())
+    }
+
+    /// 插件的 fs 授权目录范围（`fs.read`/`fs.write` → 目录列表）。
+    pub fn fs_scopes_of(&self, id: &str) -> BTreeMap<String, Vec<String>> {
+        self.state.fs_scopes_of(id)
     }
 
     pub fn list(&self) -> Vec<PluginInfo> {
@@ -594,6 +708,7 @@ impl PluginManager {
                 features: p.manifest.features.clone(),
                 has_page: Self::has_page(p),
                 sign_state: p.sign_state,
+                fs_scopes: self.state.fs_scopes_of(&p.manifest.id),
             })
             .collect()
     }
@@ -606,7 +721,15 @@ impl PluginManager {
         }
     }
 
-    pub fn open(&self, id: &str) -> Result<PluginOpenInfo, PluginError> {
+    /// 入口页打开的两段式预检（锁内）：只做插件查找、入口路径解析与单文件 stat，
+    /// 零目录遍历。整改清单 V1 整改 2 的"入口页每次加载前重验"对 Standard 插件
+    /// 产出 [`ReverifyJob`]，由调用方（ipc_server）**放锁后**执行全目录 SHA-256
+    /// 重算——哈希耗时无上界（大插件/网络盘可达秒级），留在锁内会冻结全部 IPC
+    /// （含主窗口搜索热路径）；重验判 Invalid 后调
+    /// [`PluginManager::open_fail_invalid`] 摘标并拒开。无 signature.json 直接
+    /// 放行（存量未签名插件"不拦截"的既定兼容决策，亦即缓存验签结果永不作为
+    /// 依据——官方与否每次从磁盘 + 内置公钥现场判定）。
+    pub fn open_prepare(&self, id: &str) -> Result<OpenPrepared, PluginError> {
         let p = self
             .plugins
             .iter()
@@ -640,7 +763,7 @@ impl PluginManager {
             .map(|pr| p.root.join(pr))
             .filter(|p| p.is_file())
             .map(|p| p.to_string_lossy().into_owned());
-        Ok(PluginOpenInfo {
+        let info = PluginOpenInfo {
             id: id.to_string(),
             name: p.manifest.name.clone(),
             main_abs: main_abs.to_string_lossy().into_owned(),
@@ -650,7 +773,44 @@ impl PluginManager {
             preload_abs,
             root: p.root.to_string_lossy().into_owned(),
             icon_abs: Self::icon_abs_of(p),
+        };
+        Ok(OpenPrepared {
+            info,
+            reverify: (p.source == PluginSource::Standard).then(|| ReverifyJob {
+                root: p.root.clone(),
+                id: p.manifest.id.clone(),
+                version: p.manifest.version.clone(),
+            }),
+            keys: self.trusted_keys.clone(),
         })
+    }
+
+    /// 现场重验判定 Invalid 后的收尾：**摘标**（内存 `sign_state` 置 Invalid，
+    /// 设置页/list() 立即反映真实状态，不必等下次重启扫描）并返回拒开错误。
+    /// 恒返回 `PluginError`——调用方直接把它转成对 UI 的错误回复。
+    ///
+    /// `version`/`root` 必须传 prepare 快照值做一致性比对（TOCTOU 守卫）：锁外
+    /// 重验期间同 id 插件可能已被覆盖更新（新版本换入新目录）或 `set_dir` 迁移
+    /// ——当前条目与重验对象不一致时**不摘标**（新条目并未被本次重验覆盖，摘了
+    /// 就是给未篡改插件误标），如实返回"刚被更新请重试"。找不到（已被卸载，
+    /// 目录已删 → 验签 IO Err → fail-closed Invalid）时报 not found。
+    pub fn open_fail_invalid(&mut self, id: &str, version: &str, root: &Path) -> PluginError {
+        match self.plugins.iter_mut().find(|p| p.manifest.id == id) {
+            Some(p) => {
+                if p.manifest.version == version && p.root == root {
+                    p.sign_state = SignState::Invalid;
+                    PluginError::Manifest(format!(
+                        "插件 {id} 文件校验失败（可能被篡改），已拒绝打开；建议停用或卸载"
+                    ))
+                } else {
+                    PluginError::Manifest(format!(
+                        "插件 {id} 已在打开过程中被更新（当前 v{}），校验结果已过期，请重试",
+                        p.manifest.version
+                    ))
+                }
+            }
+            None => PluginError::Manifest(format!("plugin not found: {id}")),
+        }
     }
 
     /// 更换插件目录；`migrate=true` 时把现有标准插件子目录迁到新目录。
@@ -694,6 +854,7 @@ impl PluginManager {
         // 重新扫描新目录（dev 插件保留）。
         self.plugins.retain(|p| p.source == PluginSource::Dev);
         self.scan_dir_with_source(&self.plugins_dir.clone(), PluginSource::Standard)?;
+        self.regex_cache.clear(); // 插件集合变化，pattern 缓存整体失效
         info!(dir = %self.plugins_dir.display(), "plugins dir changed");
         Ok(())
     }
@@ -842,6 +1003,85 @@ impl PluginManager {
                 "关键字冲突：多个已启用插件占用同一关键字，仅加载顺序首个生效"
             );
         }
+    }
+
+    /// 二期触发方式（《插件开发规范》§5.2/§5.3）：`type: regex` 与 `type: root`
+    /// 的 page 模式匹配。与 keyword 路由解耦：keyword 精确/前缀命中由
+    /// `find_keyword_match`/`find_keyword_prefix_matches` 以高优先级插入；
+    /// 本函数命中的候选由调用方**追加在主列表尾部**（不抢占应用/关键字结果）。
+    ///
+    /// - regex：查询文本（截断 256 字符防回溯型 pattern 放大开销）`is_match` 即命中；
+    ///   pattern 在清单加载期已编译校验，热路径只查缓存 + 匹配。
+    /// - root：任意非空查询恒命中（"每次输入都参与匹配"；开发者在规范中被
+    ///   提示谨慎使用——它让插件候选出现在所有搜索里）。
+    ///
+    /// 返回的 `KeywordMatch` 与 keyword 命中同构：`input` = 完整查询文本
+    /// （regex/root 无关键字前缀可去）；`keyword` = pattern/root 标记，仅用于
+    /// 候选 id 唯一化，UI 不展示。
+    pub fn find_trigger_matches(&mut self, text: &str) -> Vec<KeywordMatch> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let match_text: String = trimmed.chars().take(256).collect();
+        // 两段式：先收集 (plugin_id, feature_index, pattern)（借用随块结束），
+        // 再编译（可变借用）——避免同时持插件列表的不可变借用与缓存的可变借用。
+        let mut pats: Vec<(String, usize, String)> = Vec::new();
+        for p in &self.plugins {
+            if !p.enabled {
+                continue;
+            }
+            for (fi, f) in p.manifest.features.iter().enumerate() {
+                if f.mode != "page" || f.kind != FeatureType::Regex {
+                    continue;
+                }
+                if let Some(pat) = f.pattern() {
+                    pats.push((p.manifest.id.clone(), fi, pat.to_string()));
+                }
+            }
+        }
+        let ready: Vec<(String, usize, std::sync::Arc<regex_lite::Regex>)> = pats
+            .into_iter()
+            .filter_map(|(id, fi, pat)| self.compiled_regex(&pat).map(|re| (id, fi, re)))
+            .collect();
+        let mut out: Vec<KeywordMatch> = ready
+            .iter()
+            .filter(|(_, _, re)| re.is_match(&match_text))
+            .map(|(id, fi, re)| KeywordMatch {
+                plugin_id: id.clone(),
+                feature_index: *fi,
+                input: trimmed.to_string(),
+                keyword: re.as_str().to_string(),
+            })
+            .collect();
+        for p in &self.plugins {
+            if !p.enabled {
+                continue;
+            }
+            for (fi, f) in p.manifest.features.iter().enumerate() {
+                if f.mode != "page" || f.kind != FeatureType::Root {
+                    continue;
+                }
+                out.push(KeywordMatch {
+                    plugin_id: p.manifest.id.clone(),
+                    feature_index: fi,
+                    input: trimmed.to_string(),
+                    keyword: "root".to_string(),
+                });
+            }
+        }
+        out
+    }
+
+    /// 查缓存或现场编译一个 pattern（清单加载期已校验可编译，此处失败按不匹配
+    /// 处理并缓存，不再重复尝试）。Arc 免热路径深克隆。
+    fn compiled_regex(&mut self, pat: &str) -> Option<std::sync::Arc<regex_lite::Regex>> {
+        if let Some(cached) = self.regex_cache.get(pat) {
+            return cached.clone();
+        }
+        let compiled = regex_lite::Regex::new(pat).ok().map(std::sync::Arc::new);
+        self.regex_cache.insert(pat.to_string(), compiled.clone());
+        compiled
     }
 
     pub fn granted(&self, id: &str) -> Vec<String> {
@@ -1096,6 +1336,161 @@ mod tests {
         assert!(pm.find_keyword_match("翻 译").is_none());
     }
 
+    /// 测试辅助：自定义 features JSON 的 webview 插件。
+    fn make_webview_plugin_features(dir: &Path, id: &str, features_json: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let json = format!(
+            r#"{{ "id": "{id}", "name": "T", "version": "0.1.0", "api_version": 2,
+                 "runtime": "webview", "main": "index.html", "features": {features_json} }}"#
+        );
+        fs::write(dir.join("plugin.json"), json).unwrap();
+        fs::write(dir.join("index.html"), "<html></html>").unwrap();
+    }
+
+    #[test]
+    fn trigger_regex_matches_full_query() {
+        // regex feature（《规范》§5.2）：查询文本命中产出候选（input=完整查询），
+        // 不命中/空查询/禁用插件不产出；keyword feature 不进 trigger 匹配。
+        let tmp = std::env::temp_dir().join("spark_pm_trig_regex");
+        let _ = fs::remove_dir_all(&tmp);
+        make_webview_plugin_features(
+            &tmp.join("com.spark.ip"),
+            "com.spark.ip",
+            r#"[{ "type": "regex", "pattern": "^\\d{1,3}(\\.\\d{1,3}){3}$", "title": "IP", "mode": "page" },
+               { "type": "keyword", "keyword": "ip", "title": "IPKw", "mode": "page" }]"#,
+        );
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.load_dev_dir(&tmp.join("com.spark.ip")).unwrap();
+
+        let hits = pm.find_trigger_matches("1.2.3.4");
+        assert_eq!(hits.len(), 1, "{:?}", pm.find_trigger_matches("1.2.3.4"));
+        assert_eq!(hits[0].plugin_id, "com.spark.ip");
+        assert_eq!(hits[0].input, "1.2.3.4");
+        // pattern 承载在 keyword 字段（仅用于候选 id 唯一化）。
+        assert!(hits[0].keyword.contains("\\d"));
+
+        // 不命中：非 IP 文本。
+        assert!(pm.find_trigger_matches("hello world").is_empty());
+        // 空查询不产出（trim 后为空）。
+        assert!(pm.find_trigger_matches("   ").is_empty());
+        // keyword feature 不走 trigger 匹配（由 find_keyword_match 负责）。
+        assert!(pm.find_trigger_matches("ip").is_empty());
+
+        // 禁用插件不产出。
+        pm.set_enabled("com.spark.ip", false).unwrap();
+        assert!(pm.find_trigger_matches("1.2.3.4").is_empty());
+    }
+
+    #[test]
+    fn trigger_root_matches_any_non_empty_query() {
+        // root feature（《规范》§5.3）：任意非空查询恒命中（追加候选）。
+        let tmp = std::env::temp_dir().join("spark_pm_trig_root");
+        let _ = fs::remove_dir_all(&tmp);
+        make_webview_plugin_features(
+            &tmp.join("com.spark.root"),
+            "com.spark.root",
+            r#"[{ "type": "root", "title": "Root", "mode": "page" }]"#,
+        );
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.load_dev_dir(&tmp.join("com.spark.root")).unwrap();
+
+        for q in ["x", "随便什么", "1.2.3.4", "a b c"] {
+            let hits = pm.find_trigger_matches(q);
+            assert_eq!(hits.len(), 1, "query {q}");
+            assert_eq!(hits[0].plugin_id, "com.spark.root");
+            assert_eq!(hits[0].input, q);
+            assert_eq!(hits[0].keyword, "root");
+        }
+        assert!(pm.find_trigger_matches("").is_empty());
+    }
+
+    #[test]
+    fn fs_scopes_grant_roundtrip_and_validation() {
+        // fs 授权目录范围：全量覆盖 + canonicalize 落盘 + 非法条目整体拒绝 + 持久化。
+        let tmp = std::env::temp_dir().join("spark_pm_fs_scopes");
+        let _ = fs::remove_dir_all(&tmp);
+        make_webview_plugin(&tmp.join("com.spark.f"), "com.spark.f", "f");
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.load_dev_dir(&tmp.join("com.spark.f")).unwrap();
+
+        let dir = tmp.join("scopedir");
+        fs::create_dir_all(&dir).unwrap();
+        let mut map = BTreeMap::new();
+        map.insert(
+            "fs.read".to_string(),
+            vec![dir.to_string_lossy().into_owned()],
+        );
+        map.insert("fs.write".to_string(), Vec::new());
+        pm.grant(
+            "com.spark.f",
+            vec!["fs.read".into(), "fs.write".into()],
+            Some(map),
+        )
+        .unwrap();
+
+        // 落盘的是剥掉 \\?\ 前缀的规范路径。
+        let scopes = pm.fs_scopes_of("com.spark.f");
+        let stored = scopes.get("fs.read").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].starts_with(r"\\?\"), "{}", stored[0]);
+        // 测试侧同样剥掉 canonicalize 的 verbatim 前缀再比较（语义一致）。
+        let canon = fs::canonicalize(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let canon_stripped = canon
+            .strip_prefix(r"\\?\")
+            .map(|r| r.to_string())
+            .unwrap_or(canon);
+        assert_eq!(
+            stored[0].to_ascii_lowercase(),
+            canon_stripped.to_ascii_lowercase()
+        );
+
+        // 非 fs.* 的 scope key 整体拒绝（不落半套状态）：Err 后 granted 与既有
+        // fs 范围都必须原样保留（校验抢在内存变更之前，错误路径原子）。
+        let mut bad = BTreeMap::new();
+        bad.insert("net".to_string(), vec!["x".to_string()]);
+        assert!(pm.grant("com.spark.f", vec![], Some(bad)).is_err());
+        assert!(pm.granted("com.spark.f").contains(&"fs.read".to_string()));
+        assert!(pm.fs_scopes_of("com.spark.f").contains_key("fs.read"));
+
+        // 失效目录跳过（收窄方向）：grant 不因单条失效整单拒绝；
+        // 有效条目仍在，失效条目被剔除，fs 调用按收窄后的范围校验。
+        let mut mixed = BTreeMap::new();
+        mixed.insert(
+            "fs.read".to_string(),
+            vec![
+                "Z:\\spark_no_such_dir_xyz".to_string(),
+                dir.to_string_lossy().into_owned(),
+            ],
+        );
+        pm.grant("com.spark.f", vec!["fs.read".to_string()], Some(mixed))
+            .unwrap();
+        assert_eq!(
+            pm.fs_scopes_of("com.spark.f").get("fs.read").unwrap().len(),
+            1
+        );
+
+        // 全部失效 → 空范围落盘（fs 调用按"未配置范围"fail-closed 拒绝）。
+        let mut all_bad = BTreeMap::new();
+        all_bad.insert(
+            "fs.read".to_string(),
+            vec!["Z:\\spark_no_such_dir_xyz".to_string()],
+        );
+        pm.grant("com.spark.f", vec!["fs.read".to_string()], Some(all_bad))
+            .unwrap();
+        assert!(pm
+            .fs_scopes_of("com.spark.f")
+            .get("fs.read")
+            .unwrap()
+            .is_empty());
+
+        // 持久化 roundtrip：重新从盘上读，范围仍在。
+        let state = PluginState::load_at(&tmp.join("data").join("plugins-state.json"));
+        assert!(state.fs_scopes_of("com.spark.f").contains_key("fs.read"));
+    }
+
     #[test]
     fn keyword_prefix_suggest() {
         // 前缀建议：真前缀产出候选（input 为空）；完整命中不重复建议；
@@ -1205,7 +1600,7 @@ mod tests {
         make_webview_plugin(&tmp.join("com.spark.o"), "com.spark.o", "o");
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
         pm.load_dev_dir(&tmp.join("com.spark.o")).unwrap();
-        let info = pm.open("com.spark.o").unwrap();
+        let info = pm.open_prepare("com.spark.o").unwrap().info;
         assert!(info.main_abs.ends_with("index.html"));
         assert_eq!(info.window.width, 480); // default
     }
@@ -1226,7 +1621,7 @@ mod tests {
         fs::write(dir.join("page.html"), "<html></html>").unwrap();
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
         pm.load_dev_dir(&dir).unwrap();
-        let info = pm.open("com.spark.np").unwrap();
+        let info = pm.open_prepare("com.spark.np").unwrap().info;
         assert!(info.main_abs.ends_with("page.html"));
         // list DTO 的 has_page 对 native 纯应用恒为 true（「打开」按钮依据）。
         assert!(pm
@@ -1238,10 +1633,10 @@ mod tests {
         fs::remove_file(dir.join("page.html")).unwrap();
         let mut pm2 = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
         pm2.load_dev_dir(&dir).unwrap();
-        assert!(pm2.open("com.spark.np").is_err());
+        assert!(pm2.open_prepare("com.spark.np").is_err());
         // 禁用 → 拒绝。
         pm2.set_enabled("com.spark.np", false).unwrap();
-        assert!(pm2.open("com.spark.np").is_err());
+        assert!(pm2.open_prepare("com.spark.np").is_err());
     }
 
     #[test]
@@ -1520,8 +1915,12 @@ mod tests {
         fs::write(dir1.join("index.html"), "<html></html>").unwrap();
         let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
         pm.install_from_dir(&dir1, false, false).unwrap();
-        pm.grant("com.spark.h", vec!["clipboard".into(), "notify".into()])
-            .unwrap();
+        pm.grant(
+            "com.spark.h",
+            vec!["clipboard".into(), "notify".into()],
+            None,
+        )
+        .unwrap();
         pm.set_enabled("com.spark.h", false).unwrap();
 
         // 升级到 0.2.0，但新版本只声明 clipboard（删了 notify）。
@@ -1791,6 +2190,90 @@ mod tests {
         let o = pm2.install_from_dir(&src, false, false).unwrap();
         assert_eq!(o.sign_state, SignState::ThirdParty);
         assert_eq!(pm2.list()[0].sign_state, SignState::ThirdParty);
+    }
+
+    #[test]
+    fn open_reverifies_signature_and_refuses_tampered() {
+        // 整改清单 V1 整改 2：入口页每次加载前重验——装后篡改（host 长运行窗口）
+        // 在 host.plugin.open 拒开；未篡改的已装插件照常打开；无 signature.json
+        // 的未签名插件不拦截（存量兼容决策）。重验本身在 host 锁外执行，这里
+        // 按 ipc_server 的两段式流程模拟：open_prepare（快照）→ verify_with_keys
+        // （锁外）→ open_fail_invalid（摘标 + 拒开）。
+        let tmp = std::env::temp_dir().join("spark_pm_open_reverify");
+        let _ = fs::remove_dir_all(&tmp);
+        let src = tmp.join("src").join("com.dev.tool");
+        make_webview_plugin(&src, "com.dev.tool", "t");
+        let sk = SigningKey::from_bytes(&[11; 32]);
+        sign_plugin_dir(&src, "com.dev.tool", "0.1.0", "dev-v1", &sk);
+
+        let mut pm = PluginManager::with_dirs(tmp.join("plugins"), tmp.join("data"));
+        pm.set_trusted_user_keys(vec![user_key_for("dev-v1", &sk)]);
+        pm.install_from_dir(&src, false, false).unwrap();
+
+        // 未篡改：锁外重验非 Invalid，照常打开。
+        let prepared = pm.open_prepare("com.dev.tool").unwrap();
+        let reverify = prepared
+            .reverify
+            .as_ref()
+            .expect("Standard 插件必须带重验任务");
+        let state = verify_with_keys(
+            &reverify.root,
+            &reverify.id,
+            &reverify.version,
+            &prepared.keys,
+            crate::signing::REVOKED,
+        )
+        .unwrap();
+        assert_ne!(state, SignState::Invalid);
+
+        // 篡改已装目录的一个文件 → 现场重验 Invalid → 摘标 + 拒开（可见报错）。
+        let installed = tmp.join("plugins").join("com.dev.tool");
+        fs::write(installed.join("index.html"), "<html>evil</html>").unwrap();
+        let prepared = pm.open_prepare("com.dev.tool").unwrap();
+        let reverify = prepared.reverify.as_ref().unwrap();
+        let state = verify_with_keys(
+            &reverify.root,
+            &reverify.id,
+            &reverify.version,
+            &prepared.keys,
+            crate::signing::REVOKED,
+        )
+        .unwrap_or(SignState::Invalid);
+        assert_eq!(state, SignState::Invalid);
+
+        // TOCTOU 守卫：版本与当前条目不一致（锁外重验期间被覆盖更新的典型形态）
+        // → 不摘标，报"刚被更新请重试"。
+        let wrong = pm.open_fail_invalid("com.dev.tool", "9.9.9", &installed);
+        assert!(wrong.to_string().contains("重试"), "{wrong}");
+        assert_ne!(
+            pm.list()
+                .iter()
+                .find(|p| p.id == "com.dev.tool")
+                .unwrap()
+                .sign_state,
+            SignState::Invalid,
+            "版本不一致时不得给未篡改的新条目误标"
+        );
+
+        // prepare 快照的版本/目录与当前条目一致 → 摘标 + 拒开（可见报错）。
+        let err = pm.open_fail_invalid("com.dev.tool", "0.1.0", &installed);
+        let msg = err.to_string();
+        assert!(msg.contains("篡改") || msg.contains("校验失败"), "{msg}");
+        // 摘标：open 失败后 list() 立即反映 Invalid，不等下次重启扫描。
+        assert_eq!(
+            pm.list()
+                .iter()
+                .find(|p| p.id == "com.dev.tool")
+                .unwrap()
+                .sign_state,
+            SignState::Invalid
+        );
+
+        // 无 signature.json 的未签名插件：open 不拦截（Unsigned 直接放行）。
+        let free_src = tmp.join("src2").join("com.dev.free");
+        make_webview_plugin(&free_src, "com.dev.free", "free");
+        pm.install_from_dir(&free_src, false, false).unwrap();
+        assert!(pm.open_prepare("com.dev.free").is_ok());
     }
 
     #[test]

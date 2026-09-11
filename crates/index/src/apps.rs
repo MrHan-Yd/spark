@@ -343,6 +343,8 @@ fn merge_apps(collected: Vec<Collected>, seen: &mut HashSet<String>) -> Vec<Cand
             source: Source::App,
             actions,
             plugin_id: None,
+            plugin_command: None,
+            plugin_input: None,
         });
     }
     items
@@ -366,6 +368,8 @@ fn push_raw_row(c: Collected, seen: &mut HashSet<String>, out: &mut Vec<Candidat
         source: Source::App,
         actions: vec![Action::open_default(), Action::reveal()],
         plugin_id: None,
+        plugin_command: None,
+        plugin_input: None,
     });
 }
 
@@ -447,6 +451,8 @@ fn push_system_builtins(seen: &mut HashSet<String>, out: &mut Vec<Candidate>) {
             source: Source::App,
             actions: vec![Action::open_default(), Action::reveal()],
             plugin_id: None,
+            plugin_command: None,
+            plugin_input: None,
         });
     }
 }

@@ -20,3 +20,7 @@ tracing = { workspace = true }
 ed25519-dalek = "2"
 sha2 = "0.10"
 base64 = "0.22"
+# 二期触发方式 `type: regex`（《插件开发规范》§5.2）：清单 pattern 的加载期编译
+# 校验 + 搜索热路径 is_match。regex-lite 与 regex 同语法子集、纯 Rust、无 unicode
+# 重表——workspace 离线缓存已有（Cargo.lock 可离线解析）。
+regex-lite = "0.1"

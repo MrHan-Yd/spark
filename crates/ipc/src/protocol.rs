@@ -278,6 +278,11 @@ pub struct PluginToggleParams {
 pub struct PluginGrantParams {
     pub id: String,
     pub permissions: Vec<String>,
+    /// 高危权限 fs.read/fs.write 的授权目录范围（规范 §7 授权时定范围）。
+    /// `None` = 不修改存量范围；`Some(map)` = 整表替换（与 permissions 全量覆盖
+    /// 语义一致）。host 逐条 canonicalize 后落盘，fs 调用按真实路径前缀校验。
+    #[serde(default)]
+    pub fs_scopes: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,7 +309,7 @@ pub struct PluginOpenParams {
 #[serde(deny_unknown_fields)]
 pub struct PluginApiParams {
     pub plugin_id: String,
-    /// clipboard | notify | db | rpc（rpc 仅 native 插件：转发 plugin.page）
+    /// clipboard | notify | db | rpc（rpc 仅 native 插件：转发 plugin.page）| net（spark.net.fetch，host 代理 HTTP）
     pub capability: String,
     /// read_text / write_text / show / set / get ...
     pub method: String,

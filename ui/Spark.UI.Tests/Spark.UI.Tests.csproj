@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <!--
+      不引用 Spark.UI 工程：那是 WinUI/WinExe，引用会拖起 XAML 运行时，而且 Brush/Visibility
+      之类类型在没有 UI 线程的测试进程里无法构造。改为直接 <Compile Include> 链接**纯规则源
+      文件**（ui/Spark.UI/Services/MarketRules.cs、PluginErrorCodes.cs）——这两个文件刻意保持
+      零 WinUI 依赖，属于被测试护栏锁住的约定；新增被测文件时在这里加一条 Include 即可。
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Spark.UI\Services\MarketRules.cs" Link="Linked\MarketRules.cs" />
+    <Compile Include="..\Spark.UI\Services\PluginErrorCodes.cs" Link="Linked\PluginErrorCodes.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 版本取自本机已可还原的组合（dotnet new xunit 探针验证过），避免随手升级造成
+         还原失败；升级时先在本机跑一次 dotnet test 再提交。 -->
+    <PackageReference Include="coverlet.collector" Version="6.0.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.5.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
+  </ItemGroup>
+
+</Project>

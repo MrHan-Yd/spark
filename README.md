@@ -21,7 +21,8 @@ spark/
 │   ├── index/            # 应用索引 + 历史
 │   ├── plugin-manager/   # 清单扫描
 │   └── sdk/              # 插件 Rust SDK
-├── plugins/echo/         # 示例插件
+├── plugins/echo/         # 示例插件（官方示例插件源，见 插件开发/插件开发规范.md）
+├── plugins/dist/         # 插件打包产物：<id>/<version>/ + packages/ + registry.json（构建生成，已 gitignore）
 ├── ui/Spark.UI/          # C# WinUI → Spark.exe
 ├── brand/                # Logo
 ├── docs/                 # 架构 / 设计 / 功能 / 技术栈
@@ -37,6 +38,7 @@ spark/
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构 |
 | [docs/DESIGN.md](docs/DESIGN.md) | 协议与详细设计 |
 | [docs/FEATURES.md](docs/FEATURES.md) | 功能 |
+| [插件开发/插件签名规范.md](插件开发/插件签名规范.md) | 插件签名 + §9.4 打包/发布流水线（`scripts/pack_plugins.ps1`） |
 | [RUN_UI.md](RUN_UI.md) | UI 单独启动 / 排错 |
 | [docs/UI_PROTOTYPE.md](docs/UI_PROTOTYPE.md) | 原型说明 |
 
@@ -47,6 +49,7 @@ spark/
 | Host | Rust stable（`rust-toolchain.toml`）+ MSVC 工具链 |
 | UI | **.NET 8 SDK** + VS2022「Windows 应用开发」/ Windows App SDK |
 | 检查 | `.\scripts\setup_check.ps1` |
+| 测试 | `.\scripts\test.ps1`（Rust 全量 + C# 市场规则/错误码层） |
 
 ---
 

@@ -482,9 +482,27 @@ public sealed class HostIpcClient : IAsyncDisposable
     public Task<bool> PluginToggleAsync(string id, bool enabled, CancellationToken ct = default) =>
         PluginOkCallAsync("host.plugin.toggle", new { id, enabled }, ct);
 
-    public Task<bool> PluginGrantAsync(string id, IEnumerable<string> permissions,
-        CancellationToken ct = default) =>
-        PluginOkCallAsync("host.plugin.grant", new { id, permissions = permissions.ToArray() }, ct);
+    /// <summary>授权权限（全量覆盖）。fsScopes 为 null 时不修改 host 存量的
+    /// fs 授权目录范围；传 Dictionary（可为空表）则整表替换 fs.read/fs.write
+    /// 的目录范围（与 permissions 全量覆盖语义一致，规范 §7 授权时定范围）。</summary>
+    public async Task<bool> PluginGrantAsync(string id, IEnumerable<string> permissions,
+        Dictionary<string, List<string>>? fsScopes = null, CancellationToken ct = default)
+    {
+        await EnsureConnectedAsync(ct);
+        if (!IsConnected) throw HostErrorText.HostUnavailable();
+        // 两种 payload 形状不同（fs_scopes 字段有无），if 分支赋 object——
+        // 三元表达式无法统一两个匿名类型的静态类型。
+        object payload;
+        if (fsScopes is null)
+        {
+            payload = new { id, permissions = permissions.ToArray() };
+        }
+        else
+        {
+            payload = new { id, permissions = permissions.ToArray(), fs_scopes = fsScopes };
+        }
+        return await PluginOkCallAsync("host.plugin.grant", payload, ct);
+    }
 
     public Task<bool> PluginSetDirAsync(string path, bool migrate, CancellationToken ct = default) =>
         PluginOkCallAsync("host.plugin.set_dir", new { path, migrate }, ct);
@@ -518,6 +536,9 @@ public sealed class HostIpcClient : IAsyncDisposable
     /// capability=rpc（native 插件页面转发）预算放宽到 20s：host 侧懒启动 + 握手 +
     /// plugin.page 的最坏等待 15s，超出全局 8s。rpc 走插件页窗口的独立连接，
     /// 排队再慢也不阻塞主窗口的搜索连接。
+    /// capability=net（spark.net.fetch 代理）预算 30s：慢网络下的远程请求；
+    /// host 侧总预算 25s（net_fetch.rs TOTAL_BUDGET），超时会先以 NETWORK_FAILED
+    /// 干净返回，这里的 30s 只是兜底。
     /// </summary>
     public async Task<JsonElement> PluginApiAsync(string pluginId, string capability, string method,
         JsonElement args, CancellationToken ct = default)
@@ -525,9 +546,14 @@ public sealed class HostIpcClient : IAsyncDisposable
         await EnsureConnectedAsync(ct);
         if (!IsConnected) throw HostErrorText.HostUnavailable();
 
+        var timeoutSeconds = capability switch
+        {
+            "rpc" => 20,
+            "net" => 30,
+            _ => 8,
+        };
         var el = await CallAsync("host.plugin.api",
-            new { plugin_id = pluginId, capability, method, args }, ct,
-            capability == "rpc" ? 20 : 8);
+            new { plugin_id = pluginId, capability, method, args }, ct, timeoutSeconds);
         if (el.ValueKind != JsonValueKind.Object)
             throw new InvalidOperationException("后台返回了无法识别的能力调用结果");
         return el.TryGetProperty("data", out var data) ? data.Clone() : default;

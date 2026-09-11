@@ -476,6 +476,8 @@ pub fn candidates(q: &str) -> Vec<Candidate> {
             source: Source::Builtin,
             actions: vec![Action::open_default()],
             plugin_id: None,
+            plugin_command: None,
+            plugin_input: None,
         };
         // 打分风格对齐 memory.rs：精确 > 前缀 > 包含 > 别名
         if title == q {

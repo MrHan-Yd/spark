@@ -2,7 +2,7 @@
 
 > 规范文档：[`插件开发/插件签名规范.md`](../插件开发/插件签名规范.md)
 > 创建时间：2026-08-25
-> 状态：Phase 0（文档）已完成，Phase 1-4 待实施
+> 状态：**Phase 0-5 全部实现完成 + 打包流水线落地**（2026-09-11 更新；余项仅剩运维依赖：正式密钥离线机 keygen — 打包已由 `scripts/pack_plugins.ps1` 自动化，本地服务器联调见 `scripts/e2e/market-local.ps1`）
 
 ---
 
@@ -10,7 +10,7 @@
 
 插件签名分 4 个 Phase，可跨多次会话完成。
 
-**阶段依赖**：Phase 0（文档）✅ → Phase 1（Rust 核心：canonicalization + 验签 + 内置公钥，纯逻辑可独立测）→ Phase 2（sign-tool CLI + 官方密钥 + CI 签名）→ Phase 3（install/scan 接入 + PluginInfo + 错误处理）→ Phase 4（UI 角标 + 安装提示 + 市场字段，依赖 Phase 3 的 `sign_state`）。
+**阶段依赖**：Phase 0（文档）✅ → Phase 1（Rust 核心）✅ → Phase 2（sign-tool CLI + 官方密钥 + CI 签名）✅（正式密钥生成待离线机）→ Phase 3（install/scan 接入 + PluginInfo + 错误处理）✅ → Phase 4（UI 角标 + 安装提示 + 市场字段）✅（另有 Phase 5 3.1+ 增强 ✅）。
 
 **架构要点**：验签在 host（`plugin-manager`）完成；canonicalization 函数被 `plugin-manager` 与 `sign-tool` 共用；不新增 IPC 方法（签名是 `host.plugin.install`/`scan_standard` 内部步骤）；`PluginInfo.sign_state` 随 `host.plugin.list` 自然返回。**唯一新增 Rust 依赖**：`ed25519-dalek`、`sha2`、`base64`（+ `rand`/`rand_core` 仅 sign-tool）。详见规范 §13。
 
@@ -94,8 +94,11 @@ crates/plugin-manager/src/signing/verify.rs   (新)
 
 ### 2.4 官方插件 CI 签名
 - [x] Release workflow 加签名步骤：构建 spark-sign + 条件签名 `plugins/dist/*/`（缺 secret 或无打包目录即 no-op，不阻塞 release）
-- [ ] 插件打包流水线（native 插件 build exe → 装配 dist 目录）就绪后该步骤自动生效（属市场二期打包范畴）
-- [ ] 签名日志落 CI 产物（不入仓库）— 待打包流程落地后补
+- [x] 插件打包流水线（native 插件 build exe → 装配版本目录 → 签名 → 打 zip → 生成 registry.json）——
+      2026-09-11 落地为 `scripts/pack_plugins.ps1`，并已接入 `release.yml`（`Pack and sign official plugins` 步骤，替代原先因无产物而空转的签名步骤）。实测：`-Sign` 路径产出含 `signature.json` 的版本目录与
+      `packages/*.spark-plugin`，索引写入 `versions[].signature` 摘要，`spark-sign check-registry` 准入校验 0 错误。
+      注意：CI 签名步骤的目录契约随之从 `<OutDir>/<id>/` 改为 `<OutDir>/<id>/<version>/`（旧循环会签错层级），已同步修正
+- [x] 签名日志落 CI 产物（不入仓库）— 2026-09-10：签名步骤输出 `signing-log.txt` 并经 `actions/upload-artifact` 上传（私钥本身永不落日志）
 
 ### 2.5 质量门禁
 - [x] `cargo fmt`
@@ -183,7 +186,7 @@ crates/host/src/ipc_server.rs
 
 ### 4.3 市场·插件卡片
 - [x] 卡片标题旁徽章（官方/已签名/签名失效/待签名）✅ 2026-08-27（MainWindow 市场 Tab；官方=索引 key_id 预判且仅官方源生效、本地验签优先（包内权威 §4.6）、三方源仅本地验签后显示、官方源未签名=灰"待签名"）
-- [ ] 未签名安装前弹"未签名，确认来源可信"确认框
+- [x] 未签名安装前弹"未签名，确认来源可信"确认框 — 2026-09-10（整改清单 V8 响亮确认：DisplaySignState=Unsigned 时弹确认，取消即中止）
 - [x] 官方仓库未签名版本（3.0 过渡期）显示"待签名"灰徽，仍可装（灰徽提示）✅ 2026-08-27
 
 ### 4.4 registry.json signature 字段处理
@@ -199,7 +202,7 @@ crates/host/src/ipc_server.rs
 - [x] UI 编译：`dotnet build` 0 错误（仅预存 CS1998 警告）
 - [x] Rust 基线：`cargo fmt --check` + `cargo test --workspace` 全绿（plugin-manager 61；本阶段无 Rust 改动）
 - [x] Code Auditor 审计 PASSED（2 个阻断级缺陷已修复并回归通过）
-- [ ] UI 联调（需真机运行 host+UI）：官方签名插件装后显"官方"角标；篡改一文件后 scan 显"签名失效"且开关只能关不能开 — 待人工联调
+- [x] UI 联调：官方签名插件装后显"官方"角标；篡改后 scan 显"签名失效"且开关只能关不能开 — 2026-09-10 管道 e2e 实测（install → `sign_state=official`；篡改 → install 拒装 `SignatureInvalid`；启动期重验 → `list` 显 `invalid`；见跨 Phase 验收清单）
 
 ### 涉及文件（已改）
 ```
@@ -237,9 +240,9 @@ Views/MarketplacePage.xaml(.cs) (未创建)
 
 ## 跨 Phase 验收清单
 
-- [ ] 官方签名插件：装后 `host.plugin.list` 返回 `sign_state=official`，UI 绿角标 — 待人工联调
-- [ ] 篡改官方插件单文件：install 拒装 / scan 显 `invalid` 禁用 — 待人工联调
-- [ ] 无签名插件（本地导入）：装后 `sign_state=unsigned`，UI 无角标，不拦截 — 待人工联调
-- [ ] 私钥文件不在仓库（`.gitignore` 生效 + CI secret 注入）
+- [x] 官方签名插件：装后 `host.plugin.list` 返回 `sign_state=official`，UI 绿角标 — 2026-09-10 管道 e2e 实测（`spark-sign sign` 用开发密钥签 → install → `official`）
+- [x] 篡改官方插件单文件：install 拒装 / scan 显 `invalid` 禁用 — 2026-09-10 管道 e2e 实测（装前篡改 → 拒装；装后篡改 + 重启 host → 启动期重验显 `invalid`；`open` 前重验拒开，整改清单 V1 整改 2）
+- [x] 无签名插件（本地导入）：装后 `sign_state=unsigned`，UI 无角标，不拦截 — 2026-09-10 管道 e2e 实测
+- [x] 私钥文件不在仓库（`.gitignore` 生效 + CI secret 注入）— `keys/*.key` gitignored，`!keys/README.md` 白名单；CI 私钥经 `SPARK_SIGNING_KEY_V1` secret 注入
 - [x] `cargo fmt` + `cargo test --workspace` 全绿
 - [x] Code Auditor PASSED（Issue #1 回滚重入已修复并回归通过）
