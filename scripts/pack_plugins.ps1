@@ -236,12 +236,17 @@ foreach ($dir in Get-ChildItem $pluginRoot -Directory) {
   $sidecarPath = Join-Path $dir.FullName 'market.json'
   if (Test-Path $sidecarPath) { $sidecar = Get-Content $sidecarPath -Raw -Encoding UTF8 | ConvertFrom-Json }
 
+  # Assign before the call: a $(...) argument would unroll a single-element tags array into
+  # a string, which Assert-Tags rejects as "must be an array".
+  $rawTags = $null
+  if ($sidecar) { $rawTags = $sidecar.tags }
+
   $sources += [pscustomobject]@{
     Name     = $dir.Name
     Dir      = $dir.FullName
     Manifest = $manifest
     Sidecar  = $sidecar
-    Tags     = (Assert-Tags $manifest.id $(if ($sidecar) { $sidecar.tags } else { $null }))
+    Tags     = (Assert-Tags $manifest.id $rawTags)
   }
 }
 if ($sources.Count -eq 0) { throw "no plugins found under $pluginRoot" }
@@ -249,7 +254,11 @@ if ($sources.Count -eq 0) { throw "no plugins found under $pluginRoot" }
 # ---------------------------------------------------------------- build native exes
 
 # cargo has no --debug flag: debug is the default profile, only release needs a flag.
-$profileArgs = if ($Configuration -eq 'release') { @('--release') } else { @() }
+# NOTE: build the array via @() around the if — `$x = if (...) { @('a') }` unrolls the
+# single-element array into the STRING '--release', and `@x` splatting a string passes its
+# individual characters as separate args (cargo then sees a bare `-` and fails).
+$profileArgs = @()
+if ($Configuration -eq 'release') { $profileArgs = @('--release') }
 
 $nativeSources = @($sources | Where-Object { $_.Manifest.runtime -eq 'native' })
 if (-not $SkipBuild -and $nativeSources.Count -gt 0) {

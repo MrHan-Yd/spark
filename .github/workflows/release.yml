@@ -57,21 +57,23 @@ jobs:
           $log = "signing-log.txt"
           # 先把脚本输出收进变量（异常因此必然传播到 catch），再落日志——避免 `*>&1 | Tee`
           # 把 error 流并成输出后吞掉失败信号。
-          function Invoke-Pack([string[]]$PackArgs) {
+          # 哈希表 splat 按参数名绑定；数组 splat 是按位置绑定（'-OutDir' 会变成
+          # $OutDir 的值、'plugins/dist' 撞进 -Configuration 的 ValidateSet）。
+          function Invoke-Pack([hashtable]$PackArgs) {
             $text = & "$PWD/scripts/pack_plugins.ps1" @PackArgs *>&1
             $text | Tee-Object -FilePath $log -Append
-            if (-not $?) { throw "pack_plugins.ps1 失败（args: $($PackArgs -join ' ')）" }
+            if (-not $?) { throw "pack_plugins.ps1 失败（args: $($PackArgs.Keys -join ' ')）" }
           }
           if ([string]::IsNullOrEmpty($env:SPARK_SIGNING_KEY_V1)) {
             "skip: SPARK_SIGNING_KEY_V1 secret 未配置，只打包不签名" | Tee-Object -FilePath $log
-            Invoke-Pack @('-OutDir', 'plugins/dist')
+            Invoke-Pack @{ OutDir = 'plugins/dist' }
             exit 0
           }
           $keyFile = "keys/spark-official-v1.key"
           Set-Content -Path $keyFile -Value $env:SPARK_SIGNING_KEY_V1 -NoNewline
           "sign plugins/dist @ $(Get-Date -Format o) (key_id=spark-official-v1)" | Tee-Object -FilePath $log
           try {
-            Invoke-Pack @('-OutDir', 'plugins/dist', '-Sign', '-KeyFile', $keyFile)
+            Invoke-Pack @{ OutDir = 'plugins/dist'; Sign = $true; KeyFile = $keyFile }
           } catch {
             ($_ | Out-String) | Tee-Object -FilePath $log -Append
             throw
